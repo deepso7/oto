@@ -69,3 +69,72 @@ pub mod names {
     /// Bundle name under /Library/Audio/Plug-Ins/HAL.
     pub const DRIVER_BUNDLE: &str = "OtoMicrophone.driver";
 }
+
+/// Latest-wins levels the meter reads, in dBFS peak per callback. Written by the engine's
+/// metering path, read by the UI at any rate. No locks.
+#[derive(Default)]
+pub struct Levels {
+    raw: std::sync::atomic::AtomicU32,
+    clean: std::sync::atomic::AtomicU32,
+}
+
+impl Levels {
+    pub fn raw(&self) -> f32 {
+        f32::from_bits(self.raw.load(std::sync::atomic::Ordering::Relaxed))
+    }
+    pub fn clean(&self) -> f32 {
+        f32::from_bits(self.clean.load(std::sync::atomic::Ordering::Relaxed))
+    }
+    pub fn set(&self, raw: f32, clean: f32) {
+        self.raw.store(raw.to_bits(), std::sync::atomic::Ordering::Relaxed);
+        self.clean.store(clean.to_bits(), std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// An input device the user can pick.
+#[derive(Clone, Debug, PartialEq)]
+pub struct InputDevice {
+    /// Stable id to pass to [`Command::SetInputDevice`].
+    pub id: String,
+    pub name: String,
+    pub is_default: bool,
+}
+
+/// CONTRACT STUB: the running engine. The real implementation replaces the bodies, not the API.
+pub struct Engine {
+    levels: std::sync::Arc<Levels>,
+    events: std::sync::mpsc::Receiver<Event>,
+}
+
+impl Engine {
+    /// Start the control thread. Audio only runs while enabled and an app records from Oto Microphone.
+    pub fn start(_initial: Settings) -> Result<Self, String> {
+        let (_tx, events) = std::sync::mpsc::channel();
+        Ok(Self { levels: Default::default(), events })
+    }
+    pub fn send(&self, _cmd: Command) {}
+    /// Non-blocking drain of pending events.
+    pub fn try_events(&self) -> Vec<Event> {
+        self.events.try_iter().collect()
+    }
+    pub fn levels(&self) -> std::sync::Arc<Levels> {
+        self.levels.clone()
+    }
+    /// Physical inputs, excluding Oto's own devices.
+    pub fn input_devices(&self) -> Vec<InputDevice> {
+        Vec::new()
+    }
+    /// Whether the Oto HAL driver is installed and visible to Core Audio.
+    pub fn driver_installed() -> bool {
+        false
+    }
+}
+
+/// Initial state for [`Engine::start`].
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Settings {
+    pub enabled: bool,
+    pub input_device: Option<String>,
+    pub strength: Strength,
+    pub tier: Tier,
+}
