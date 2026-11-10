@@ -4,4 +4,18 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = []
+# DeepFilterNet3 via upstream libDF + tract. Heavy to build; off by default.
+dfn3 = ["dep:deep_filter", "dep:ndarray", "dep:tract-core", "dep:tract-onnx", "dep:tract-pulse", "dep:tract-hir"]
+
 [dependencies]
+nnnoiseless = { version = "0.5.2", default-features = false }
+# Pinned to the commit that states the weights are MIT OR Apache-2.0 (closes upstream #700).
+deep_filter = { git = "https://github.com/Rikorose/DeepFilterNet", rev = "7b14b895fe7fc42cab72b4a4c1e49c982bd6404b", default-features = false, features = ["tract", "default-model"], optional = true }
+ndarray = { version = "0.15", optional = true }
+# libDF only builds against the tract it was written for (0.21.5+ changed the graph API).
+tract-core = { version = "=0.21.4", optional = true }
+tract-onnx = { version = "=0.21.4", optional = true }
+tract-pulse = { version = "=0.21.4", optional = true }
+tract-hir = { version = "=0.21.4", optional = true }
