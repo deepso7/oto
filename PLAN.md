@@ -226,7 +226,7 @@ The bake-off harness: `oto bench` for timing in Rust; `tools/eval` (VERSA: PESQ,
 
 ## 10. What exists today
 
-- **`oto-dsp`**: the v1 chain (80 Hz high-pass → denoise → −1 dBFS limiter), allocation-free on the audio thread. RNNoise (`nnnoiseless`) is the default model: 20 ms chain latency, about 0.5% of an M2 Pro core. DeepFilterNet3 builds behind the `dfn3` feature (40 ms, 6.5% of a core, allocates per frame) and is used for the Max tier when compiled in. `oto bench` times either.
+- **`oto-dsp`**: the v1 chain (80 Hz high-pass → denoise → −1 dBFS limiter), allocation-free on the audio thread. RNNoise (`nnnoiseless`) is the default model: 20 ms chain latency, about 0.5% of an M2 Pro core. DeepFilterNet3 builds behind the `dfn3` feature (40 ms, 6.5% of a core, allocates per frame) and is bench-only for now (`oto bench --model dfn3`) because it allocates on the audio thread. `oto bench` times either.
 - **DeepFilterNet3 weights licence**: cleared. Upstream commit `7b14b89` (closing issue #700) states that code and weights are MIT/Apache-2.0.
 - **`driver/macos`**: the C HAL plug-in. A visible "Oto Microphone" and a hidden "Oto Sink" share one clock; the sink loops to the mic through time-tagged slots, so it plays silence (never stale audio) when nothing is playing. `scripts/macos/install-driver.sh` installs it, and `driver/macos/build/oto-verify` checks it.
 - **`oto-engine`**: the Core Audio backend behind a `Platform` trait (Linux PipeWire comes next). It captures the chosen mic, runs the chain, and plays into Oto Sink with fill-driven `rubato` drift control. It runs only while an app records from Oto Microphone, and it handles hot-plug and default-device changes.

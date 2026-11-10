@@ -43,13 +43,11 @@ fn make_chain(tier: Tier) -> Result<Chain, String> {
     Chain::with_model(model_for(tier))
 }
 
-/// Light and Standard run the default model (RNNoise: it meets the 50 ms budget, see PLAN.md);
-/// Max runs DeepFilterNet3 when this build has it, otherwise the default.
-pub fn model_for(tier: Tier) -> oto_dsp::Model {
-    match tier {
-        Tier::Max if oto_dsp::Model::DeepFilterNet3.available() => oto_dsp::Model::DeepFilterNet3,
-        _ => oto_dsp::Model::default(),
-    }
+/// Every tier runs the default model (RNNoise: it meets the 50 ms budget, see PLAN.md) for now.
+/// DeepFilterNet3 (`dfn3` feature) allocates per frame, so it is bench-only until it can run on
+/// the audio thread; `oto bench --model dfn3` times it.
+pub fn model_for(_tier: Tier) -> oto_dsp::Model {
+    oto_dsp::Model::default()
 }
 
 const TICK: Duration = Duration::from_millis(250);

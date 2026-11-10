@@ -23,7 +23,7 @@ USAGE:
         Driver and device status.
     oto latency [--seconds N] [--device ID] [--no-denoise]
         Measure end-to-end latency through the real Oto Microphone path (needs the driver).
-    oto bench [--tier light|standard|max] [--seconds N]
+    oto bench [--model rnnoise|dfn3] [--seconds N]
         Time the DSP chain on synthetic audio.
 
 Development flags (run, latency): --mic-uid UID, --sink-uid UID stand in for Oto's devices;
@@ -40,6 +40,7 @@ struct Args {
     no_denoise: bool,
     set_default: bool,
     seconds: Option<f64>,
+    model: Option<dsp::Model>,
     opts: EngineOptions,
 }
 
@@ -65,6 +66,13 @@ fn parse() -> Result<Args, lexopt::Error> {
                     "max" => Tier::Max,
                     s => return Err(format!("unknown tier {s:?}").into()),
                 }
+            }
+            Long("model") => {
+                a.model = Some(match p.value()?.string()?.as_str() {
+                    "rnnoise" => dsp::Model::RNNoise,
+                    "dfn3" => dsp::Model::DeepFilterNet3,
+                    s => return Err(format!("unknown model {s:?}").into()),
+                })
             }
             Long("no-denoise") => a.no_denoise = true,
             Long("set-default") => a.set_default = true,
@@ -296,7 +304,7 @@ fn latency(a: Args) -> Result<(), String> {
 
 fn bench(a: Args) -> Result<(), String> {
     let seconds = a.seconds.unwrap_or(10.0);
-    let model = oto_engine::model_for(a.tier);
+    let model = a.model.unwrap_or_else(|| oto_engine::model_for(a.tier));
     let report = dsp::try_bench(model, seconds as f32)?;
     println!("{report}");
     Ok(())

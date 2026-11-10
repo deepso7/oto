@@ -662,6 +662,9 @@ impl Mac {
             last_physical_default: Default::default(),
         };
         m.refresh();
+        // Remember the physical default now, so making Oto Microphone the default while idle
+        // (`oto run --set-default`) still captures from it once an app starts recording.
+        let _ = m.resolve_input(None);
         Ok(m)
     }
 }
