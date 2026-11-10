@@ -203,6 +203,8 @@ pub struct CaptureStage {
     probe: Option<ProbeGen>,
     level_raw: f32,
     level_clean: f32,
+    /// Whether `Chain::prime` has run on the audio thread yet.
+    primed: bool,
 }
 
 impl CaptureStage {
@@ -257,6 +259,7 @@ impl CaptureStage {
             probe,
             level_raw: -120.0,
             level_clean: -120.0,
+            primed: false,
         })
     }
 
@@ -277,6 +280,11 @@ impl CaptureStage {
     /// Process the first `n` (≤ `MAX_BLOCK`) samples of [`Self::mono_mut`]. `first_ns` is the
     /// host-clock capture time of the first sample, or 0 if unknown.
     pub fn process(&mut self, n: usize, first_ns: u64) {
+        if !self.primed {
+            // One-time per-thread model setup, so later callbacks never allocate.
+            self.chain.prime();
+            self.primed = true;
+        }
         let n = n.min(MAX_BLOCK);
         if let Some(p) = &mut self.probe {
             p.fill(&mut self.mono[..n], first_ns);

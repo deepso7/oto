@@ -284,34 +284,8 @@ fn latency(a: Args) -> Result<(), String> {
 
 fn bench(a: Args) -> Result<(), String> {
     let seconds = a.seconds.unwrap_or(10.0);
-    // TODO(merge): replace this placeholder with the real benchmark:
-    //   let model = match a.tier { Tier::Light => dsp::Model::RNNoise, _ => dsp::Model::DeepFilterNet3 };
-    //   let report = dsp::bench(model, seconds); println!("{report:?}");
-    let _ = a.tier;
-    let mut chain = dsp::Chain::new();
-    let block = 480;
-    let blocks = (seconds * dsp::SAMPLE_RATE as f64 / block as f64) as usize;
-    let mut seed = 0x2545_f491_u32;
-    let mut buf = vec![0.0f32; block];
-    let mut worst = Duration::ZERO;
-    let t0 = Instant::now();
-    for _ in 0..blocks {
-        for s in buf.iter_mut() {
-            seed ^= seed << 13;
-            seed ^= seed >> 17;
-            seed ^= seed << 5;
-            *s = (seed as f32 / u32::MAX as f32 - 0.5) * 0.2;
-        }
-        let t = Instant::now();
-        chain.process(&mut buf);
-        worst = worst.max(t.elapsed());
-    }
-    let total = t0.elapsed();
-    println!(
-        "chain placeholder bench: {seconds} s of audio in {:.1} ms ({:.4}% of one core), worst 10 ms block {:?}",
-        total.as_secs_f64() * 1000.0,
-        total.as_secs_f64() / seconds * 100.0,
-        worst
-    );
+    let model = oto_engine::model_for(a.tier);
+    let report = dsp::try_bench(model, seconds as f32)?;
+    println!("{}: {report}", model.name());
     Ok(())
 }

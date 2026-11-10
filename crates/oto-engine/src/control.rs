@@ -40,12 +40,16 @@ pub fn decide(enabled: bool, clients_active: bool, driver_installed: bool) -> Mo
 
 /// Builds the chain for a tier. Allocates and may load a model: control thread only.
 fn make_chain(tier: Tier) -> Result<Chain, String> {
-    // TODO(merge): select the model once oto-dsp has it:
-    //   let model = match tier { Tier::Light => oto_dsp::Model::RNNoise,
-    //                            Tier::Standard | Tier::Max => oto_dsp::Model::DeepFilterNet3 };
-    //   Chain::with_model(model)
-    let _ = tier;
-    Ok(Chain::new())
+    Chain::with_model(model_for(tier))
+}
+
+/// Light and Standard run the default model (RNNoise: it meets the 50 ms budget, see PLAN.md);
+/// Max runs DeepFilterNet3 when this build has it, otherwise the default.
+pub fn model_for(tier: Tier) -> oto_dsp::Model {
+    match tier {
+        Tier::Max if oto_dsp::Model::DeepFilterNet3.available() => oto_dsp::Model::DeepFilterNet3,
+        _ => oto_dsp::Model::default(),
+    }
 }
 
 const TICK: Duration = Duration::from_millis(250);

@@ -12,6 +12,7 @@ pub mod latency;
 mod pipeline;
 mod platform;
 
+pub use control::model_for;
 pub use pipeline::Probe;
 
 use std::sync::atomic::Ordering::Relaxed;
