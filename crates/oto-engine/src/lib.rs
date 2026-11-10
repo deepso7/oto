@@ -2,9 +2,20 @@
 //!
 //! The UI and CLI never touch audio directly. They send [`Command`]s and read [`Event`]s, which
 //! keeps the engine free to move into its own process later without changing its callers.
-//! See PLAN.md for the design.
+//! See PLAN.md for the design. Threads: the caller's, one control thread (`oto-control`) owning
+//! devices and state, and the two Core Audio IO threads (mic, sink) running the realtime path.
 
 pub use oto_dsp as dsp;
+
+mod control;
+pub mod latency;
+mod pipeline;
+mod platform;
+
+pub use pipeline::Probe;
+
+use std::sync::atomic::Ordering::Relaxed;
+use std::sync::{Arc, Mutex, mpsc};
 
 /// How hard the denoiser works. Maps to an attenuation limit, not to different models.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -86,8 +97,10 @@ impl Levels {
         f32::from_bits(self.clean.load(std::sync::atomic::Ordering::Relaxed))
     }
     pub fn set(&self, raw: f32, clean: f32) {
-        self.raw.store(raw.to_bits(), std::sync::atomic::Ordering::Relaxed);
-        self.clean.store(clean.to_bits(), std::sync::atomic::Ordering::Relaxed);
+        self.raw
+            .store(raw.to_bits(), std::sync::atomic::Ordering::Relaxed);
+        self.clean
+            .store(clean.to_bits(), std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -100,33 +113,224 @@ pub struct InputDevice {
     pub is_default: bool,
 }
 
-/// CONTRACT STUB: the running engine. The real implementation replaces the bodies, not the API.
+/// The running engine: a control thread owning devices and state. Dropping it shuts down cleanly
+/// (streams stopped, listeners removed) and restores the default input if the engine changed it.
 pub struct Engine {
-    levels: std::sync::Arc<Levels>,
-    events: std::sync::mpsc::Receiver<Event>,
+    levels: Arc<Levels>,
+    events: mpsc::Receiver<Event>,
+    tx: mpsc::Sender<control::Msg>,
+    thread: Option<std::thread::JoinHandle<()>>,
+    shared: Arc<pipeline::Shared>,
+    uids: platform::Uids,
+    restore_input: Mutex<Option<String>>,
 }
 
 impl Engine {
     /// Start the control thread. Audio only runs while enabled and an app records from Oto Microphone.
-    pub fn start(_initial: Settings) -> Result<Self, String> {
-        let (_tx, events) = std::sync::mpsc::channel();
-        Ok(Self { levels: Default::default(), events })
+    pub fn start(initial: Settings) -> Result<Self, String> {
+        Self::start_with(initial, EngineOptions::default())
     }
-    pub fn send(&self, _cmd: Command) {}
+
+    /// [`Engine::start`] with test and development hooks.
+    pub fn start_with(initial: Settings, opts: EngineOptions) -> Result<Self, String> {
+        let levels = Arc::new(Levels::default());
+        levels.set(-120.0, -120.0);
+        let shared = Arc::new(pipeline::Shared::new(levels.clone(), opts.probe.clone()));
+        let uids = opts.uids();
+        let (tx, rx) = mpsc::channel();
+        let (etx, events) = mpsc::channel();
+        let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+        let (sh, u, tx2) = (shared.clone(), uids.clone(), tx.clone());
+        let force = opts.force_clients_active;
+        let thread = std::thread::Builder::new()
+            .name("oto-control".into())
+            .spawn(move || match platform::sys::Backend::new(u, tx2) {
+                Ok(p) => {
+                    let _ = ready_tx.send(Ok(()));
+                    control::Control::new(p, initial, force, sh, etx).run(rx);
+                }
+                Err(e) => {
+                    let _ = ready_tx.send(Err(e));
+                }
+            })
+            .map_err(|e| format!("cannot spawn control thread: {e}"))?;
+        match ready_rx.recv() {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return Err(e),
+            Err(_) => return Err("control thread died during start".into()),
+        }
+        Ok(Self {
+            levels,
+            events,
+            tx,
+            thread: Some(thread),
+            shared,
+            uids,
+            restore_input: Mutex::new(None),
+        })
+    }
+
+    pub fn send(&self, cmd: Command) {
+        let _ = self.tx.send(control::Msg::Cmd(cmd));
+    }
     /// Non-blocking drain of pending events.
     pub fn try_events(&self) -> Vec<Event> {
         self.events.try_iter().collect()
     }
-    pub fn levels(&self) -> std::sync::Arc<Levels> {
+    pub fn levels(&self) -> Arc<Levels> {
         self.levels.clone()
     }
     /// Physical inputs, excluding Oto's own devices.
     pub fn input_devices(&self) -> Vec<InputDevice> {
-        Vec::new()
+        platform::sys::input_devices(&self.uids)
     }
     /// Whether the Oto HAL driver is installed and visible to Core Audio.
     pub fn driver_installed() -> bool {
-        false
+        platform::sys::driver_installed(&EngineOptions::default().uids())
+    }
+
+    /// Diagnostics: ring fill, drift correction, xruns, latency estimate.
+    pub fn stats(&self) -> Stats {
+        Stats::from_shared(&self.shared)
+    }
+
+    /// Make Oto Microphone the system default input. The previous default is restored when the
+    /// engine is dropped (unless the user picked something else in the meantime).
+    pub fn set_default_input_to_oto(&self) -> Result<(), String> {
+        let prev = platform::sys::default_input_uid();
+        if prev.as_deref() == Some(self.uids.mic.as_str()) {
+            return Ok(());
+        }
+        platform::sys::set_default_input(&self.uids.mic)?;
+        *self.restore_input.lock().unwrap_or_else(|e| e.into_inner()) = prev;
+        Ok(())
+    }
+
+    /// Undo [`Engine::set_default_input_to_oto`] now. Also runs on drop.
+    pub fn restore_default_input(&self) -> Result<(), String> {
+        let prev = self
+            .restore_input
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        match prev {
+            Some(uid) if platform::sys::default_input_uid().as_deref() == Some(&self.uids.mic) => {
+                platform::sys::set_default_input(&uid)
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
+impl Drop for Engine {
+    fn drop(&mut self) {
+        self.send(Command::Shutdown);
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+        let _ = self.restore_default_input();
+    }
+}
+
+/// Test and development hooks for [`Engine::start_with`]. The defaults are what the app uses.
+#[derive(Clone, Default)]
+pub struct EngineOptions {
+    /// Replace the mic signal with a tone-burst train and record injection times (`oto latency`).
+    /// The real mic is still opened as the clock, so the measurement covers its IO buffer.
+    pub probe: Option<Arc<Probe>>,
+    /// Use another device as "Oto Microphone" (its clients are watched). Development only.
+    pub mic_uid: Option<String>,
+    /// Use another output device as "Oto Sink". Development only.
+    pub sink_uid: Option<String>,
+    /// Behave as if an app is always recording from the mic.
+    pub force_clients_active: bool,
+}
+
+impl EngineOptions {
+    fn uids(&self) -> platform::Uids {
+        platform::Uids {
+            mic: self
+                .mic_uid
+                .clone()
+                .unwrap_or_else(|| names::MIC_UID.into()),
+            sink: self
+                .sink_uid
+                .clone()
+                .unwrap_or_else(|| names::SINK_UID.into()),
+        }
+    }
+}
+
+/// A snapshot of the realtime path, for diagnostics.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Stats {
+    /// Streams are open (an app is recording and the driver is present).
+    pub running: bool,
+    pub input_rate: u32,
+    pub output_rate: u32,
+    /// Current ring fill and its target, ms at 48 kHz.
+    pub ring_fill_ms: f32,
+    pub ring_target_ms: f32,
+    /// Drift correction applied by the output resampler, ppm (+ = consuming faster).
+    pub drift_ppm: i32,
+    pub underruns: u64,
+    pub resyncs: u64,
+    pub overflows: u64,
+    /// Mic-to-sink latency estimated from device-reported latencies, buffers and ring target.
+    pub estimated_latency_ms: f32,
+}
+
+impl Stats {
+    fn from_shared(s: &pipeline::Shared) -> Self {
+        let ms = |frames: u32| frames as f32 * 1000.0 / dsp::SAMPLE_RATE as f32;
+        Self {
+            running: s.running.load(Relaxed),
+            input_rate: s.in_rate.load(Relaxed),
+            output_rate: s.out_rate.load(Relaxed),
+            ring_fill_ms: ms(s.fill_frames.load(Relaxed)),
+            ring_target_ms: ms(s.target_frames.load(Relaxed)),
+            drift_ppm: s.correction_ppm.load(Relaxed),
+            underruns: s.underruns.load(Relaxed),
+            resyncs: s.resyncs.load(Relaxed),
+            overflows: s.overflows.load(Relaxed),
+            estimated_latency_ms: s.estimate_us.load(Relaxed) as f32 / 1000.0,
+        }
+    }
+}
+
+/// Physical inputs, excluding Oto's own devices, without starting an engine.
+pub fn list_input_devices() -> Vec<InputDevice> {
+    platform::sys::input_devices(&EngineOptions::default().uids())
+}
+
+/// State of one of Oto's virtual devices.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DeviceStatus {
+    pub name: String,
+    pub sample_rate: f64,
+    pub channels: u32,
+    /// Some process is doing IO on it (for the mic: an app is recording).
+    pub in_use: bool,
+}
+
+/// Driver and device overview for `oto status`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Status {
+    pub driver_installed: bool,
+    pub microphone: Option<DeviceStatus>,
+    pub sink: Option<DeviceStatus>,
+    pub default_input: Option<String>,
+    pub inputs: Vec<InputDevice>,
+}
+
+pub fn status() -> Status {
+    let uids = EngineOptions::default().uids();
+    Status {
+        driver_installed: platform::sys::driver_installed(&uids),
+        microphone: platform::sys::device_status(&uids.mic, true),
+        sink: platform::sys::device_status(&uids.sink, false),
+        default_input: platform::sys::default_input_uid(),
+        inputs: platform::sys::input_devices(&uids),
     }
 }
 
