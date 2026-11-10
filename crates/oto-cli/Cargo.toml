@@ -4,6 +4,11 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = ["dfn3"]
+# DeepFilterNet3 as the default model. `--no-default-features` builds an RNNoise-only CLI.
+dfn3 = ["oto-engine/dfn3"]
+
 [dependencies]
 lexopt = "0.3"
 oto-engine.workspace = true

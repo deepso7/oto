@@ -40,6 +40,8 @@ pub const kAudioDevicePropertySafetyOffset: u32 = fourcc(b"saft");
 pub const kAudioDevicePropertyStreams: u32 = fourcc(b"stm#");
 pub const kAudioStreamPropertyVirtualFormat: u32 = fourcc(b"sfmt");
 pub const kAudioStreamPropertyLatency: u32 = fourcc(b"ltnc");
+/// The `os_workgroup_t` of the device's IO thread (macOS 11+), retained for the caller.
+pub const kAudioDevicePropertyIOThreadOSWorkgroup: u32 = fourcc(b"oswg");
 
 pub const kAudioDeviceTransportTypeBuiltIn: u32 = fourcc(b"bltn");
 pub const kAudioDeviceTransportTypeAggregate: u32 = fourcc(b"grup");
@@ -214,7 +216,40 @@ unsafe extern "C" {
 unsafe extern "C" {
     pub fn mach_absolute_time() -> u64;
     pub fn mach_timebase_info(info: *mut MachTimebaseInfo) -> i32;
+    pub fn pthread_self() -> *mut c_void;
+    pub fn pthread_mach_thread_np(thread: *mut c_void) -> u32;
+    pub fn thread_policy_set(thread: u32, flavor: u32, info: *mut i32, count: u32) -> i32;
+    pub fn pthread_set_qos_class_self_np(qos: u32, relative_priority: i32) -> i32;
+    pub fn os_workgroup_join(wg: *mut c_void, token: *mut OsWorkgroupJoinToken) -> i32;
+    pub fn os_workgroup_leave(wg: *mut c_void, token: *mut OsWorkgroupJoinToken);
+    pub fn os_release(object: *mut c_void);
 }
+
+/// `os_workgroup_join_token_s` (`os/workgroup_object.h`).
+#[repr(C)]
+pub struct OsWorkgroupJoinToken {
+    pub sig: u32,
+    pub opaque: [u8; 36],
+}
+
+/// `thread_policy.h`: a thread with a periodic deadline (what Core Audio's IO threads use).
+pub const THREAD_TIME_CONSTRAINT_POLICY: u32 = 2;
+/// `sys/qos.h`.
+pub const QOS_CLASS_USER_INTERACTIVE: u32 = 0x21;
+
+/// `thread_time_constraint_policy_data_t`. Times are in mach absolute time units.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ThreadTimeConstraintPolicy {
+    pub period: u32,
+    pub computation: u32,
+    pub constraint: u32,
+    pub preemptible: i32,
+}
+
+/// `THREAD_TIME_CONSTRAINT_POLICY_COUNT`, in `integer_t`s.
+pub const THREAD_TIME_CONSTRAINT_POLICY_COUNT: u32 =
+    (std::mem::size_of::<ThreadTimeConstraintPolicy>() / 4) as u32;
 
 /// Renders an OSStatus as its four-char code when printable, else as a number.
 pub fn status_str(s: OSStatus) -> String {
@@ -237,6 +272,8 @@ mod tests {
         assert_eq!(size_of::<AudioStreamBasicDescription>(), 40);
         assert_eq!(size_of::<AudioBuffer>(), 16);
         assert_eq!(size_of::<AudioBufferList>(), 24);
+        assert_eq!(THREAD_TIME_CONSTRAINT_POLICY_COUNT, 4);
+        assert_eq!(size_of::<OsWorkgroupJoinToken>(), 40);
         assert_eq!(fourcc(b"glob"), 0x676c_6f62);
         assert_eq!(status_str(fourcc(b"!dev") as i32), "'!dev'");
     }

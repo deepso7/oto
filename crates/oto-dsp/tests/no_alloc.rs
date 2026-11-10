@@ -1,5 +1,7 @@
-//! Proves `Chain::process` and its realtime-safe setters never touch the heap (RNNoise build),
-//! and measures how far DeepFilterNet3 is from that (`dfn3` feature).
+//! Proves `Chain::process` and its realtime-safe setters never touch the heap with RNNoise, and
+//! measures how far DeepFilterNet3 is from that (`dfn3` feature). The engine's own
+//! `crates/oto-engine/tests/no_alloc.rs` checks the real capture path, counting from the
+//! second callback as decision 3 of plan 0001 states the contract.
 //!
 //! A counting global allocator that only counts on threads that opted in, so the test harness's
 //! own allocations on other threads do not interfere.
@@ -138,13 +140,14 @@ fn rnnoise_chain_process_never_allocates() {
 }
 
 /// Measurement, not a contract check: DeepFilterNet3 allocates on every frame (libDF clones its
-/// spectrum tensors and tract allocates a fresh tensor for every node output on every run), so
-/// it fails the zero-allocation rule that the RNNoise test above enforces. This prints the
-/// per-frame numbers instead of failing, so the gap stays visible. It is `#[ignore]` because
-/// it asserts nothing; run it with
+/// spectrum tensors and tract allocates a fresh tensor for every node output on every run, about
+/// 1,700 heap calls and 0.95 MB per 10 ms frame, ~95% inside tract). That is why the engine runs
+/// it on a DSP worker thread instead of in the audio callback (design B of plan 0001); the
+/// engine's `tests/no_alloc.rs` checks that the callback side of that stays allocation-free.
+/// This prints the per-frame numbers so the gap stays visible. It is `#[ignore]` because it
+/// asserts nothing; run it with
 /// `cargo test -p oto-dsp --features dfn3 --test no_alloc -- --ignored --nocapture`
 /// (add `--release` for release numbers, `OTO_ALLOC_TRACE=N` to see where they come from).
-/// Turn it into an `assert_eq!(heap.calls(), 0)` once DFN3 runs allocation-free.
 #[cfg(feature = "dfn3")]
 #[test]
 #[ignore = "measurement: DFN3 is known to allocate per frame"]

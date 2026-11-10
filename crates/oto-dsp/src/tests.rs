@@ -284,7 +284,7 @@ fn reported_latency_matches_measured_delay() {
 
 #[test]
 fn latency_is_the_same_enabled_or_disabled() {
-    let mut chain = Chain::new();
+    let mut chain = Chain::with_model(Model::RNNoise).unwrap();
     let on = chain.latency();
     chain.set_enabled(false);
     assert_eq!(chain.latency(), on);

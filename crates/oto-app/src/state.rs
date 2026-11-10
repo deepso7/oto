@@ -4,6 +4,7 @@
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::Sender;
 
+use oto_engine::dsp::Model;
 use oto_engine::{Command, Event, InputDevice, Settings, Strength, Tier};
 
 use crate::driver::{Outcome, REBOOT_MESSAGE, UninstallOutcome};
@@ -20,17 +21,8 @@ pub const STRENGTHS: [(Strength, &str); 3] = [
     (Strength::Balanced, "Balanced"),
     (Strength::Strong, "Strong"),
 ];
-/// Every tier's name and what picking it costs. The picker only offers the ones in
-/// [`State::tiers`], which is `oto_engine::available_tiers()` in the running app.
-pub const TIERS: [(Tier, &str, &str); 3] = [
-    (Tier::Light, "Light", "Lowest CPU and delay."),
-    (
-        Tier::Standard,
-        "Standard",
-        "Higher quality. Uses much more CPU and adds about 20 ms.",
-    ),
-    (Tier::Max, "Max", "Highest quality, the most CPU."),
-];
+/// What "Low CPU mode" trades, under its switch in Settings.
+pub const LOW_CPU_ABOUT: &str = "Lower quality, but less CPU and less delay.";
 pub const SYSTEM_DEFAULT: &str = "System default";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -82,7 +74,6 @@ pub struct Probe {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Open {
     Device,
-    Tier,
 }
 
 /// What the UI asks of the engine's host thread.
@@ -170,8 +161,15 @@ pub struct State {
     system_mic_applied: bool,
     /// Start at login can be turned on from this copy of Oto.
     pub login_available: bool,
-    /// The model tiers the picker offers; fewer than two hides it.
+    /// The model tiers this build offers. "Low CPU mode" shows only when there are two or more:
+    /// off is [`Tier::Standard`], on is [`Tier::Light`].
     pub tiers: Vec<Tier>,
+    /// The model the running streams use (after any fallback) and the estimated mic-to-app
+    /// delay in ms, while streams run. From `Engine::stats`.
+    pub running: Option<(Model, f32)>,
+    /// The requested model couldn't load and another runs instead. Not an error: audio works.
+    /// Cleared when the user changes the mode, which makes the engine try again.
+    pub model_notice: Option<String>,
     pub devices: Vec<InputDevice>,
     /// An app is recording from Oto Microphone.
     pub clients_active: bool,
@@ -226,6 +224,8 @@ impl State {
             system_mic_applied: false,
             login_available: true,
             tiers,
+            running: None,
+            model_notice: None,
             devices: Vec::new(),
             clients_active: false,
             load: None,
@@ -319,9 +319,25 @@ impl State {
         self.open = None;
         if self.prefs.tier != t && self.tiers.contains(&t) {
             self.prefs.tier = t;
+            // The engine forgets a failed load on a tier change and tries again; so does this.
+            self.model_notice = None;
             self.command(Command::SetTier(t));
             self.save();
         }
+    }
+
+    /// "Low CPU mode": RNNoise ([`Tier::Light`]) instead of DeepFilterNet3 ([`Tier::Standard`]).
+    pub fn low_cpu(&self) -> bool {
+        self.prefs.tier == Tier::Light
+    }
+
+    pub fn set_low_cpu(&mut self, on: bool) {
+        self.set_tier(if on { Tier::Light } else { Tier::Standard });
+    }
+
+    /// Whether the build offers a choice of model, so "Low CPU mode" does something.
+    pub fn offers_low_cpu(&self) -> bool {
+        self.tiers.len() > 1
     }
 
     pub fn set_start_at_login(&mut self, on: bool) {
@@ -436,6 +452,11 @@ impl State {
         };
     }
 
+    /// What `Engine::stats` says runs: the effective model and the estimated delay in ms.
+    pub fn set_running(&mut self, running: Option<(Model, f32)>) {
+        self.running = running;
+    }
+
     pub fn set_devices(&mut self, devices: Vec<InputDevice>) {
         self.devices = devices;
     }
@@ -457,8 +478,17 @@ impl State {
             Event::Recovered => self.clear_engine_error(),
             // The host thread re-reads the device list and calls `set_devices`.
             Event::DevicesChanged => {}
-            // TODO(plan 0001 step 5): show a notice naming the effective model.
-            Event::ModelFallback { .. } => {}
+            Event::ModelFallback {
+                requested,
+                effective,
+                ..
+            } => {
+                self.model_notice = Some(format!(
+                    "{} couldn\u{2019}t load, so Oto is running {}.",
+                    requested.name(),
+                    effective.name()
+                ));
+            }
         }
     }
 
@@ -489,6 +519,7 @@ impl State {
         self.system_mic_applied = false;
         self.clients_active = false;
         self.load = None;
+        self.running = None;
         self.clear_engine_error();
         self.meter_gate();
     }
@@ -659,6 +690,13 @@ impl State {
         self.load
             .filter(|_| self.clients_active)
             .map(|l| format!("{:.0}% CPU", l * 100.0))
+    }
+
+    /// The running model and its delay, as "DeepFilterNet3 · 56 ms", while streams run.
+    pub fn running_model(&self) -> Option<String> {
+        self.running
+            .filter(|_| self.clients_active)
+            .map(|(m, ms)| format!("{} \u{b7} {ms:.0} ms", m.name()))
     }
 }
 
@@ -939,6 +977,71 @@ mod tests {
                 Command::SetTier(Tier::Light)
             ]
         );
+    }
+
+    #[test]
+    fn low_cpu_mode_is_the_light_tier() {
+        let mut s = state();
+        s.tiers = vec![Tier::Light, Tier::Standard];
+        assert!(s.offers_low_cpu());
+        assert!(!s.low_cpu(), "off by default");
+        s.set_low_cpu(true);
+        assert!(s.low_cpu());
+        assert_eq!(s.prefs.tier, Tier::Light);
+        s.set_low_cpu(true);
+        s.set_low_cpu(false);
+        assert_eq!(s.prefs.tier, Tier::Standard);
+        assert_eq!(
+            sent(&s),
+            [
+                Command::SetTier(Tier::Light),
+                Command::SetTier(Tier::Standard)
+            ]
+        );
+        s.tiers = vec![Tier::Standard];
+        assert!(!s.offers_low_cpu());
+    }
+
+    #[test]
+    fn a_saved_max_tier_runs_as_standard() {
+        let s = State::new(
+            Prefs {
+                tier: Tier::Max,
+                ..Prefs::default()
+            },
+            true,
+        );
+        assert_eq!(s.prefs.tier, Tier::Standard);
+        assert!(!s.low_cpu());
+    }
+
+    #[test]
+    fn a_model_fallback_is_a_notice_not_an_error() {
+        let mut s = state();
+        s.tiers = vec![Tier::Light, Tier::Standard];
+        s.on_event(Event::ClientsActive(true));
+        s.on_event(Event::ModelFallback {
+            requested: Model::DeepFilterNet3,
+            effective: Model::RNNoise,
+            reason: "running pass codegen".into(),
+        });
+        s.set_running(Some((Model::RNNoise, 36.0)));
+        assert_eq!(s.error, None);
+        assert_eq!(
+            s.model_notice.as_deref(),
+            Some("DeepFilterNet3 couldn\u{2019}t load, so Oto is running RNNoise.")
+        );
+        assert_eq!(s.running_model().as_deref(), Some("RNNoise \u{b7} 36 ms"));
+        // A recovery is about errors, not the model.
+        s.on_event(Event::Recovered);
+        assert!(s.model_notice.is_some());
+        // Changing the mode makes the engine try again, so the notice goes.
+        s.set_low_cpu(true);
+        assert_eq!(s.model_notice, None);
+
+        // Nothing runs while no app records.
+        s.on_event(Event::ClientsActive(false));
+        assert_eq!(s.running_model(), None);
     }
 
     #[test]

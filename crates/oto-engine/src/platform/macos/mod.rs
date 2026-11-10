@@ -22,8 +22,8 @@ use super::{HalEvent, Platform, Uids};
 use crate::InputDevice;
 use crate::control::Msg;
 use crate::pipeline::{
-    CaptureStage, MAX_BLOCK, OutputStage, RING_CAPACITY, Shared, clamp_io_frames, downmix,
-    estimate_latency_s, scaled_io_frames, target_fill,
+    CaptureStage, DspSetup, DspThread, MAX_BLOCK, OutputStage, RING_CAPACITY, Shared,
+    clamp_io_frames, downmix, estimate_latency_s, placement_for, scaled_io_frames, target_fill,
 };
 
 /// IO buffer we ask the mic for, in frames at 48 kHz (5.3 ms; leaves room for model inference).
@@ -295,6 +295,111 @@ fn timebase() -> (u64, u64) {
 pub fn host_to_ns(t: u64) -> u64 {
     let (n, d) = timebase();
     (t as u128 * n as u128 / d as u128) as u64
+}
+
+/// Gives the calling thread (the DSP worker) realtime scheduling: Mach time-constraint policy
+/// with a `period_ns` period, the whole period as its deadline and half of it as its expected
+/// computation, like an audio IO thread. If the kernel refuses, falls back to the
+/// user-interactive QoS class. Returns which one applied.
+pub fn promote_dsp_thread(period_ns: u64) -> Result<&'static str, String> {
+    let (n, d) = timebase();
+    let ticks = |ns: u64| (ns as u128 * d as u128 / n as u128).min(u32::MAX as u128) as u32;
+    // The kernel rejects computation below 50 µs or above 50 ms.
+    let period_ns = period_ns.clamp(1_000_000, 50_000_000);
+    let mut policy = ThreadTimeConstraintPolicy {
+        period: ticks(period_ns),
+        computation: ticks(period_ns / 2),
+        constraint: ticks(period_ns),
+        preemptible: 1,
+    };
+    let st = unsafe {
+        thread_policy_set(
+            pthread_mach_thread_np(pthread_self()),
+            THREAD_TIME_CONSTRAINT_POLICY,
+            (&raw mut policy).cast(),
+            THREAD_TIME_CONSTRAINT_POLICY_COUNT,
+        )
+    };
+    if st == 0 {
+        return Ok("time-constraint");
+    }
+    if unsafe { pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0) } == 0 {
+        return Ok("user-interactive QoS");
+    }
+    Err(format!("thread_policy_set failed ({st})"))
+}
+
+/// A retained `os_workgroup_t`.
+struct Workgroup(*mut c_void);
+
+// SAFETY: os_workgroup objects are thread-safe, reference-counted OS objects; joining from
+// another thread is their purpose.
+unsafe impl Send for Workgroup {}
+
+impl Drop for Workgroup {
+    fn drop(&mut self) {
+        unsafe { os_release(self.0) };
+    }
+}
+
+/// The audio workgroup of `dev`'s IO thread, if the system provides one.
+fn io_workgroup(dev: AudioObjectID) -> Option<Workgroup> {
+    let a = addr(
+        kAudioDevicePropertyIOThreadOSWorkgroup,
+        kAudioObjectPropertyScopeGlobal,
+    );
+    let mut wg: *mut c_void = ptr::null_mut();
+    let mut size = size_of::<*mut c_void>() as u32;
+    let st = unsafe {
+        AudioObjectGetPropertyData(dev, &a, 0, ptr::null(), &mut size, (&raw mut wg).cast())
+    };
+    (st == 0 && !wg.is_null()).then_some(Workgroup(wg))
+}
+
+/// Membership of a workgroup; leaves it on drop, which must happen on the thread that joined.
+struct Joined {
+    wg: Workgroup,
+    token: OsWorkgroupJoinToken,
+    joined: bool,
+}
+
+impl Drop for Joined {
+    fn drop(&mut self) {
+        if self.joined {
+            unsafe { os_workgroup_leave(self.wg.0, &mut self.token) };
+        }
+    }
+}
+
+/// The DSP worker's setup for a capture device: realtime priority, then membership of the
+/// device's IO-thread workgroup. Without the workgroup, Apple Silicon runs the worker's short
+/// bursts on efficiency cores or at low clocks when the machine is otherwise idle; in it, the
+/// scheduler knows the worker shares the audio deadline. Measured on an M2 Pro (release,
+/// `live_worker_on_a_real_mic`, 256-frame mic): DeepFilterNet3 worker time per block p99
+/// 3.67 ms / max 3.94 ms without, 1.57 ms / 1.59 ms with, of a 5.33 ms period.
+fn dsp_setup(dev: AudioObjectID) -> DspSetup {
+    let wg = io_workgroup(dev);
+    Box::new(move |period_ns| {
+        let realtime = promote_dsp_thread(period_ns).is_ok();
+        let guard = wg.and_then(|wg| {
+            // Boxed first: the token must stay where it was when joining.
+            let mut j = Box::new(Joined {
+                wg,
+                token: OsWorkgroupJoinToken {
+                    sig: 0,
+                    opaque: [0; 36],
+                },
+                joined: false,
+            });
+            j.joined = unsafe { os_workgroup_join(j.wg.0, &mut j.token) } == 0;
+            j.joined.then_some(j as Box<dyn std::any::Any>)
+        });
+        DspThread {
+            realtime,
+            workgroup: guard.is_some(),
+            guard,
+        }
+    })
 }
 
 fn use_hal_notification_thread() {
@@ -728,7 +833,16 @@ impl Platform for Mac {
         let out_frames = set_buffer_frames(out_dev, scaled_io_frames(OUT_IO_FRAMES, out_rate));
         let (prod, cons) = RingBuffer::new(RING_CAPACITY);
         let target = target_fill(in_frames as usize, in_rate, out_frames as usize, out_rate);
-        let cap = CaptureStage::new(in_rate, chain, prod, shared.clone())?;
+        let placement = placement_for(chain.model());
+        let cap = CaptureStage::build(
+            in_rate,
+            in_frames as usize,
+            chain,
+            prod,
+            shared.clone(),
+            placement,
+            dsp_setup(in_dev),
+        )?;
         let out = OutputStage::new(cons, out_rate, target, shared.clone())?;
 
         let est_s = estimate_latency_s(
@@ -853,5 +967,107 @@ impl Recorder {
         let mut io = IoProc::new(dev, record_proc, RecCtx { f }, uid)?;
         io.start(uid)?;
         Ok(Self { _io: io })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Levels;
+    use crate::pipeline::{Placement, default_dsp_setup};
+    use oto_dsp::Model;
+    use std::time::Duration;
+
+    /// Live check of the DSP worker on a real mic's IO thread, without Oto's devices (so it
+    /// runs next to a running Oto app): the mic's callback drives `CaptureStage` exactly like
+    /// the engine's and its output is discarded. Compares the worker with and without the mic's
+    /// audio workgroup. Opens the mic for `OTO_LIVE_SECONDS` (default 15) per variant. The
+    /// signal is synthetic noisy speech in place of the mic's (like `oto run --input-raw`).
+    ///
+    /// `cargo test --release -p oto-engine --lib live_worker -- --ignored --nocapture`
+    /// (`OTO_LIVE_MIC=UID` picks the mic; default the built-in one).
+    #[test]
+    #[ignore = "live: opens a real microphone"]
+    fn live_worker_on_a_real_mic() {
+        let uid = std::env::var("OTO_LIVE_MIC").unwrap_or("BuiltInMicrophoneDevice".into());
+        let secs: f64 = std::env::var("OTO_LIVE_SECONDS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(15.0);
+        let dev = device_for_uid(&uid).expect("no such microphone");
+        let rate = rate_of(dev);
+        let frames = set_buffer_frames(dev, scaled_io_frames(IN_IO_FRAMES, rate)) as usize;
+        let model = if Model::DeepFilterNet3.available() {
+            Model::DeepFilterNet3
+        } else {
+            Model::RNNoise
+        };
+        for workgroup in [false, true] {
+            // The mic clocks the callbacks; the signal is synthetic noisy speech, so the model
+            // really runs (a mic without permission delivers digital silence, which it skips).
+            let mut shared = Shared::new(Arc::new(Levels::default()), None);
+            shared.source = Some(oto_dsp::signal::noisy_speech(rate as usize * 4, 1).into());
+            let shared = Arc::new(shared);
+            let (prod, mut cons) = RingBuffer::new(RING_CAPACITY);
+            let setup = if workgroup {
+                dsp_setup(dev)
+            } else {
+                default_dsp_setup()
+            };
+            let chain = Chain::with_model(model).unwrap();
+            let mut cap = CaptureStage::build(
+                rate,
+                frames,
+                chain,
+                prod,
+                shared.clone(),
+                Placement::Worker,
+                setup,
+            )
+            .unwrap();
+            let sh = shared.clone();
+            let rec = Recorder::start(
+                &uid,
+                Box::new(move |data, ch, ns| {
+                    let t0 = unsafe { mach_absolute_time() };
+                    let n = (data.len() / ch).min(MAX_BLOCK);
+                    downmix(
+                        [(&data[..n * ch], ch)].into_iter(),
+                        &mut cap.mono_mut()[..n],
+                    );
+                    cap.process(n, ns);
+                    if let Ok(c) = cons.read_chunk(cons.slots()) {
+                        c.commit_all();
+                    }
+                    let dt = host_to_ns(unsafe { mach_absolute_time() } - t0);
+                    sh.capture_times.record(dt);
+                }),
+            )
+            .unwrap();
+            std::thread::sleep(Duration::from_secs_f64(secs));
+            drop(rec);
+            let s = crate::Stats::from_shared(&shared);
+            let w = s.worker;
+            eprintln!(
+                "{} on {uid} ({rate} Hz, {frames} frames), workgroup {} (joined {}), realtime \
+                 {}: worker p50 {:.0} µs, p99 {:.0} µs, max {:.0} µs of {:.0} µs over {} \
+                 blocks; starvations {}, overflows {}, reserve {:.2} ms; callback p99 {:.0} \
+                 µs, max {:.0} µs",
+                model.name(),
+                workgroup,
+                s.worker_workgroup,
+                s.worker_realtime,
+                w.p50_us,
+                w.p99_us,
+                w.max_us,
+                w.period_us,
+                w.callbacks,
+                s.starvations,
+                s.worker_overflows,
+                s.worker_reserve_ms,
+                s.capture.p99_us,
+                s.capture.max_us,
+            );
+        }
     }
 }

@@ -23,11 +23,14 @@ USAGE:
         Driver and device status. Exits 1 when the driver is not installed.
     oto latency [--seconds N] [--device ID] [--strength S] [--tier TIER] [--no-denoise]
         Measure end-to-end latency through the real Oto Microphone path (needs the driver).
+        --no-denoise keeps the tier's model and its delay but bypasses its processing, so it
+        cannot suppress the test tone. Exits 1 if fewer than 80% of the tone bursts arrive.
     oto bench [--model rnnoise|dfn3] [--tier TIER] [--seconds N]
         Time the DSP chain on synthetic audio.
     oto --version | --help
 
---tier takes light, standard or max, limited to the tiers this build has a distinct model for.
+--tier takes standard (DeepFilterNet3, the default) or light (RNNoise, the app's Low CPU
+mode), limited to the tiers this build has a distinct model for (max is not offered).
 --seconds takes a number above 0, up to 86400.
 
 Development flags (run, latency): --mic-uid UID, --sink-uid UID stand in for Oto's devices;
@@ -499,11 +502,25 @@ fn latency(a: Args) -> Result<(), String> {
     let seconds = a.seconds.unwrap_or(10.0);
     let opts = engine_options(&a)?;
     println!(
-        "measuring for {seconds} s: tone bursts injected at the engine input, recorded from Oto Microphone"
+        "measuring for {seconds} s (tier {}, {} {}): tone bursts injected at the engine input, \
+         recorded from Oto Microphone",
+        tier_name(a.tier),
+        oto_engine::model_for(a.tier).name(),
+        if a.no_denoise {
+            "bypassed, delay kept"
+        } else {
+            "denoising"
+        },
     );
     let r = oto_engine::latency::measure(settings(&a), opts, seconds).map_err(start_error)?;
     for e in &r.errors {
         println!("engine error: {e}");
+    }
+    for n in &r.notices {
+        println!("notice: model fallback, {n}");
+    }
+    if let Some(m) = r.stats.model {
+        println!("running model: {}", m.name());
     }
     match r.summary() {
         Some((min, med, max)) => {
@@ -511,10 +528,10 @@ fn latency(a: Args) -> Result<(), String> {
                 "end-to-end (mic IO buffer → chain → ring → sink → driver → recorder): \
                  median {med:.1} ms, min {min:.1}, max {max:.1} ({} of {} bursts)",
                 r.measurements_ms.len(),
-                r.injections
+                r.expected()
             );
         }
-        None => println!("no bursts detected ({} injected)", r.injections),
+        None => println!("no bursts detected ({} expected)", r.expected()),
     }
     let s = r.stats;
     println!(
@@ -527,7 +544,7 @@ fn latency(a: Args) -> Result<(), String> {
         s.resyncs,
         s.estimated_latency_ms
     );
-    Ok(())
+    r.check()
 }
 
 fn bench(a: Args) -> Result<(), String> {
@@ -588,6 +605,15 @@ mod tests {
         let (cmd, a) = args("bench --model rnnoise --seconds 1").unwrap();
         assert_eq!(cmd, Cmd::Bench);
         assert_eq!(a.model, Some(dsp::Model::RNNoise));
+
+        let (cmd, a) = args("latency --no-denoise --tier standard").unwrap();
+        assert_eq!(cmd, Cmd::Latency);
+        assert!(a.no_denoise);
+        assert_eq!(a.tier, Tier::Standard);
+        // Bypassed, not idle: the tier's model still loads and keeps its delay.
+        let s = settings(&a);
+        assert!(!s.enabled);
+        assert_eq!(s.tier, Tier::Standard);
 
         assert_eq!(args("devices").unwrap().0, Cmd::Devices);
         assert_eq!(args("status").unwrap().0, Cmd::Status);
@@ -685,6 +711,23 @@ mod tests {
                 .unwrap_err()
                 .contains("unknown tier")
         );
+
+        // With DeepFilterNet3 in the build, light is RNNoise and standard is DeepFilterNet3.
+        if oto_engine::available_tiers().len() > 1 {
+            let tier = |line: &str| args(line).unwrap().1.tier;
+            assert_eq!(
+                oto_engine::model_for(tier("run --tier light")),
+                dsp::Model::RNNoise
+            );
+            assert_eq!(
+                oto_engine::model_for(tier("run --tier standard")),
+                dsp::Model::DeepFilterNet3
+            );
+            assert_eq!(
+                oto_engine::model_for(tier("latency --tier light --no-denoise")),
+                dsp::Model::RNNoise
+            );
+        }
 
         // The real flag follows this build's tiers.
         for t in [Tier::Light, Tier::Standard, Tier::Max] {

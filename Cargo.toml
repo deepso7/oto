@@ -10,8 +10,9 @@ edition = "2024"
 license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
-oto-dsp = { path = "crates/oto-dsp" }
-oto-engine = { path = "crates/oto-engine" }
+# Without default features, so each crate opts in to `dfn3` itself and forwards it.
+oto-dsp = { path = "crates/oto-dsp", default-features = false }
+oto-engine = { path = "crates/oto-engine", default-features = false }
 # Rune is pre-release: always pin a rev of `dev` and bump deliberately.
 rune = { git = "https://github.com/anomalyco/rune", rev = "70eff81165e9854834a75f17753edb6c96ab2ab7" }
 rune-kit = { git = "https://github.com/anomalyco/rune", rev = "70eff81165e9854834a75f17753edb6c96ab2ab7" }

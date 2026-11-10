@@ -4,6 +4,16 @@
 //! Everything here is called from device callbacks, so after construction nothing allocates,
 //! locks or blocks. Cross-thread state is atomics in [`Shared`].
 //!
+//! # Where the chain runs
+//!
+//! RNNoise runs inside the capture callback ([`Placement::Inline`]). DeepFilterNet3 allocates on
+//! every frame, so it runs on a realtime DSP worker thread ([`Placement::Worker`]): the
+//! callback pushes 48 kHz audio into one ring, wakes the worker and pulls processed audio from
+//! a second ring, a fixed [`worker_reserve`] (one capture block + 2 ms) behind. When the worker
+//! has not delivered in time the callback crossfades to the dry signal at the same delay and
+//! counts a starvation; when it catches up, wet audio older than the current position is
+//! discarded before fading back, so audio never jumps backwards.
+//!
 //! # Drift control and latency
 //!
 //! The mic and the sink run on different clocks, so the ring between them would slowly fill or
@@ -37,10 +47,13 @@
 //! - less than that: bled off by the drift controller at up to 2000 ppm (under ~5 s).
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU32, AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU32, AtomicU64};
+use std::time::{Duration, Instant};
 
+use oto_dsp::filters::Delay;
 use oto_dsp::{Chain, Model, SAMPLE_RATE};
-use rtrb::{Consumer, Producer};
+use rtrb::{Consumer, Producer, RingBuffer};
 use rubato::audioadapter_buffers::direct::InterleavedSlice;
 use rubato::{Adjustable, Async, FixedAsync, PolynomialDegree, Resampler};
 
@@ -66,6 +79,15 @@ pub const TRIM_EXCESS: usize = 480;
 pub const TRIM_WINDOW_S: f64 = 0.25;
 /// Length of the fade applied when audio resumes after priming or a resync, seconds.
 pub const FADE_S: f64 = 0.003;
+/// Length of the fade-out before the streams stop (a model switch, say), seconds.
+pub const STOP_FADE_S: f64 = 0.010;
+
+/// [`Shared::stop_fade`] states.
+pub const STOP_FADE_IDLE: u8 = 0;
+/// Set by the control thread: the output callback fades to silence and holds it.
+pub const STOP_FADE_REQUESTED: u8 = 1;
+/// Set by the output callback once its output is silent.
+pub const STOP_FADE_DONE: u8 = 2;
 
 const RATE: f64 = SAMPLE_RATE as f64;
 
@@ -250,11 +272,26 @@ pub struct Shared {
     pub running: AtomicBool,
     pub in_cycles: AtomicU64,
     pub out_cycles: AtomicU64,
-    /// Nanoseconds spent inside both callbacks, cumulative.
+    /// Nanoseconds spent inside both callbacks and the DSP worker, cumulative.
     pub busy_ns: AtomicU64,
     /// Per-callback durations of the capture (mic) and output (sink) streams.
     pub capture_times: CallbackTimes,
     pub output_times: CallbackTimes,
+    /// Per-block processing time of the DSP worker ([`Placement::Worker`]); the first record is
+    /// its priming. Its `period_ns` is the capture period, the time it has per block.
+    pub worker_times: CallbackTimes,
+    /// The worker runs with realtime (time-constraint) scheduling.
+    pub worker_realtime: AtomicBool,
+    /// The worker joined the mic's IO-thread audio workgroup.
+    pub worker_workgroup: AtomicBool,
+    /// Capture blocks the worker had not processed in time, so dry audio filled in.
+    pub starvations: AtomicU64,
+    /// Times the worker fell a whole ring behind and its backlog was dropped.
+    pub worker_overflows: AtomicU64,
+    /// The worker reserve of the running streams, samples at 48 kHz (0 when inline).
+    pub reserve_frames: AtomicU32,
+    /// Fade-out handshake before stopping streams: `STOP_FADE_*`.
+    pub stop_fade: AtomicU8,
     /// The model the running streams use ([`encode_model`]), 0 when nothing runs.
     pub model: AtomicU8,
     pub underruns: AtomicU64,
@@ -285,6 +322,13 @@ impl Shared {
             busy_ns: AtomicU64::new(0),
             capture_times: CallbackTimes::new(),
             output_times: CallbackTimes::new(),
+            worker_times: CallbackTimes::new(),
+            worker_realtime: AtomicBool::new(false),
+            worker_workgroup: AtomicBool::new(false),
+            starvations: AtomicU64::new(0),
+            worker_overflows: AtomicU64::new(0),
+            reserve_frames: AtomicU32::new(0),
+            stop_fade: AtomicU8::new(STOP_FADE_IDLE),
             model: AtomicU8::new(0),
             underruns: AtomicU64::new(0),
             resyncs: AtomicU64::new(0),
@@ -434,33 +478,442 @@ pub fn peak_dbfs(buf: &[f32]) -> f32 {
     }
 }
 
+/// Where a model's chain runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Placement {
+    /// Inside the capture callback. For models that never allocate once primed (RNNoise).
+    Inline,
+    /// On a dedicated DSP thread fed through two rings from the capture callback (design B in
+    /// docs/plans/0001-deepfilternet3-default.md). For models that allocate per frame
+    /// (DeepFilterNet3): the audio callback stays allocation-free, the worker may allocate.
+    Worker,
+}
+
+/// Where this engine runs `model`'s chain: DeepFilterNet3 on the DSP worker, RNNoise inline.
+pub fn placement_for(model: Model) -> Placement {
+    match model {
+        Model::RNNoise => Placement::Inline,
+        Model::DeepFilterNet3 => Placement::Worker,
+    }
+}
+
+/// What the DSP worker's thread setup produced: whether it got realtime scheduling and whether
+/// it joined the capture device's audio workgroup, plus anything to keep alive (and drop on the
+/// worker thread when it exits, e.g. to leave the workgroup).
+pub struct DspThread {
+    pub realtime: bool,
+    pub workgroup: bool,
+    pub guard: Option<Box<dyn std::any::Any>>,
+}
+
+/// Runs first on the DSP worker thread, given the capture period in ns, to set up its
+/// scheduling. See [`default_dsp_setup`] and the platform's version.
+pub type DspSetup = Box<dyn FnOnce(u64) -> DspThread + Send>;
+
+/// Realtime priority only, no workgroup (no device to take one from).
+pub fn default_dsp_setup() -> DspSetup {
+    Box::new(|period_ns| DspThread {
+        realtime: crate::platform::sys::promote_dsp_thread(period_ns).is_ok(),
+        workgroup: false,
+        guard: None,
+    })
+}
+
+/// Crossfade between the worker's (wet) output and the dry signal, samples at 48 kHz (1 ms).
+pub const WORKER_FADE: usize = 48;
+/// Slack in the worker reserve beyond one capture block and the fade, samples at 48 kHz (1 ms):
+/// how much later than the next capture callback the worker may deliver without starving.
+pub const WORKER_SLACK: usize = 48;
+/// How long the worker sleeps when it hears nothing (it is woken by every capture callback;
+/// this only bounds how long it takes to notice a stop request).
+const WORKER_IDLE: Duration = Duration::from_millis(20);
+
+/// The reserve between the worker's rings, in samples at 48 kHz, for capture callbacks that
+/// deliver at most `max_block48` samples at 48 kHz.
+///
+/// At each capture callback the worker has normally processed everything pushed before it, so
+/// processed audio reaches exactly `reserve` samples past the start of the block the callback
+/// must output. The block needs `max_block48` of them, the fade-out on starvation needs
+/// [`WORKER_FADE`] more beyond the block (so it can fade on real wet audio), and
+/// [`WORKER_SLACK`] covers callback jitter and the worker's wake-up. The worker therefore has
+/// one capture period plus the slack to process each block.
+pub fn worker_reserve(max_block48: usize) -> usize {
+    max_block48 + WORKER_FADE + WORKER_SLACK
+}
+
+/// Most samples at 48 kHz one capture callback of `in_block` device frames can produce.
+fn max_block48(in_block: usize, rate: f64, resampled: bool) -> usize {
+    if !resampled {
+        return in_block;
+    }
+    // The input resampler runs in whole `IN_CHUNK`s, so a callback can complete one chunk more
+    // than its own frames fill (the rest of the previous callback's partial chunk).
+    let chunks = (in_block + IN_CHUNK - 1).div_ceil(IN_CHUNK);
+    chunks * ((IN_CHUNK as f64 * RATE / rate).ceil() as usize + 1)
+}
+
+/// The chain running inside the capture callback.
+struct InlineChain {
+    chain: Chain,
+    denoise: bool,
+    atten: f32,
+    /// Whether `Chain::prime` has run on the audio thread yet.
+    primed: bool,
+}
+
+impl InlineChain {
+    fn process(&mut self, buf: &mut [f32], shared: &Shared) {
+        apply_settings(&mut self.chain, &mut self.denoise, &mut self.atten, shared);
+        self.chain.process(buf);
+    }
+}
+
+/// Copies changed bypass/strength settings from `shared` into `chain`.
+fn apply_settings(chain: &mut Chain, denoise: &mut bool, atten: &mut f32, shared: &Shared) {
+    let d = shared.denoise.load(Relaxed);
+    if d != *denoise {
+        *denoise = d;
+        chain.set_enabled(d);
+    }
+    let a = f32::from_bits(shared.max_atten_bits.load(Relaxed));
+    if a.to_bits() != atten.to_bits() {
+        *atten = a;
+        chain.set_max_attenuation_db(a);
+    }
+}
+
+/// Handshake between the capture callback and the worker. All lock-free.
+struct WorkerSync {
+    stop: AtomicBool,
+    /// Bumped by the callback when the input ring overflowed: the worker drops its pending
+    /// input and acknowledges by copying the value to `flush_ack`.
+    flush_req: AtomicU32,
+    flush_ack: AtomicU32,
+    /// Tests: the worker leaves its input alone while set, to force starvation and overflow.
+    #[cfg(test)]
+    pause: AtomicBool,
+}
+
+/// The callback's end of the DSP worker: owns the rings, the dry path and the thread.
+///
+/// Sample accounting: `in_pos` counts samples entering the callback, the output of a call
+/// starts at input index `in_pos - delay()` (that is what the dry delay line yields), and wet
+/// sample number `w` (counted from `wet_base`, where the current worker stream started) is the
+/// chain's output after it consumed input `wet_base + w`, i.e. the processed version of input
+/// `wet_base + w - chain_latency`.
+struct Worker {
+    to: Producer<f32>,
+    from: Consumer<f32>,
+    sync: Arc<WorkerSync>,
+    thread: Option<std::thread::JoinHandle<()>>,
+    /// The worker's handle, to wake it. `unpark` does not allocate or block.
+    handle: std::thread::Thread,
+    flush_gen: u32,
+    flushing: bool,
+    dry: Delay,
+    dry_buf: Box<[f32]>,
+    wet_buf: Box<[f32]>,
+    chain_latency: i64,
+    reserve: usize,
+    in_pos: i64,
+    wet_base: i64,
+    /// Wet samples consumed (used or discarded) since `wet_base`.
+    wet_read: i64,
+    /// Share of wet signal in the output, ramped per sample.
+    mix: f32,
+    /// Wet minus dry at the last wet sample used.
+    last_diff: f32,
+}
+
+impl Worker {
+    /// Spawns and primes the worker. Allocates and blocks until the model is primed; call off
+    /// the realtime thread.
+    fn spawn(
+        chain: Chain,
+        max_block48: usize,
+        period_ns: u64,
+        shared: &Arc<Shared>,
+        setup: DspSetup,
+    ) -> Result<Self, String> {
+        let reserve = worker_reserve(max_block48);
+        let chain_latency = chain.latency();
+        let (to, input) = RingBuffer::new(RING_CAPACITY);
+        // Unconsumed wet audio never exceeds the input ring plus the reserve and one block (the
+        // callback discards stale wet audio every call), so this ring cannot overflow.
+        let (output, from) = RingBuffer::new(2 * RING_CAPACITY);
+        let sync = Arc::new(WorkerSync {
+            stop: AtomicBool::new(false),
+            flush_req: AtomicU32::new(0),
+            flush_ack: AtomicU32::new(0),
+            #[cfg(test)]
+            pause: AtomicBool::new(false),
+        });
+        shared.worker_times.reset();
+        shared.worker_times.period_ns.store(period_ns, Relaxed);
+        shared.worker_realtime.store(false, Relaxed);
+        shared.worker_workgroup.store(false, Relaxed);
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+        let thread = std::thread::Builder::new()
+            .name("oto-dsp".into())
+            .spawn({
+                let (sync, shared) = (sync.clone(), shared.clone());
+                move || {
+                    let thread = setup(period_ns);
+                    shared.worker_realtime.store(thread.realtime, Relaxed);
+                    shared.worker_workgroup.store(thread.workgroup, Relaxed);
+                    worker_main(chain, input, output, &sync, &shared, ready_tx);
+                    // Leaves the workgroup (if any) on this thread, as it must.
+                    drop(thread);
+                }
+            })
+            .map_err(|e| format!("cannot start the DSP thread: {e}"))?;
+        let handle = thread.thread().clone();
+        let delay = chain_latency + reserve;
+        let w = Self {
+            to,
+            from,
+            sync,
+            thread: Some(thread),
+            handle,
+            flush_gen: 0,
+            flushing: false,
+            dry: Delay::new(delay),
+            dry_buf: vec![0.0; MAX_BLOCK].into(),
+            wet_buf: vec![0.0; MAX_BLOCK].into(),
+            chain_latency: chain_latency as i64,
+            reserve,
+            in_pos: 0,
+            wet_base: 0,
+            wet_read: 0,
+            mix: 0.0,
+            last_diff: 0.0,
+        };
+        // On failure `w` is dropped, which stops and joins the thread.
+        match ready_rx.recv_timeout(Duration::from_secs(10)) {
+            Ok(()) => Ok(w),
+            Err(_) => Err("the DSP thread did not start".into()),
+        }
+    }
+
+    /// Delay from input to output, samples at 48 kHz: the chain's plus the reserve.
+    fn delay(&self) -> usize {
+        self.chain_latency as usize + self.reserve
+    }
+
+    fn discard_wet(&mut self, n: usize) -> usize {
+        let n = n.min(self.from.slots());
+        if let Ok(c) = self.from.read_chunk(n) {
+            c.commit_all();
+        }
+        n
+    }
+
+    /// Hands `buf` to the worker and replaces it with processed audio from `delay()` samples
+    /// ago, or the dry signal at that delay where the worker has not delivered. Realtime-safe.
+    fn run(&mut self, buf: &mut [f32], shared: &Shared) {
+        let len = buf.len();
+        let n = len as i64;
+        if self.flushing && self.sync.flush_ack.load(Acquire) == self.flush_gen {
+            // The worker dropped its input and everything it pushed before is visible: start a
+            // fresh wet stream from this block on.
+            self.discard_wet(usize::MAX);
+            self.flushing = false;
+            self.wet_base = self.in_pos;
+            self.wet_read = 0;
+        }
+        if !self.flushing {
+            if self.to.slots() >= len {
+                let _ = self.to.push_entire_slice(buf);
+            } else {
+                // The worker is a ring (≈340 ms) behind. Pushing part of the block would break
+                // the sample accounting, so drop its backlog and restart the wet stream.
+                shared.worker_overflows.fetch_add(1, Relaxed);
+                self.flush_gen = self.flush_gen.wrapping_add(1);
+                self.sync.flush_req.store(self.flush_gen, Release);
+                self.flushing = true;
+            }
+            self.handle.unpark();
+        }
+        self.dry.process(buf, &mut self.dry_buf[..len]);
+        let o0 = self.in_pos - self.delay() as i64;
+        self.in_pos += n;
+
+        // Block-relative range [first, end) the wet stream covers; `end` may lie past the block
+        // (that lookahead lets a fade-out run on real wet audio). Before `wet_base` there is no
+        // wet stream: output dry (silence at stream start).
+        let first = (self.wet_base - o0).clamp(0, n);
+        let mut end = first;
+        if !self.flushing && first < n {
+            // The wet sample that belongs at block index `first`.
+            let need = o0 + first - self.wet_base + self.chain_latency;
+            if self.wet_read < need {
+                // Stale: the worker caught up after a starvation, or the chain's start-up
+                // output. Dropped so the output never jumps backwards.
+                let k = self.discard_wet((need - self.wet_read) as usize);
+                self.wet_read += k as i64;
+            }
+            if self.wet_read == need {
+                end = first + self.from.slots() as i64;
+            }
+        }
+        let take = (end.min(n) - first).max(0) as usize;
+        let f = first as usize;
+        if take > 0 {
+            let _ = self.from.pop_entire_slice(&mut self.wet_buf[f..f + take]);
+            self.wet_read += take as i64;
+        }
+
+        let step = 1.0 / WORKER_FADE as f32;
+        for (i, (y, &dry)) in buf.iter_mut().zip(&self.dry_buf[..len]).enumerate() {
+            let at = i as i64;
+            let wet = at >= first && at < end;
+            // Normally the fade-out ends exactly where the wet audio runs out (the reserve
+            // leaves WORKER_FADE samples of lookahead). The mix never moves by more than one
+            // step per sample, so if wet audio ever runs out sooner, the fade continues on the
+            // last wet-minus-dry difference instead of cutting to dry.
+            let target = if wet {
+                ((end - at) as f32 * step).min(1.0)
+            } else {
+                0.0
+            };
+            self.mix = (self.mix + step).min(target).max(self.mix - step).max(0.0);
+            *y = if !wet {
+                dry + self.last_diff * self.mix
+            } else if self.mix >= 1.0 {
+                self.last_diff = self.wet_buf[i] - dry;
+                self.wet_buf[i]
+            } else {
+                self.last_diff = self.wet_buf[i] - dry;
+                dry + self.last_diff * self.mix
+            };
+        }
+        if first < n && end < n {
+            shared.starvations.fetch_add(1, Relaxed);
+        }
+    }
+}
+
+impl Drop for Worker {
+    fn drop(&mut self) {
+        self.sync.stop.store(true, Release);
+        self.handle.unpark();
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
+/// The DSP thread: owns the chain, primes it, then processes whatever the capture callback
+/// pushed. May allocate (DeepFilterNet3 does on every frame).
+fn worker_main(
+    mut chain: Chain,
+    mut input: Consumer<f32>,
+    mut output: Producer<f32>,
+    sync: &WorkerSync,
+    shared: &Shared,
+    ready: std::sync::mpsc::SyncSender<()>,
+) {
+    let t0 = Instant::now();
+    chain.prime();
+    // The first record is kept apart as the priming time.
+    shared.worker_times.record(t0.elapsed().as_nanos() as u64);
+    let _ = ready.send(());
+    let mut buf = vec![0.0f32; MAX_BLOCK];
+    let (mut denoise, mut atten) = (chain.enabled(), chain.max_attenuation_db());
+    let mut seen = 0u32;
+    while !sync.stop.load(Acquire) {
+        let g = sync.flush_req.load(Acquire);
+        if g != seen {
+            let n = input.slots();
+            if let Ok(c) = input.read_chunk(n) {
+                c.commit_all();
+            }
+            seen = g;
+            sync.flush_ack.store(g, Release);
+            continue;
+        }
+        let n = input.slots().min(MAX_BLOCK);
+        #[cfg(test)]
+        let n = if sync.pause.load(Acquire) { 0 } else { n };
+        if n == 0 {
+            std::thread::park_timeout(WORKER_IDLE);
+            continue;
+        }
+        let _ = input.pop_entire_slice(&mut buf[..n]);
+        apply_settings(&mut chain, &mut denoise, &mut atten, shared);
+        let t = Instant::now();
+        chain.process(&mut buf[..n]);
+        let dt = t.elapsed().as_nanos() as u64;
+        shared.worker_times.record(dt);
+        shared.busy_ns.fetch_add(dt, Relaxed);
+        if output.push_entire_slice(&buf[..n]).is_err() {
+            shared.worker_overflows.fetch_add(1, Relaxed);
+        }
+    }
+}
+
+enum ChainRunner {
+    Inline(InlineChain),
+    Worker(Worker),
+}
+
 /// Mic side: device-rate mono in, 48 kHz processed audio into the ring.
+///
+/// The chain runs either inline (in [`Self::process`]) or on a DSP worker thread, see
+/// [`Placement`]. Either way `process` does not allocate after the first call.
 pub struct CaptureStage {
     mono: Box<[f32]>,
     stage: Box<[f32]>,
     stage_len: usize,
     resampler: Option<Async<f32>>,
     out48: Box<[f32]>,
-    chain: Chain,
-    denoise: bool,
-    atten: f32,
+    runner: ChainRunner,
     producer: Producer<f32>,
     shared: Arc<Shared>,
     probe: Option<ProbeGen>,
     source: Option<(Arc<[f32]>, usize)>,
     level_raw: f32,
     level_clean: f32,
-    /// Whether `Chain::prime` has run on the audio thread yet.
-    primed: bool,
 }
 
 impl CaptureStage {
-    /// Allocates; call off the realtime thread.
+    /// Allocates (and for a worker model starts and primes the DSP thread); call off the
+    /// realtime thread. `in_block` is the device IO buffer in frames at `rate`. The chain runs
+    /// where [`placement_for`] says.
     pub fn new(
         rate: f64,
+        in_block: usize,
         chain: Chain,
         producer: Producer<f32>,
         shared: Arc<Shared>,
+    ) -> Result<Self, String> {
+        let placement = placement_for(chain.model());
+        Self::with_placement(rate, in_block, chain, producer, shared, placement)
+    }
+
+    /// [`Self::new`] with the chain placed explicitly (tests run RNNoise on the worker too).
+    pub fn with_placement(
+        rate: f64,
+        in_block: usize,
+        chain: Chain,
+        producer: Producer<f32>,
+        shared: Arc<Shared>,
+        placement: Placement,
+    ) -> Result<Self, String> {
+        let setup = default_dsp_setup();
+        Self::build(rate, in_block, chain, producer, shared, placement, setup)
+    }
+
+    /// The full constructor: `setup` runs first on the DSP worker thread (unused inline). The
+    /// macOS backend uses it to join the mic's IO-thread audio workgroup.
+    pub fn build(
+        rate: f64,
+        in_block: usize,
+        chain: Chain,
+        producer: Producer<f32>,
+        shared: Arc<Shared>,
+        placement: Placement,
+        setup: DspSetup,
     ) -> Result<Self, String> {
         let resampler = if (rate - RATE).abs() > 0.5 {
             let params = rubato::SincInterpolationParameters {
@@ -497,32 +950,74 @@ impl CaptureStage {
         let atten = f32::from_bits(shared.max_atten_bits.load(Relaxed));
         chain.set_enabled(denoise);
         chain.set_max_attenuation_db(atten);
+        let runner = match placement {
+            Placement::Inline => {
+                shared.worker_times.reset();
+                shared.worker_times.period_ns.store(0, Relaxed);
+                shared.worker_realtime.store(false, Relaxed);
+                shared.worker_workgroup.store(false, Relaxed);
+                ChainRunner::Inline(InlineChain {
+                    chain,
+                    denoise,
+                    atten,
+                    primed: false,
+                })
+            }
+            Placement::Worker => {
+                let block = in_block.clamp(1, MAX_BLOCK);
+                let period_ns = (block as f64 * 1e9 / rate) as u64;
+                let max48 = max_block48(block, rate, resampler.is_some()).min(max_out);
+                ChainRunner::Worker(Worker::spawn(chain, max48, period_ns, &shared, setup)?)
+            }
+        };
+        let reserve = match &runner {
+            ChainRunner::Inline(_) => 0,
+            ChainRunner::Worker(w) => w.reserve,
+        };
+        shared.reserve_frames.store(reserve as u32, Relaxed);
         Ok(Self {
             mono: vec![0.0; MAX_BLOCK].into(),
             stage: vec![0.0; IN_CHUNK].into(),
             stage_len: 0,
             resampler,
             out48: vec![0.0; max_out].into(),
-            chain,
-            denoise,
-            atten,
+            runner,
             producer,
             shared,
             source,
             probe,
             level_raw: -120.0,
             level_clean: -120.0,
-            primed: false,
         })
     }
 
-    /// Delay added by the input resampler and the chain, in frames at 48 kHz.
+    /// Where the chain runs.
+    pub fn placement(&self) -> Placement {
+        match self.runner {
+            ChainRunner::Inline(_) => Placement::Inline,
+            ChainRunner::Worker(_) => Placement::Worker,
+        }
+    }
+
+    /// The worker reserve in samples at 48 kHz (0 when the chain runs inline).
+    pub fn reserve_frames(&self) -> usize {
+        match &self.runner {
+            ChainRunner::Inline(_) => 0,
+            ChainRunner::Worker(w) => w.reserve,
+        }
+    }
+
+    /// Delay added by the input resampler, the chain and (on the worker) the reserve, in
+    /// frames at 48 kHz.
     pub fn latency_frames(&self) -> usize {
         let rs = self
             .resampler
             .as_ref()
             .map_or(0, |r| r.output_delay() + IN_CHUNK);
-        rs + self.chain.latency()
+        rs + match &self.runner {
+            ChainRunner::Inline(c) => c.chain.latency(),
+            ChainRunner::Worker(w) => w.delay(),
+        }
     }
 
     /// Scratch buffer (`MAX_BLOCK` long) to downmix device audio into before [`Self::process`].
@@ -532,11 +1027,16 @@ impl CaptureStage {
 
     /// Process the first `n` (≤ `MAX_BLOCK`) samples of [`Self::mono_mut`]. `first_ns` is the
     /// host-clock capture time of the first sample, or 0 if unknown.
+    ///
+    /// Never allocates, except that the first call primes an inline model on the calling thread
+    /// (decision 3 of plan 0001: RNNoise sets up per-thread state on its first frame).
     pub fn process(&mut self, n: usize, first_ns: u64) {
-        if !self.primed {
+        if let ChainRunner::Inline(c) = &mut self.runner
+            && !c.primed
+        {
             // One-time per-thread model setup, so later callbacks never allocate.
-            self.chain.prime();
-            self.primed = true;
+            c.chain.prime();
+            c.primed = true;
         }
         let n = n.min(MAX_BLOCK);
         // A glitching device can hand us NaN or infinity; keep it out of the resampler too.
@@ -584,18 +1084,16 @@ impl CaptureStage {
             return;
         }
         let buf = &mut self.out48[..len];
-        let denoise = self.shared.denoise.load(Relaxed);
-        if denoise != self.denoise {
-            self.denoise = denoise;
-            self.chain.set_enabled(denoise);
-        }
-        let atten = f32::from_bits(self.shared.max_atten_bits.load(Relaxed));
-        if atten.to_bits() != self.atten.to_bits() {
-            self.atten = atten;
-            self.chain.set_max_attenuation_db(atten);
-        }
         self.level_raw = peak_dbfs(buf);
-        self.chain.process(buf);
+        match &mut self.runner {
+            ChainRunner::Inline(c) => c.process(buf, &self.shared),
+            ChainRunner::Worker(w) => {
+                // The worker's scratch buffers hold MAX_BLOCK samples.
+                for part in buf.chunks_mut(MAX_BLOCK) {
+                    w.run(part, &self.shared);
+                }
+            }
+        }
         self.level_clean = peak_dbfs(buf);
         self.shared.levels.set(self.level_raw, self.level_clean);
         let (_, rest) = self.producer.push_partial_slice(buf);
@@ -690,6 +1188,9 @@ pub struct OutputStage {
     win_t: f64,
     /// The previous callback saw more than `target + TRIM_EXCESS`.
     was_over: bool,
+    /// Gain of the fade-out before a stop ([`Shared::stop_fade`]) and its per-sample step.
+    stop_gain: f32,
+    stop_step: f32,
 }
 
 impl OutputStage {
@@ -712,6 +1213,7 @@ impl OutputStage {
         let inbuf = vec![0.0; resampler.input_frames_max()].into();
         let pend = vec![0.0; resampler.output_frames_max()].into();
         shared.target_frames.store(target as u32, Relaxed);
+        shared.stop_fade.store(STOP_FADE_IDLE, Relaxed);
         Ok(Self {
             consumer,
             resampler,
@@ -730,6 +1232,8 @@ impl OutputStage {
             win_sum: 0.0,
             win_t: 0.0,
             was_over: false,
+            stop_gain: 1.0,
+            stop_step: (1.0 / (STOP_FADE_S * rate).max(1.0)) as f32,
         })
     }
 
@@ -775,6 +1279,24 @@ impl OutputStage {
 
     /// Fill `out` (mono, device rate).
     pub fn render(&mut self, out: &mut [f32]) {
+        if self.stop_gain <= 0.0 {
+            // Faded out for a stop: hold silence until the stream is stopped.
+            out.fill(0.0);
+            return;
+        }
+        self.render_ring(out);
+        if self.shared.stop_fade.load(Acquire) == STOP_FADE_REQUESTED {
+            for s in out.iter_mut() {
+                self.stop_gain = (self.stop_gain - self.stop_step).max(0.0);
+                *s *= self.stop_gain;
+            }
+            if self.stop_gain <= 0.0 {
+                self.shared.stop_fade.store(STOP_FADE_DONE, Release);
+            }
+        }
+    }
+
+    fn render_ring(&mut self, out: &mut [f32]) {
         let dt = out.len() as f64 / self.rate;
         let mut fill = self.fill_now();
         let target = self.ctl.target();
@@ -948,6 +1470,12 @@ mod tests {
         }
     }
 
+    /// RNNoise explicitly: `Chain::new()` is DeepFilterNet3 in `dfn3` builds, which would put
+    /// these stages on the worker.
+    fn rnnoise() -> Chain {
+        Chain::with_model(Model::RNNoise).unwrap()
+    }
+
     fn shared() -> Arc<Shared> {
         let s = Shared::new(Arc::new(Levels::default()), None);
         // Keep the denoiser out of signal-shape assertions once the real chain lands.
@@ -1031,7 +1559,7 @@ mod tests {
     #[test]
     fn capture_survives_non_finite_input() {
         let (prod, mut cons) = RingBuffer::new(1 << 16);
-        let mut cap = CaptureStage::new(44_100.0, Chain::new(), prod, shared()).unwrap();
+        let mut cap = CaptureStage::new(44_100.0, 441, rnnoise(), prod, shared()).unwrap();
         for block in 0..200 {
             for (i, s) in cap.mono_mut()[..441].iter_mut().enumerate() {
                 let k = (block * 441 + i) as f64;
@@ -1074,7 +1602,7 @@ mod tests {
     #[test]
     fn capture_resamples_44k1_to_48k_preserving_pitch_and_level() {
         let (prod, mut cons) = RingBuffer::new(1 << 20);
-        let mut cap = CaptureStage::new(44_100.0, Chain::new(), prod, shared()).unwrap();
+        let mut cap = CaptureStage::new(44_100.0, 441, rnnoise(), prod, shared()).unwrap();
         let total = 44_100 * 2;
         let mut t = 0usize;
         for block in [441usize, 512, 37, 1000].iter().cycle() {
@@ -1105,13 +1633,325 @@ mod tests {
     #[test]
     fn capture_at_48k_is_bit_transparent_with_stub_chain_bypassed() {
         let (prod, cons) = RingBuffer::new(4096);
-        let mut cap = CaptureStage::new(48_000.0, Chain::new(), prod, shared()).unwrap();
-        assert_eq!(cap.latency_frames(), Chain::new().latency());
+        let mut cap = CaptureStage::new(48_000.0, 256, rnnoise(), prod, shared()).unwrap();
+        assert_eq!(cap.placement(), Placement::Inline);
+        assert_eq!(cap.latency_frames(), rnnoise().latency());
         for (i, s) in cap.mono_mut()[..100].iter_mut().enumerate() {
             *s = i as f32 / 1000.0;
         }
         cap.process(100, 0);
         assert_eq!(cons.slots(), 100);
+    }
+
+    fn tone(k: usize, rate: f64) -> f32 {
+        0.25 * (2.0 * std::f64::consts::PI * 440.0 * k as f64 / rate).sin() as f32
+    }
+
+    fn worker_of(cap: &CaptureStage) -> &Worker {
+        match &cap.runner {
+            ChainRunner::Worker(w) => w,
+            ChainRunner::Inline(_) => panic!("chain runs inline"),
+        }
+    }
+
+    /// Waits until the worker has processed everything the stage handed it.
+    fn settle(cap: &CaptureStage) {
+        let w = worker_of(cap);
+        let t = Instant::now();
+        while w.wet_read + w.from.slots() as i64 != w.in_pos - w.wet_base || w.flushing {
+            assert!(
+                t.elapsed() < Duration::from_secs(5),
+                "worker did not catch up"
+            );
+            std::thread::sleep(Duration::from_micros(200));
+        }
+    }
+
+    struct Run {
+        out: Vec<f32>,
+        shared: Arc<Shared>,
+        latency: usize,
+        reserve: usize,
+    }
+
+    /// Feeds `blocks` device blocks of a 440 Hz tone through a capture stage. With
+    /// `Placement::Worker`, the worker is paused during blocks for which `paused` is true and
+    /// otherwise waited for after each block (so it never starves by accident).
+    fn run_capture(
+        rate: f64,
+        block: usize,
+        placement: Placement,
+        blocks: usize,
+        sh: Arc<Shared>,
+        source: impl Fn(usize) -> f32,
+        mut each: impl FnMut(usize, &Shared) -> bool,
+    ) -> Run {
+        let (prod, mut cons) = RingBuffer::new(1 << 22);
+        let mut cap =
+            CaptureStage::with_placement(rate, block, rnnoise(), prod, sh.clone(), placement)
+                .unwrap();
+        assert_eq!(cap.placement(), placement);
+        let mut k = 0;
+        let mut out = Vec::new();
+        for b in 0..blocks {
+            let paused = each(b, &sh);
+            if placement == Placement::Worker {
+                worker_of(&cap).sync.pause.store(paused, Release);
+            }
+            for s in &mut cap.mono_mut()[..block] {
+                *s = source(k);
+                k += 1;
+            }
+            cap.process(block, 0);
+            if placement == Placement::Worker && !paused {
+                settle(&cap);
+            }
+            let n = cons.slots();
+            let at = out.len();
+            out.resize(at + n, 0.0);
+            cons.pop_entire_slice(&mut out[at..]).unwrap();
+        }
+        Run {
+            out,
+            latency: cap.latency_frames(),
+            reserve: cap.reserve_frames(),
+            shared: sh,
+        }
+    }
+
+    fn max_step(x: &[f32]) -> f32 {
+        x.windows(2).fold(0.0, |m, w| m.max((w[1] - w[0]).abs()))
+    }
+
+    #[test]
+    fn worker_output_is_the_inline_output_delayed_by_the_reserve() {
+        for (rate, block) in [(48_000.0, 256), (44_100.0, 441), (16_000.0, 85)] {
+            let src = |k| tone(k, rate);
+            let w = run_capture(
+                rate,
+                block,
+                Placement::Worker,
+                300,
+                shared(),
+                src,
+                |_, _| false,
+            );
+            let r = run_capture(
+                rate,
+                block,
+                Placement::Inline,
+                300,
+                shared(),
+                src,
+                |_, _| false,
+            );
+            assert_eq!(w.shared.starvations.load(Relaxed), 0, "{rate}");
+            assert_eq!(w.shared.worker_overflows.load(Relaxed), 0, "{rate}");
+            assert_eq!(w.out.len(), r.out.len());
+            let res = w.reserve;
+            assert_eq!(
+                res,
+                worker_reserve(max_block48(block, rate, rate != 48_000.0))
+            );
+            assert_eq!(
+                w.latency,
+                r.latency + res,
+                "{rate}: latency includes the reserve"
+            );
+            assert_eq!(r.reserve, 0);
+            eprintln!(
+                "{rate} Hz / {block}: reserve {res} samples ({:.2} ms)",
+                res as f64 / 48.0
+            );
+            // Past the start-up fade the worker path is bit-identical to the inline path, `res`
+            // samples later.
+            let d = w.latency - r.latency + rnnoise().latency() + WORKER_FADE;
+            for k in d..w.out.len() {
+                assert_eq!(w.out[k], r.out[k - res], "{rate} Hz, sample {k}");
+            }
+            assert!(max_step(&w.out) < 0.05, "{rate}: {}", max_step(&w.out));
+            // The worker recorded its priming apart and a time for every block.
+            assert!(w.shared.worker_times.calls() > 1);
+            assert!(w.shared.worker_times.period_ns.load(Relaxed) > 0);
+        }
+    }
+
+    #[test]
+    fn starvation_crossfades_to_dry_and_back_without_going_backwards() {
+        let rate = 48_000.0;
+        let src = |k| tone(k, rate);
+        let paused = |b: usize, _: &Shared| (100..103).contains(&b);
+        let w = run_capture(rate, 256, Placement::Worker, 300, shared(), src, paused);
+        let r = run_capture(rate, 256, Placement::Inline, 300, shared(), src, |_, _| {
+            false
+        });
+        let starved = w.shared.starvations.load(Relaxed);
+        eprintln!("starved blocks: {starved}");
+        assert!((2..=4).contains(&starved), "starvations {starved}");
+        assert_eq!(w.shared.worker_overflows.load(Relaxed), 0);
+        // Dry audio filled the gap: the tone never dropped out.
+        let gap = &w.out[101 * 256..104 * 256];
+        let rms = (gap.iter().map(|s| s * s).sum::<f32>() / gap.len() as f32).sqrt();
+        assert!(
+            (rms - 0.25 / 2f32.sqrt()).abs() < 0.03,
+            "rms in the gap {rms}"
+        );
+        // Crossfades, no steps: a 440 Hz tone at 0.25 moves < 0.015 per sample; the wet/dry
+        // difference (the high-pass's phase shift) is spread over WORKER_FADE samples.
+        let step = max_step(&w.out[1000..]);
+        assert!(step < 0.03, "largest step {step}");
+        // Once caught up, exactly the inline output at the same fixed delay again: the stale
+        // wet audio was discarded rather than played late.
+        let res = w.reserve;
+        for k in 106 * 256..w.out.len() {
+            assert_eq!(w.out[k], r.out[k - res], "sample {k}");
+        }
+    }
+
+    /// The reserve normally leaves a fade's worth of wet audio beyond every block. If wet audio
+    /// ever vanished at a block start anyway, the fade-out continues on the last wet-minus-dry
+    /// difference rather than cutting to dry.
+    #[test]
+    fn wet_running_out_without_lookahead_still_fades() {
+        let rate = 48_000.0;
+        let src = |k| tone(k, rate);
+        let steal = |b: usize, _: &Shared| b >= 100;
+        let (prod, mut cons) = RingBuffer::new(1 << 22);
+        let sh = shared();
+        let mut cap =
+            CaptureStage::with_placement(rate, 256, rnnoise(), prod, sh.clone(), Placement::Worker)
+                .unwrap();
+        let mut out = Vec::new();
+        for b in 0..104 {
+            worker_of(&cap).sync.pause.store(steal(b, &sh), Release);
+            if b == 100 {
+                // Everything the worker delivered disappears, as if it had never arrived.
+                let ChainRunner::Worker(w) = &mut cap.runner else {
+                    unreachable!()
+                };
+                let k = w.discard_wet(usize::MAX);
+                w.wet_read += k as i64;
+            }
+            for (i, s) in cap.mono_mut()[..256].iter_mut().enumerate() {
+                *s = src(b * 256 + i);
+            }
+            cap.process(256, 0);
+            if !steal(b, &sh) {
+                settle(&cap);
+            }
+            let n = cons.slots();
+            let at = out.len();
+            out.resize(at + n, 0.0);
+            cons.pop_entire_slice(&mut out[at..]).unwrap();
+        }
+        assert!(sh.starvations.load(Relaxed) >= 1);
+        let step = max_step(&out[1000..]);
+        assert!(step < 0.03, "largest step {step}");
+    }
+
+    #[test]
+    fn worker_overflow_drops_the_backlog_and_recovers() {
+        let rate = 48_000.0;
+        let src = |k| tone(k, rate);
+        // 80 blocks of 256 overfill the 16384-sample input ring.
+        let paused = |b: usize, _: &Shared| (50..130).contains(&b);
+        let w = run_capture(rate, 256, Placement::Worker, 400, shared(), src, paused);
+        let r = run_capture(rate, 256, Placement::Inline, 400, shared(), src, |_, _| {
+            false
+        });
+        assert_eq!(w.shared.worker_overflows.load(Relaxed), 1);
+        assert!(w.shared.starvations.load(Relaxed) > 60);
+        assert!(w.out.iter().all(|s| s.is_finite()));
+        assert!(max_step(&w.out[1000..]) < 0.03);
+        // Back on the fixed delay; the chain's filters have long settled after the jump.
+        let res = w.reserve;
+        let tail = w.out.len() - 50 * 256;
+        for k in tail..w.out.len() {
+            assert!((w.out[k] - r.out[k - res]).abs() < 1e-4, "sample {k}");
+        }
+    }
+
+    #[test]
+    fn bypass_and_strength_reach_the_worker_chain() {
+        let audio = oto_dsp::signal::noisy_speech(48_000 * 4, 3);
+        // Denoise on, then strength changes, bypass and back, at block boundaries.
+        let schedule = |b: usize, s: &Shared| {
+            let (on, db) = match b {
+                0..100 => (true, 24.0),
+                100..200 => (true, 12.0),
+                200..300 => (false, 12.0),
+                300..450 => (true, f32::INFINITY),
+                _ => (true, 24.0),
+            };
+            s.denoise.store(on, Relaxed);
+            s.max_atten_bits.store(f32::to_bits(db), Relaxed);
+            false
+        };
+        let src = |k: usize| audio[k];
+        let w = run_capture(
+            48_000.0,
+            256,
+            Placement::Worker,
+            700,
+            shared(),
+            src,
+            schedule,
+        );
+        let r = run_capture(
+            48_000.0,
+            256,
+            Placement::Inline,
+            700,
+            shared(),
+            src,
+            schedule,
+        );
+        // The worker saw every change at the same point in the stream as the inline chain.
+        let res = w.reserve;
+        let d = w.latency - r.latency + rnnoise().latency() + WORKER_FADE;
+        for k in d..w.out.len() {
+            assert_eq!(w.out[k], r.out[k - res], "sample {k}");
+        }
+        // And the changes did something: a run that stays on 24 dB differs.
+        let fixed = |_: usize, s: &Shared| {
+            s.denoise.store(true, Relaxed);
+            false
+        };
+        let f = run_capture(48_000.0, 256, Placement::Worker, 700, shared(), src, fixed);
+        let differs = |a: usize, b: usize| (a * 256..b * 256).any(|k| w.out[k] != f.out[k]);
+        assert!(differs(110, 200) && differs(210, 300) && differs(310, 450));
+    }
+
+    #[test]
+    fn stop_fade_ramps_to_silence_and_reports_done() {
+        let sh = shared();
+        let (mut prod, cons) = RingBuffer::new(RING_CAPACITY);
+        let mut out = OutputStage::new(cons, 48_000.0, 300, sh.clone()).unwrap();
+        prod.push_entire_slice(&[0.5; 2000]).unwrap();
+        let mut buf = [0.0f32; 128];
+        for _ in 0..4 {
+            out.render(&mut buf);
+        }
+        assert!(buf.iter().all(|&s| (s - 0.5).abs() < 1e-3));
+        sh.stop_fade.store(STOP_FADE_REQUESTED, Release);
+        let mut faded = Vec::new();
+        for _ in 0..6 {
+            out.render(&mut buf);
+            faded.extend_from_slice(&buf);
+        }
+        assert_eq!(sh.stop_fade.load(Acquire), STOP_FADE_DONE);
+        // 10 ms at 48 kHz = 480 samples: a ramp, then held silence.
+        assert!(faded[479..].iter().all(|&s| s == 0.0));
+        assert!(
+            max_step(&faded) <= 0.5 / 480.0 + 1e-6,
+            "{}",
+            max_step(&faded)
+        );
+        assert!(faded[0] > 0.49);
+        // A new stage (the next start) clears the request.
+        let (_p, c) = RingBuffer::<f32>::new(16);
+        let _next = OutputStage::new(c, 48_000.0, 300, sh.clone()).unwrap();
+        assert_eq!(sh.stop_fade.load(Relaxed), STOP_FADE_IDLE);
     }
 
     struct SimResult {
@@ -1127,7 +1967,7 @@ mod tests {
     fn simulate(ppm: f64, in_block: usize, out_block: usize, seconds: f64) -> SimResult {
         let sh = shared();
         let (prod, cons) = RingBuffer::new(RING_CAPACITY);
-        let mut cap = CaptureStage::new(48_000.0, Chain::new(), prod, sh.clone()).unwrap();
+        let mut cap = CaptureStage::new(48_000.0, 256, rnnoise(), prod, sh.clone()).unwrap();
         let target = target_fill(in_block, 48_000.0, out_block, 48_000.0);
         let mut out = OutputStage::new(cons, 48_000.0, target, sh.clone()).unwrap();
         let in_period = in_block as f64 / (48_000.0 * (1.0 + ppm * 1e-6));
@@ -1293,7 +2133,7 @@ mod tests {
         let (in_block, out_block) = (256usize, 128usize);
         let sh = shared();
         let (prod, cons) = RingBuffer::new(RING_CAPACITY);
-        let mut cap = CaptureStage::new(48_000.0, Chain::new(), prod, sh.clone()).unwrap();
+        let mut cap = CaptureStage::new(48_000.0, 256, rnnoise(), prod, sh.clone()).unwrap();
         let target = target_fill(in_block, 48_000.0, out_block, 48_000.0);
         let mut out = OutputStage::new(cons, 48_000.0, target, sh.clone()).unwrap();
         let in_period = in_block as f64 / (48_000.0 * (1.0 + PPM * 1e-6));

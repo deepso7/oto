@@ -3,13 +3,17 @@
 //! The UI and CLI never touch audio directly. They send [`Command`]s and read [`Event`]s, which
 //! keeps the engine free to move into its own process later without changing its callers.
 //! See docs/architecture.md for the design. Threads: the caller's, one control thread (`oto-control`) owning
-//! devices and state, and the two Core Audio IO threads (mic, sink) running the realtime path.
+//! devices and state, the two Core Audio IO threads (mic, sink) running the realtime path, and
+//! for DeepFilterNet3 a realtime DSP worker (`oto-dsp`) that runs the chain off the callback.
 
 pub use oto_dsp as dsp;
 
 mod control;
 pub mod latency;
-mod pipeline;
+/// The realtime path. Public only for the integration tests in `tests/` (allocation counting
+/// needs its own test binary); not a stable API.
+#[doc(hidden)]
+pub mod pipeline;
 mod platform;
 mod state;
 
@@ -61,7 +65,7 @@ pub enum Event {
     /// The virtual mic gained or lost its last listener. Inference only runs while `true`.
     ClientsActive(bool),
     DevicesChanged,
-    /// Share of one core spent in the audio callback, 0.0 to 1.0.
+    /// Share of one core spent in the audio callbacks and the DSP worker, 0.0 to 1.0.
     Load(f32),
     /// Something is wrong. Stays true until [`Event::Recovered`] (or the next `Error`).
     Error(String),
@@ -333,15 +337,32 @@ pub struct Stats {
     pub underruns: u64,
     pub resyncs: u64,
     pub overflows: u64,
+    /// Capture blocks the DSP worker had not processed in time, so the dry signal (at the same
+    /// delay, crossfaded) filled in. Always 0 for models that run inline.
+    pub starvations: u64,
+    /// Times the DSP worker fell a whole ring (≈340 ms) behind and its backlog was dropped.
+    pub worker_overflows: u64,
     /// Mic-to-sink latency estimated from device-reported latencies, buffers and ring target.
-    /// Includes the running model's delay.
+    /// Includes the running model's delay and the worker reserve.
     pub estimated_latency_ms: f32,
+    /// The reserve between the capture callback and the DSP worker, ms. 0 when the model runs
+    /// inside the capture callback (RNNoise).
+    pub worker_reserve_ms: f32,
+    /// The DSP worker got realtime (time-constraint) scheduling.
+    pub worker_realtime: bool,
+    /// The DSP worker joined the mic's IO-thread audio workgroup, so the scheduler runs it on
+    /// the audio deadline (on Apple Silicon: performance cores at speed).
+    pub worker_workgroup: bool,
     /// The model the running streams use (after any fallback), `None` when not running.
     pub model: Option<dsp::Model>,
     /// Callback timing of the capture (mic) stream, since the streams last started.
     pub capture: CallbackStats,
     /// Callback timing of the output (Oto Sink) stream, since the streams last started.
     pub output: CallbackStats,
+    /// Processing time per capture block on the DSP worker, since the streams last started;
+    /// `period_us` is the capture period it has per block and `first_us` its priming. All zero
+    /// when the model runs inline.
+    pub worker: CallbackStats,
 }
 
 /// How long one stream's audio callback takes, since the streams last started. A callback
@@ -388,10 +409,16 @@ impl Stats {
             underruns: s.underruns.load(Relaxed),
             resyncs: s.resyncs.load(Relaxed),
             overflows: s.overflows.load(Relaxed),
+            starvations: s.starvations.load(Relaxed),
+            worker_overflows: s.worker_overflows.load(Relaxed),
             estimated_latency_ms: s.estimate_us.load(Relaxed) as f32 / 1000.0,
+            worker_reserve_ms: ms(s.reserve_frames.load(Relaxed)),
+            worker_realtime: s.worker_realtime.load(Relaxed),
+            worker_workgroup: s.worker_workgroup.load(Relaxed),
             model: pipeline::decode_model(s.model.load(Relaxed)),
             capture: CallbackStats::from_times(&s.capture_times),
             output: CallbackStats::from_times(&s.output_times),
+            worker: CallbackStats::from_times(&s.worker_times),
         }
     }
 }

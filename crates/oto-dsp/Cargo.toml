@@ -5,8 +5,9 @@ edition.workspace = true
 license.workspace = true
 
 [features]
-default = []
-# DeepFilterNet3 via upstream libDF + tract. Heavy to build; off by default.
+default = ["dfn3"]
+# DeepFilterNet3 via upstream libDF + tract, the default model. Without it the build is
+# RNNoise-only and has no tract.
 dfn3 = ["dep:deep_filter", "dep:ndarray", "dep:tract-core", "dep:tract-onnx", "dep:tract-pulse", "dep:tract-hir"]
 
 [dependencies]

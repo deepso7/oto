@@ -4,13 +4,13 @@
 //! OS) plus a periodic tick, so the state machine is testable with a fake [`Platform`].
 
 use std::sync::Arc;
-use std::sync::atomic::Ordering::Relaxed;
+use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant};
 
 use oto_dsp::{Chain, Model};
 
-use crate::pipeline::{Shared, encode_model};
+use crate::pipeline::{STOP_FADE_DONE, STOP_FADE_REQUESTED, Shared, encode_model};
 use crate::platform::{HalEvent, Platform};
 use crate::{Command, Event, Settings, Tier};
 
@@ -40,10 +40,12 @@ pub fn decide(enabled: bool, clients_active: bool, driver_installed: bool) -> Mo
 
 /// The model this build runs for a tier.
 ///
-/// Without the `dfn3` cargo feature every tier is RNNoise (it meets the 50 ms budget, see
-/// docs/models.md), so the tier setting changes nothing. With `dfn3`, [`Tier::Light`] is RNNoise and
-/// [`Tier::Standard`] and [`Tier::Max`] are DeepFilterNet3, which costs ~15× the CPU, adds
-/// 20 ms and allocates inside inference on the audio thread (see `oto_dsp::Model`).
+/// With the `dfn3` cargo feature (the default), [`Tier::Standard`] is DeepFilterNet3,
+/// [`Tier::Light`] ("Low CPU mode") is RNNoise, and [`Tier::Max`], kept for a later model,
+/// resolves to Standard's. DeepFilterNet3 costs ~15× RNNoise's CPU and adds ~20 ms of model
+/// delay plus the DSP worker's reserve; it runs on a realtime worker thread rather than in the
+/// audio callback ([`crate::pipeline::placement_for`]). Without `dfn3` every tier is RNNoise and
+/// the tier setting changes nothing.
 pub fn model_for(tier: Tier) -> Model {
     if cfg!(feature = "dfn3") {
         match tier {
@@ -56,8 +58,8 @@ pub fn model_for(tier: Tier) -> Model {
 }
 
 /// The tiers worth offering: one per distinct model in this build, in ascending order. Always
-/// contains [`Tier::default`]. When it has a single entry the tier setting does nothing and a
-/// UI should hide its picker.
+/// contains [`Tier::default`]. `[Light, Standard]` with `dfn3`, `[Standard]` without; with a
+/// single entry the tier setting does nothing and a UI should hide its picker.
 pub fn available_tiers() -> &'static [Tier] {
     if cfg!(feature = "dfn3") {
         &[Tier::Light, Tier::Standard]
@@ -76,6 +78,9 @@ type Loader = Box<dyn FnMut(Model) -> Result<Chain, String>>;
 const FALLBACK: Model = Model::RNNoise;
 
 const TICK: Duration = Duration::from_millis(250);
+/// How long a stop waits for the output callback to fade to silence (it takes `STOP_FADE_S`,
+/// 10 ms, plus up to one output callback). A stalled or dead output is not waited for longer.
+const STOP_FADE_WAIT: Duration = Duration::from_millis(30);
 const RETRY: Duration = Duration::from_secs(2);
 const STALL: Duration = Duration::from_millis(1500);
 
@@ -253,9 +258,21 @@ impl<P: Platform> Control<P> {
 
     fn stop(&mut self) {
         if self.running.take().is_some() {
+            self.fade_out();
             self.p.stop();
             self.shared.running.store(false, Relaxed);
             self.shared.model.store(encode_model(None), Relaxed);
+        }
+    }
+
+    /// Asks the output callback to fade to silence and waits (bounded) until it has, so stopping
+    /// the streams does not cut audio mid-waveform (a click).
+    fn fade_out(&self) {
+        let s = &self.shared;
+        s.stop_fade.store(STOP_FADE_REQUESTED, Release);
+        let deadline = Instant::now() + STOP_FADE_WAIT;
+        while s.stop_fade.load(Acquire) != STOP_FADE_DONE && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
         }
     }
 
@@ -957,5 +974,197 @@ mod tests {
         c.reconcile();
         assert!(c.p.live);
         assert_eq!(c.p.started.len(), 2);
+    }
+
+    /// Output blocks with the time they were rendered.
+    type Recording = Arc<std::sync::Mutex<Vec<(Instant, Vec<f32>)>>>;
+
+    /// A platform that runs the real capture and output stages on a thread paced in real time
+    /// (256-frame mic, 128-frame sink, 48 kHz), recording every output block with its time.
+    #[derive(Default)]
+    struct Sim {
+        live: Option<(
+            Arc<std::sync::atomic::AtomicBool>,
+            std::thread::JoinHandle<()>,
+        )>,
+        rec: Recording,
+        /// Where the next start puts the chain; `None` follows `placement_for`.
+        force: Option<crate::pipeline::Placement>,
+        placements: Vec<crate::pipeline::Placement>,
+    }
+
+    impl Platform for Sim {
+        fn driver_installed(&self) -> bool {
+            true
+        }
+        fn clients_active(&self) -> bool {
+            true
+        }
+        fn input_devices(&self) -> Vec<InputDevice> {
+            Vec::new()
+        }
+        fn resolve_input(&self, _: Option<&str>) -> Option<String> {
+            Some("sim".into())
+        }
+        fn start(&mut self, _: &str, chain: Chain, shared: &Arc<Shared>) -> Result<(), String> {
+            use crate::pipeline::*;
+            const IN: usize = 256;
+            const OUT: usize = 128;
+            let placement = self.force.unwrap_or(placement_for(chain.model()));
+            self.placements.push(placement);
+            let (prod, cons) = rtrb::RingBuffer::new(RING_CAPACITY);
+            let mut cap =
+                CaptureStage::with_placement(48_000.0, IN, chain, prod, shared.clone(), placement)?;
+            let target = target_fill(IN, 48_000.0, OUT, 48_000.0);
+            let mut out = OutputStage::new(cons, 48_000.0, target, shared.clone())?;
+            let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let (st, rec, sh) = (stop.clone(), self.rec.clone(), shared.clone());
+            let t = std::thread::spawn(move || {
+                let t0 = Instant::now();
+                let (mut ni, mut no) = (0u32, 0u32);
+                let mut buf = vec![0.0; OUT];
+                while !st.load(Acquire) {
+                    let ti = Duration::from_secs_f64(ni as f64 * IN as f64 / 48_000.0);
+                    let to = Duration::from_secs_f64(no as f64 * OUT as f64 / 48_000.0);
+                    let due = ti.min(to);
+                    if let Some(wait) = due.checked_sub(t0.elapsed()) {
+                        std::thread::sleep(wait);
+                    }
+                    if ti <= to {
+                        cap.process(IN, 0);
+                        sh.in_cycles.fetch_add(1, Relaxed);
+                        ni += 1;
+                    } else {
+                        out.render(&mut buf);
+                        rec.lock().unwrap().push((Instant::now(), buf.clone()));
+                        sh.out_cycles.fetch_add(1, Relaxed);
+                        no += 1;
+                    }
+                }
+            });
+            self.live = Some((stop, t));
+            Ok(())
+        }
+        fn stop(&mut self) {
+            if let Some((stop, t)) = self.live.take() {
+                stop.store(true, Release);
+                t.join().unwrap();
+            }
+        }
+        fn refresh(&mut self) {}
+    }
+
+    /// Plan 0001 step 5: a tier change during a call loads the new model while audio still
+    /// plays, fades out over 10 ms, restarts and fades in. Measures the silent gap in both
+    /// directions (worker model ↔ inline model) and checks there is no click.
+    #[test]
+    fn switching_models_mid_call_is_short_and_click_free() {
+        use crate::pipeline::Placement;
+        const AUDIBLE: f32 = 0.01;
+        let mut sh = Shared::new(Arc::new(Levels::default()), None);
+        // 480 Hz at 0.3: a whole number of periods in the loop, < 0.019 per sample.
+        let tone: Vec<f32> = (0..4800)
+            .map(|k| 0.3 * (2.0 * std::f32::consts::PI * 480.0 * k as f32 / 48_000.0).sin())
+            .collect();
+        sh.source = Some(tone.into());
+        let (tx, _rx) = mpsc::channel();
+        // Bypassed, so the tone passes whatever the model (the delay is still the model's).
+        let s = Settings {
+            enabled: false,
+            ..Default::default()
+        };
+        let mut c = Control::new(Sim::default(), s, true, Arc::new(sh), tx);
+        c.tier_model = |t| match t {
+            Tier::Light => Model::RNNoise,
+            Tier::Standard | Tier::Max => Model::DeepFilterNet3,
+        };
+        if !cfg!(feature = "dfn3") {
+            // No DeepFilterNet3 in this build: an RNNoise chain stands in, on the worker.
+            c.loader = Box::new(loads_anything);
+        }
+        let worker = |c: &mut Control<Sim>, on: bool| {
+            if !cfg!(feature = "dfn3") {
+                c.p.force = Some(if on {
+                    Placement::Worker
+                } else {
+                    Placement::Inline
+                });
+            }
+        };
+        let play = Duration::from_millis(700);
+        worker(&mut c, true);
+        c.reconcile();
+        std::thread::sleep(play);
+        let mut switches = Vec::new();
+        for (tier, to_worker) in [(Tier::Light, false), (Tier::Standard, true)] {
+            worker(&mut c, to_worker);
+            let t = Instant::now();
+            c.handle(Msg::Cmd(Command::SetTier(tier)));
+            c.reconcile();
+            switches.push((t, t.elapsed()));
+            std::thread::sleep(play);
+        }
+        c.stop();
+        assert_eq!(
+            c.p.placements,
+            [Placement::Worker, Placement::Inline, Placement::Worker]
+        );
+        // A stalled simulation thread would cause underruns or a far-behind resync, both hard
+        // cuts that have nothing to do with switching.
+        let glitches = (
+            c.shared.underruns.load(Relaxed),
+            c.shared.resyncs.load(Relaxed),
+        );
+        assert_eq!(glitches, (0, 0), "the simulation glitched");
+
+        // Every output sample with its approximate time.
+        let rec = c.p.rec.lock().unwrap();
+        let samples: Vec<(Instant, f32)> = rec
+            .iter()
+            .flat_map(|(t, b)| {
+                let n = b.len();
+                b.iter().enumerate().map(move |(i, &x)| {
+                    (*t - Duration::from_secs_f64((n - i) as f64 / 48_000.0), x)
+                })
+            })
+            .collect();
+        for (i, &(at, took)) in switches.iter().enumerate() {
+            // Audible before the switch, then the longest run without audio after it.
+            let mut last = None;
+            let mut gap = Duration::ZERO;
+            let mut step = 0.0f32;
+            let mut step_at = Duration::ZERO;
+            let mut prev: Option<f32> = None;
+            for &(t, x) in samples.iter().filter(|(t, _)| *t >= at - play / 2) {
+                if let Some(p) = prev
+                    && (x - p).abs() > step
+                {
+                    step = (x - p).abs();
+                    step_at = t.saturating_duration_since(at);
+                }
+                prev = Some(x);
+                if x.abs() > AUDIBLE {
+                    if let Some(l) = last {
+                        gap = gap.max(t - l);
+                    }
+                    last = Some(t);
+                }
+                if t > at + play - Duration::from_millis(100) {
+                    break;
+                }
+            }
+            eprintln!(
+                "switch {i}: control thread busy {:.1} ms (model load + fade + restart), \
+                 silent gap {:.1} ms, largest step {step:.4} at +{:.1} ms; starvations {}",
+                took.as_secs_f64() * 1e3,
+                gap.as_secs_f64() * 1e3,
+                step_at.as_secs_f64() * 1e3,
+                c.shared.starvations.load(Relaxed),
+            );
+            assert!(gap < Duration::from_millis(500), "switch {i}: gap {gap:?}");
+            assert!(gap > Duration::from_millis(5), "switch {i}: no gap at all?");
+            // The tone moves < 0.019 per sample; a cut would step by up to 0.3.
+            assert!(step < 0.03, "switch {i}: click, step {step}");
+        }
     }
 }
