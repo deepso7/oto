@@ -7,3 +7,16 @@ license.workspace = true
 [dependencies]
 oto-engine.workspace = true
 rune.workspace = true
+rune-kit.workspace = true
+auto-launch = "0.6"
+dirs = "6"
+serde = { version = "1", features = ["derive"] }
+toml = "0.9"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# Rune's own tray has no macOS backend yet. tray-icon's NSStatusItem lives on Rune's main
+# thread, created from an `AppHandle::update` once the event loop runs.
+tray-icon = { version = "0.26", default-features = false }
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "objc2-core-foundation", "NSResponder", "NSView", "NSWindow", "NSScreen", "NSStatusItem", "NSStatusBarButton", "NSButton", "NSControl"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSGeometry", "NSArray"] }
