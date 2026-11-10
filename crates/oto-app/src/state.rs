@@ -457,6 +457,8 @@ impl State {
             Event::Recovered => self.clear_engine_error(),
             // The host thread re-reads the device list and calls `set_devices`.
             Event::DevicesChanged => {}
+            // TODO(plan 0001 step 5): show a notice naming the effective model.
+            Event::ModelFallback { .. } => {}
         }
     }
 

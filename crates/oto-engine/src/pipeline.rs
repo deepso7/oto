@@ -37,9 +37,9 @@
 //! - less than that: bled off by the drift controller at up to 2000 ppm (under ~5 s).
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU32, AtomicU64, Ordering::Relaxed};
 
-use oto_dsp::{Chain, SAMPLE_RATE};
+use oto_dsp::{Chain, Model, SAMPLE_RATE};
 use rtrb::{Consumer, Producer};
 use rubato::audioadapter_buffers::direct::InterleavedSlice;
 use rubato::{Adjustable, Async, FixedAsync, PolynomialDegree, Resampler};
@@ -112,6 +112,135 @@ pub fn estimate_latency_s(
         + out_latency as f64 / out_rate
 }
 
+/// Callback durations of one stream: maximum and a fixed log-scale histogram, so a worst case
+/// and p50/p99 can be read without allocating or locking on the audio thread.
+///
+/// Buckets: index 0 holds everything under [`CallbackTimes::MIN_NS`]; above that every octave of
+/// nanoseconds is split into [`CallbackTimes::SUB`] equal-width buckets, so a bucket's upper
+/// edge is at most 25% above its lower edge; the last bucket is open-ended (≥ ~134 ms).
+///
+/// The first callback after [`CallbackTimes::reset`] is kept apart in `first_ns` rather than in
+/// the histogram and maximum: it primes the model on the audio thread (the one documented
+/// exception to the no-allocation rule), so it would otherwise always be the maximum.
+pub struct CallbackTimes {
+    buckets: [AtomicU64; CallbackTimes::BUCKETS],
+    max_ns: AtomicU64,
+    first_ns: AtomicU64,
+    /// Callbacks recorded since the last reset, including the first.
+    calls: AtomicU64,
+    /// The device IO buffer duration, ns, set by the backend when the stream starts.
+    pub period_ns: AtomicU64,
+}
+
+impl CallbackTimes {
+    /// log2 of the lowest resolved duration (1024 ns ≈ 1 µs).
+    const MIN_LOG2: u32 = 10;
+    pub const MIN_NS: u64 = 1 << Self::MIN_LOG2;
+    /// log2 of the start of the open-ended last bucket (2^27 ns ≈ 134 ms).
+    const MAX_LOG2: u32 = 27;
+    /// Buckets per octave (a power of two).
+    const SUB: usize = 4;
+    const SUB_BITS: u32 = Self::SUB.trailing_zeros();
+    pub const BUCKETS: usize = 2 + (Self::MAX_LOG2 - Self::MIN_LOG2) as usize * Self::SUB;
+
+    pub fn new() -> Self {
+        Self {
+            buckets: std::array::from_fn(|_| AtomicU64::new(0)),
+            max_ns: AtomicU64::new(0),
+            first_ns: AtomicU64::new(0),
+            calls: AtomicU64::new(0),
+            period_ns: AtomicU64::new(0),
+        }
+    }
+
+    /// The bucket a duration falls into.
+    pub fn bucket(ns: u64) -> usize {
+        if ns < Self::MIN_NS {
+            return 0;
+        }
+        let e = 63 - ns.leading_zeros();
+        if e >= Self::MAX_LOG2 {
+            return Self::BUCKETS - 1;
+        }
+        let sub = ((ns >> (e - Self::SUB_BITS)) as usize) & (Self::SUB - 1);
+        1 + (e - Self::MIN_LOG2) as usize * Self::SUB + sub
+    }
+
+    /// The exclusive upper edge of a bucket, ns (`u64::MAX` for the last one).
+    pub fn upper_ns(bucket: usize) -> u64 {
+        if bucket == 0 {
+            return Self::MIN_NS;
+        }
+        if bucket >= Self::BUCKETS - 1 {
+            return u64::MAX;
+        }
+        let i = bucket - 1;
+        let e = Self::MIN_LOG2 + (i / Self::SUB) as u32;
+        let sub = (i % Self::SUB) as u64;
+        (1u64 << e) + ((sub + 1) << (e - Self::SUB_BITS))
+    }
+
+    /// Record one callback's duration. Realtime-safe: a few relaxed atomic operations.
+    pub fn record(&self, ns: u64) {
+        if self.calls.fetch_add(1, Relaxed) == 0 {
+            self.first_ns.store(ns, Relaxed);
+            return;
+        }
+        self.buckets[Self::bucket(ns)].fetch_add(1, Relaxed);
+        self.max_ns.fetch_max(ns, Relaxed);
+    }
+
+    /// Forget everything recorded so far. Call while the stream's callback is not running.
+    pub fn reset(&self) {
+        for b in &self.buckets {
+            b.store(0, Relaxed);
+        }
+        self.max_ns.store(0, Relaxed);
+        self.first_ns.store(0, Relaxed);
+        self.calls.store(0, Relaxed);
+    }
+
+    /// The `q`-quantile (0.0..=1.0) of the recorded durations, ns: the upper edge of the bucket
+    /// it falls in, capped at the maximum, so it errs high by at most one bucket width (25%).
+    /// `None` before any callback past the first was recorded.
+    pub fn quantile_ns(&self, q: f64) -> Option<u64> {
+        let counts: [u64; Self::BUCKETS] = std::array::from_fn(|i| self.buckets[i].load(Relaxed));
+        let total: u64 = counts.iter().sum();
+        if total == 0 {
+            return None;
+        }
+        // The rank of the sample at quantile q, 1-based.
+        let rank = ((q.clamp(0.0, 1.0) * total as f64).ceil() as u64).max(1);
+        let max = self.max_ns.load(Relaxed);
+        let mut seen = 0;
+        for (i, &c) in counts.iter().enumerate() {
+            seen += c;
+            if seen >= rank {
+                return Some(Self::upper_ns(i).min(max));
+            }
+        }
+        Some(max)
+    }
+
+    pub fn max_ns(&self) -> u64 {
+        self.max_ns.load(Relaxed)
+    }
+
+    pub fn first_ns(&self) -> u64 {
+        self.first_ns.load(Relaxed)
+    }
+
+    pub fn calls(&self) -> u64 {
+        self.calls.load(Relaxed)
+    }
+}
+
+impl Default for CallbackTimes {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// State shared between the control thread and both callbacks. All lock-free.
 pub struct Shared {
     /// Denoise on (true) or bypassed (false). The chain still runs HPF and limiter when bypassed.
@@ -123,6 +252,11 @@ pub struct Shared {
     pub out_cycles: AtomicU64,
     /// Nanoseconds spent inside both callbacks, cumulative.
     pub busy_ns: AtomicU64,
+    /// Per-callback durations of the capture (mic) and output (sink) streams.
+    pub capture_times: CallbackTimes,
+    pub output_times: CallbackTimes,
+    /// The model the running streams use ([`encode_model`]), 0 when nothing runs.
+    pub model: AtomicU8,
     pub underruns: AtomicU64,
     pub resyncs: AtomicU64,
     pub overflows: AtomicU64,
@@ -149,6 +283,9 @@ impl Shared {
             in_cycles: AtomicU64::new(0),
             out_cycles: AtomicU64::new(0),
             busy_ns: AtomicU64::new(0),
+            capture_times: CallbackTimes::new(),
+            output_times: CallbackTimes::new(),
+            model: AtomicU8::new(0),
             underruns: AtomicU64::new(0),
             resyncs: AtomicU64::new(0),
             overflows: AtomicU64::new(0),
@@ -161,6 +298,23 @@ impl Shared {
             probe,
             source: None,
         }
+    }
+}
+
+/// [`Shared::model`]'s encoding: 0 is "nothing running".
+pub fn encode_model(m: Option<Model>) -> u8 {
+    match m {
+        None => 0,
+        Some(Model::RNNoise) => 1,
+        Some(Model::DeepFilterNet3) => 2,
+    }
+}
+
+pub fn decode_model(v: u8) -> Option<Model> {
+    match v {
+        1 => Some(Model::RNNoise),
+        2 => Some(Model::DeepFilterNet3),
+        _ => None,
     }
 }
 
@@ -729,6 +883,70 @@ impl OutputStage {
 mod tests {
     use super::*;
     use rtrb::RingBuffer;
+
+    #[test]
+    fn callback_buckets_are_contiguous_and_narrow() {
+        assert_eq!(CallbackTimes::bucket(0), 0);
+        assert_eq!(CallbackTimes::bucket(CallbackTimes::MIN_NS - 1), 0);
+        assert_eq!(CallbackTimes::bucket(CallbackTimes::MIN_NS), 1);
+        assert_eq!(CallbackTimes::bucket(u64::MAX), CallbackTimes::BUCKETS - 1);
+        // Every bucket's upper edge is the next bucket's lower edge.
+        for b in 0..CallbackTimes::BUCKETS - 1 {
+            let hi = CallbackTimes::upper_ns(b);
+            assert_eq!(CallbackTimes::bucket(hi - 1), b, "bucket {b}");
+            assert_eq!(CallbackTimes::bucket(hi), b + 1, "bucket {b}");
+        }
+        // Resolution: an upper edge is at most 25% above the lower edge.
+        for b in 2..CallbackTimes::BUCKETS - 1 {
+            let (lo, hi) = (CallbackTimes::upper_ns(b - 1), CallbackTimes::upper_ns(b));
+            assert!(
+                hi as f64 <= lo as f64 * 1.25 + 1.0,
+                "bucket {b}: {lo}..{hi}"
+            );
+        }
+        // The open-ended bucket starts past 100 ms.
+        assert!(CallbackTimes::upper_ns(CallbackTimes::BUCKETS - 2) > 100_000_000);
+    }
+
+    #[test]
+    fn callback_percentiles_max_and_reset() {
+        let t = CallbackTimes::new();
+        assert_eq!(t.quantile_ns(0.5), None);
+        // The first callback primes the model: kept apart from the statistics.
+        t.record(50_000_000);
+        assert_eq!(t.first_ns(), 50_000_000);
+        assert_eq!(t.quantile_ns(0.5), None);
+        assert_eq!(t.max_ns(), 0);
+        // 98 callbacks at 100 µs, one at 1 ms, one at 3 ms.
+        for _ in 0..98 {
+            t.record(100_000);
+        }
+        t.record(1_000_000);
+        t.record(3_000_000);
+        assert_eq!(t.calls(), 101);
+        assert_eq!(t.max_ns(), 3_000_000);
+        let p50 = t.quantile_ns(0.5).unwrap();
+        assert!((100_000..=125_000).contains(&p50), "p50 {p50}");
+        let p99 = t.quantile_ns(0.99).unwrap();
+        assert!((1_000_000..=1_250_000).contains(&p99), "p99 {p99}");
+        // The top quantile is capped at the true maximum rather than the bucket edge.
+        assert_eq!(t.quantile_ns(1.0), Some(3_000_000));
+        t.reset();
+        assert_eq!(t.quantile_ns(0.5), None);
+        assert_eq!((t.max_ns(), t.first_ns(), t.calls()), (0, 0, 0));
+        // After a reset the next callback is a first callback again.
+        t.record(7);
+        assert_eq!(t.first_ns(), 7);
+        assert_eq!(t.quantile_ns(0.5), None);
+    }
+
+    #[test]
+    fn model_encoding_round_trips() {
+        assert_eq!(decode_model(encode_model(None)), None);
+        for m in Model::ALL {
+            assert_eq!(decode_model(encode_model(Some(m))), Some(m));
+        }
+    }
 
     fn shared() -> Arc<Shared> {
         let s = Shared::new(Arc::new(Levels::default()), None);

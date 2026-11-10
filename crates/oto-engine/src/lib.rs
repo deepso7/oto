@@ -69,6 +69,15 @@ pub enum Event {
     /// or nothing needs to run (no app is recording and the driver is present). Sent once per
     /// recovery; UIs clear their error banner on it.
     Recovered,
+    /// The tier asks for `requested`, which could not be loaded, so `effective` runs instead.
+    /// A notice, not an [`Event::Error`]: audio works. Sent once per failure; the engine does not
+    /// retry `requested` until the tier is changed or the engine restarts.
+    /// [`Stats::model`] reports what runs.
+    ModelFallback {
+        requested: dsp::Model,
+        effective: dsp::Model,
+        reason: String,
+    },
 }
 
 impl Strength {
@@ -325,7 +334,45 @@ pub struct Stats {
     pub resyncs: u64,
     pub overflows: u64,
     /// Mic-to-sink latency estimated from device-reported latencies, buffers and ring target.
+    /// Includes the running model's delay.
     pub estimated_latency_ms: f32,
+    /// The model the running streams use (after any fallback), `None` when not running.
+    pub model: Option<dsp::Model>,
+    /// Callback timing of the capture (mic) stream, since the streams last started.
+    pub capture: CallbackStats,
+    /// Callback timing of the output (Oto Sink) stream, since the streams last started.
+    pub output: CallbackStats,
+}
+
+/// How long one stream's audio callback takes, since the streams last started. A callback
+/// that takes longer than `period_us` misses its deadline. Percentiles come from a log-scale
+/// histogram and err high by at most 25%. All zero before the stream has run.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct CallbackStats {
+    /// Callbacks seen, including the first.
+    pub callbacks: u64,
+    /// The device IO buffer duration: the time each callback has.
+    pub period_us: f32,
+    pub p50_us: f32,
+    pub p99_us: f32,
+    pub max_us: f32,
+    /// The first callback, which primes the model on the audio thread. Not included in the
+    /// percentiles or the maximum.
+    pub first_us: f32,
+}
+
+impl CallbackStats {
+    fn from_times(t: &pipeline::CallbackTimes) -> Self {
+        let us = |ns: u64| ns as f32 / 1000.0;
+        Self {
+            callbacks: t.calls(),
+            period_us: us(t.period_ns.load(Relaxed)),
+            p50_us: t.quantile_ns(0.5).map_or(0.0, us),
+            p99_us: t.quantile_ns(0.99).map_or(0.0, us),
+            max_us: us(t.max_ns()),
+            first_us: us(t.first_ns()),
+        }
+    }
 }
 
 impl Stats {
@@ -342,6 +389,9 @@ impl Stats {
             resyncs: s.resyncs.load(Relaxed),
             overflows: s.overflows.load(Relaxed),
             estimated_latency_ms: s.estimate_us.load(Relaxed) as f32 / 1000.0,
+            model: pipeline::decode_model(s.model.load(Relaxed)),
+            capture: CallbackStats::from_times(&s.capture_times),
+            output: CallbackStats::from_times(&s.output_times),
         }
     }
 }

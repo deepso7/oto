@@ -515,6 +515,7 @@ unsafe extern "C" fn input_proc(
     ctx.shared.in_cycles.fetch_add(1, Relaxed);
     let dt = host_to_ns(unsafe { mach_absolute_time() } - t0);
     ctx.shared.busy_ns.fetch_add(dt, Relaxed);
+    ctx.shared.capture_times.record(dt);
     0
 }
 
@@ -562,6 +563,7 @@ unsafe extern "C" fn output_proc(
     ctx.shared.out_cycles.fetch_add(1, Relaxed);
     let dt = host_to_ns(unsafe { mach_absolute_time() } - t0);
     ctx.shared.busy_ns.fetch_add(dt, Relaxed);
+    ctx.shared.output_times.record(dt);
     0
 }
 
@@ -741,6 +743,15 @@ impl Platform for Mac {
         shared.estimate_us.store((est_s * 1e6) as u32, Relaxed);
         shared.in_rate.store(in_rate as u32, Relaxed);
         shared.out_rate.store(out_rate as u32, Relaxed);
+        // The callbacks are not running yet: start their timing statistics afresh.
+        for (t, frames, rate) in [
+            (&shared.capture_times, in_frames, in_rate),
+            (&shared.output_times, out_frames, out_rate),
+        ] {
+            t.reset();
+            t.period_ns
+                .store((frames as f64 * 1e9 / rate) as u64, Relaxed);
+        }
 
         let in_ctx = InCtx {
             stage: cap,

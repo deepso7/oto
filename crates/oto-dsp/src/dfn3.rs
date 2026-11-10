@@ -25,7 +25,7 @@ impl DeepFilterNet3 {
     /// Loads the bundled DFN3 weights (MIT OR Apache-2.0). Slow (tens of ms); off the RT thread.
     pub fn new() -> Result<Self, String> {
         let rp = RuntimeParams::default_with_ch(1);
-        let model = DfTract::new(DfParams::default(), &rp).map_err(|e| e.to_string())?;
+        let model = DfTract::new(DfParams::default(), &rp).map_err(|e| format!("{e:#}"))?;
         let hop = model.hop_size;
         // STFT overlap (fft - hop) plus the model's lookahead frames.
         let latency = model.fft_size - hop + model.lookahead * hop;

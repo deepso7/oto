@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use oto_dsp::{Chain, Model};
 
-use crate::pipeline::Shared;
+use crate::pipeline::{Shared, encode_model};
 use crate::platform::{HalEvent, Platform};
 use crate::{Command, Event, Settings, Tier};
 
@@ -69,6 +69,12 @@ pub fn available_tiers() -> &'static [Tier] {
 /// Called on the control thread when the system default input changed.
 pub(crate) type Hook = Box<dyn Fn() + Send>;
 
+/// Builds the chain for a model. [`Chain::with_model`] outside tests.
+type Loader = Box<dyn FnMut(Model) -> Result<Chain, String>>;
+
+/// What runs when the requested model cannot be loaded. Always compiled in.
+const FALLBACK: Model = Model::RNNoise;
+
 const TICK: Duration = Duration::from_millis(250);
 const RETRY: Duration = Duration::from_secs(2);
 const STALL: Duration = Duration::from_millis(1500);
@@ -97,6 +103,12 @@ pub(crate) struct Control<P: Platform> {
     watch: (Instant, u64, u64),
     load: (Instant, u64),
     on_default_input: Option<Hook>,
+    /// The model a tier asks for. [`model_for`] outside tests.
+    tier_model: fn(Tier) -> Model,
+    loader: Loader,
+    /// A model that failed to load. While set, a request for it resolves to [`FALLBACK`]
+    /// without retrying. Cleared when the tier changes; nothing retries on a timer.
+    failed: Option<Model>,
 }
 
 impl<P: Platform> Control<P> {
@@ -123,6 +135,9 @@ impl<P: Platform> Control<P> {
             watch: (now, 0, 0),
             load: (now, 0),
             on_default_input: None,
+            tier_model: model_for,
+            loader: Box::new(Chain::with_model),
+            failed: None,
         }
     }
 
@@ -175,6 +190,10 @@ impl<P: Platform> Control<P> {
                 }
                 Command::SetStrength(s) => self.settings.strength = s,
                 Command::SetTier(t) => {
+                    if t != self.settings.tier {
+                        // The user asked again: give a model that failed to load another try.
+                        self.failed = None;
+                    }
                     self.settings.tier = t;
                     self.retry_at = None;
                 }
@@ -236,6 +255,37 @@ impl<P: Platform> Control<P> {
         if self.running.take().is_some() {
             self.p.stop();
             self.shared.running.store(false, Relaxed);
+            self.shared.model.store(encode_model(None), Relaxed);
+        }
+    }
+
+    /// The model to run: what the tier asks for, unless that failed to load.
+    fn effective_model(&self) -> Model {
+        let requested = (self.tier_model)(self.settings.tier);
+        if self.failed == Some(requested) {
+            FALLBACK
+        } else {
+            requested
+        }
+    }
+
+    /// Builds the chain for `key`. If its model cannot load and is not already the fallback,
+    /// remembers the failure, reports it once and switches `key` to the fallback.
+    fn load_chain(&mut self, key: &mut RunKey) -> Result<Chain, String> {
+        match (self.loader)(key.model) {
+            Ok(c) => Ok(c),
+            Err(reason) if key.model != FALLBACK => {
+                let requested = key.model;
+                self.failed = Some(requested);
+                key.model = FALLBACK;
+                self.emit(Event::ModelFallback {
+                    requested,
+                    effective: FALLBACK,
+                    reason,
+                });
+                (self.loader)(FALLBACK)
+            }
+            Err(e) => Err(e),
         }
     }
 
@@ -275,25 +325,42 @@ impl<P: Platform> Control<P> {
             self.error("no microphone found".into());
             return;
         };
-        let key = RunKey {
+        let mut key = RunKey {
             input,
-            model: model_for(self.settings.tier),
+            model: self.effective_model(),
+        };
+        if self.running.as_ref() == Some(&key) {
+            return;
+        }
+        if self.retry_at.is_some_and(|t| Instant::now() < t) {
+            self.stop();
+            return;
+        }
+        // Allocates and may load a model: fine here, this is the control thread. Loaded before
+        // the old streams stop, so a model that fails to load falls back without a restart when
+        // the fallback is what already runs.
+        let chain = match self.load_chain(&mut key) {
+            Ok(c) => c,
+            Err(e) => {
+                self.stop();
+                self.error(e);
+                self.retry_at = Some(Instant::now() + RETRY);
+                return;
+            }
         };
         if self.running.as_ref() == Some(&key) {
             return;
         }
         self.stop();
-        if self.retry_at.is_some_and(|t| Instant::now() < t) {
-            return;
-        }
-        // Allocates and may load a model: fine here, this is the control thread.
-        let started =
-            Chain::with_model(key.model).and_then(|c| self.p.start(&key.input, c, &self.shared));
+        let started = self.p.start(&key.input, chain, &self.shared);
         // Opening devices can take a while (Bluetooth: seconds). The stall watchdog and the
         // load meter count from when the streams were actually started, not from before.
         let now = Instant::now();
         match started {
             Ok(()) => {
+                self.shared
+                    .model
+                    .store(encode_model(Some(key.model)), Relaxed);
                 self.running = Some(key);
                 self.shared.running.store(true, Relaxed);
                 self.last_error = None;
@@ -723,6 +790,154 @@ mod tests {
         c.retry_at = Some(Instant::now());
         c.reconcile();
         assert!(c.p.live);
+    }
+
+    /// A controller whose Standard/Max tiers ask for DeepFilterNet3 (as with the `dfn3`
+    /// feature) and whose DeepFilterNet3 never loads. Returns the models it tried to load.
+    fn dfn3_fails(c: &mut Control<Fake>) -> std::rc::Rc<std::cell::RefCell<Vec<Model>>> {
+        c.tier_model = |t| match t {
+            Tier::Light => Model::RNNoise,
+            Tier::Standard | Tier::Max => Model::DeepFilterNet3,
+        };
+        let loads = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let l = loads.clone();
+        c.loader = Box::new(move |m| {
+            l.borrow_mut().push(m);
+            match m {
+                Model::DeepFilterNet3 => Err("cannot load DeepFilterNet3".into()),
+                Model::RNNoise => Chain::with_model(m),
+            }
+        });
+        loads
+    }
+
+    /// A loader for which every model loads (the Fake ignores the chain, so an RNNoise chain
+    /// stands in for DeepFilterNet3 in builds without it).
+    fn loads_anything(_: Model) -> Result<Chain, String> {
+        Chain::with_model(Model::RNNoise)
+    }
+
+    /// What `Stats::model` reports.
+    fn running_model(c: &Control<Fake>) -> Option<Model> {
+        crate::pipeline::decode_model(c.shared.model.load(Relaxed))
+    }
+
+    fn fallbacks(ev: &[Event]) -> usize {
+        ev.iter()
+            .filter(|e| matches!(e, Event::ModelFallback { .. }))
+            .count()
+    }
+
+    #[test]
+    fn model_load_failure_falls_back_once_without_restarting() {
+        use Model::{DeepFilterNet3 as Dfn3, RNNoise};
+        let (mut c, rx) = ctl(
+            Fake {
+                clients: true,
+                ..fake()
+            },
+            true,
+        );
+        let loads = dfn3_fails(&mut c);
+        c.reconcile();
+        assert!(c.p.live);
+        assert_eq!(*loads.borrow(), [Dfn3, RNNoise]);
+        assert_eq!(running_model(&c), Some(RNNoise));
+        let ev: Vec<_> = rx.try_iter().collect();
+        assert!(
+            ev.contains(&Event::ModelFallback {
+                requested: Dfn3,
+                effective: RNNoise,
+                reason: "cannot load DeepFilterNet3".into(),
+            }),
+            "{ev:?}"
+        );
+        // A notice, not an error.
+        assert!(!ev.iter().any(|e| matches!(e, Event::Error(_))));
+        assert!(c.retry_at.is_none());
+
+        // The tier still asks for DeepFilterNet3, but nothing retries or restarts.
+        for _ in 0..10 {
+            advance(&c);
+            c.tick(Instant::now());
+            c.reconcile();
+        }
+        assert_eq!(c.p.started.len(), 1);
+        assert_eq!(c.p.stops, 0);
+        assert_eq!(loads.borrow().len(), 2);
+
+        // The app stops recording and starts again: RNNoise, without trying DeepFilterNet3.
+        c.p.clients = false;
+        c.reconcile();
+        assert!(!c.p.live);
+        assert_eq!(running_model(&c), None);
+        c.p.clients = true;
+        c.reconcile();
+        assert!(c.p.live);
+        assert_eq!(*loads.borrow(), [Dfn3, RNNoise, RNNoise]);
+        assert_eq!(running_model(&c), Some(RNNoise));
+        assert_eq!(fallbacks(&rx.try_iter().collect::<Vec<_>>()), 0);
+
+        // Re-sending the same tier is not a change: still remembered.
+        c.handle(Msg::Cmd(Command::SetTier(Tier::Standard)));
+        c.reconcile();
+        assert_eq!(loads.borrow().len(), 3);
+        assert_eq!(c.p.started.len(), 2);
+    }
+
+    #[test]
+    fn changing_tier_clears_the_remembered_failure() {
+        use Model::{DeepFilterNet3 as Dfn3, RNNoise};
+        let (mut c, rx) = ctl(
+            Fake {
+                clients: true,
+                ..fake()
+            },
+            true,
+        );
+        let loads = dfn3_fails(&mut c);
+        c.reconcile();
+        assert_eq!(fallbacks(&rx.try_iter().collect::<Vec<_>>()), 1);
+        // Standard → Max asks for the same model: tried again, fails again, and since the
+        // fallback already runs, audio is not restarted.
+        c.handle(Msg::Cmd(Command::SetTier(Tier::Max)));
+        c.reconcile();
+        assert_eq!(*loads.borrow(), [Dfn3, RNNoise, Dfn3, RNNoise]);
+        assert_eq!(c.p.started.len(), 1);
+        assert_eq!(c.p.stops, 0);
+        assert_eq!(fallbacks(&rx.try_iter().collect::<Vec<_>>()), 1);
+        // Light is RNNoise anyway; back to Standard tries DeepFilterNet3 again, which now loads.
+        c.handle(Msg::Cmd(Command::SetTier(Tier::Light)));
+        c.reconcile();
+        assert_eq!(loads.borrow().len(), 4, "Light is already running");
+        c.loader = Box::new(loads_anything);
+        c.handle(Msg::Cmd(Command::SetTier(Tier::Standard)));
+        c.reconcile();
+        assert_eq!(running_model(&c), Some(Dfn3));
+        assert_eq!(c.p.started.len(), 2);
+        assert_eq!(fallbacks(&rx.try_iter().collect::<Vec<_>>()), 0);
+    }
+
+    #[test]
+    fn device_start_failure_is_an_error_not_a_fallback() {
+        let (mut c, rx) = ctl(
+            Fake {
+                clients: true,
+                fail: true,
+                ..fake()
+            },
+            true,
+        );
+        let loads = dfn3_fails(&mut c);
+        // DeepFilterNet3 loads here; it is the device that fails.
+        c.loader = Box::new(loads_anything);
+        c.reconcile();
+        let ev: Vec<_> = rx.try_iter().collect();
+        assert_eq!(fallbacks(&ev), 0);
+        assert!(ev.contains(&Event::Error("boom".into())));
+        assert!(c.retry_at.is_some());
+        assert!(c.failed.is_none());
+        assert!(loads.borrow().is_empty());
     }
 
     #[test]

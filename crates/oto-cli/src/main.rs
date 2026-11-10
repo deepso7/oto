@@ -361,6 +361,7 @@ fn run(a: Args) -> Result<(), String> {
     let mut last_line = Instant::now();
     let mut line_shown = false;
     let mut load = 0.0f32;
+    let mut model = None;
     while !STOP.load(Ordering::Relaxed) {
         std::thread::sleep(Duration::from_millis(50));
         for e in engine.try_events() {
@@ -378,16 +379,39 @@ fn run(a: Args) -> Result<(), String> {
                 Event::DevicesChanged => println!("devices changed"),
                 Event::Error(e) => println!("error: {e}"),
                 Event::Recovered => println!("recovered"),
+                Event::ModelFallback {
+                    requested,
+                    effective,
+                    reason,
+                } => println!(
+                    "notice: {} could not be loaded, running {} instead ({reason})",
+                    requested.name(),
+                    effective.name()
+                ),
                 Event::Load(_) => {}
             }
         }
         if last_line.elapsed() >= Duration::from_millis(250) {
             last_line = Instant::now();
             let s = engine.stats();
+            if s.model != model {
+                model = s.model;
+                if let Some(m) = model {
+                    if line_shown {
+                        println!();
+                        line_shown = false;
+                    }
+                    println!(
+                        "model: {} (est. latency {:.1} ms)",
+                        m.name(),
+                        s.estimated_latency_ms
+                    );
+                }
+            }
             if s.running {
                 print!(
                     "\rraw {:6.1} dBFS  clean {:6.1} dBFS  ring {:4.1}/{:4.1} ms  drift {:+5} ppm  \
-                     xruns {}/{}  est {:4.1} ms  load {:4.1}% ",
+                     xruns {}/{}  est {:4.1} ms  load {:4.1}%  cb in {} out {} ",
                     levels.raw(),
                     levels.clean(),
                     s.ring_fill_ms,
@@ -396,7 +420,9 @@ fn run(a: Args) -> Result<(), String> {
                     s.underruns,
                     s.resyncs,
                     s.estimated_latency_ms,
-                    load * 100.0
+                    load * 100.0,
+                    callback_times(&s.capture),
+                    callback_times(&s.output),
                 );
                 line_shown = true;
                 let _ = std::io::stdout().flush();
@@ -406,6 +432,14 @@ fn run(a: Args) -> Result<(), String> {
     println!("\nstopping");
     drop(engine);
     Ok(())
+}
+
+/// One stream's callback time as `p50/p99/max of period` in µs, e.g. `120/310/900 of 5333µs`.
+fn callback_times(c: &oto_engine::CallbackStats) -> String {
+    format!(
+        "{:.0}/{:.0}/{:.0} of {:.0}µs",
+        c.p50_us, c.p99_us, c.max_us, c.period_us
+    )
 }
 
 fn devices() -> Result<(), String> {

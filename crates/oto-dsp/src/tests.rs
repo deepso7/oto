@@ -371,6 +371,27 @@ fn bench_reports_sane_numbers() {
     assert_eq!(r.latency_ms, 20.0);
 }
 
+/// Regression: DFN3 must load in the default (debug) test profile. tract-core's
+/// debug-assertion-only graph check rejected the compiled model ("running pass codegen ...
+/// duplicate name /convt3/Conv.bias") until the root Cargo.toml turned tract's debug assertions
+/// off. If this fails after a tract bump or a profile change, look there first.
+#[cfg(feature = "dfn3")]
+#[test]
+fn dfn3_loads_and_runs_in_debug_builds() {
+    let mut model = DeepFilterNet3::new().unwrap_or_else(|e| panic!("DFN3 failed to load: {e}"));
+    let n = model.frame_size();
+    assert_eq!(n, 480);
+    let input = noisy_speech(n * 20, 3);
+    let mut out = vec![0.0; n];
+    let mut energy = 0.0;
+    for frame in input.chunks_exact(n) {
+        model.process_frame(frame, &mut out);
+        assert!(out.iter().all(|s| s.is_finite()));
+        energy += out.iter().map(|s| s * s).sum::<f32>();
+    }
+    assert!(energy > 0.0, "DFN3 produced only silence for noisy speech");
+}
+
 /// DFN3 outputs digital silence for noise alone and passes clean speech untouched. Its gain on
 /// *synthetic* noisy speech is not a fair quality measure (it reshapes the synthetic harmonics
 /// it does not recognise as voice), so quality is left to the real-speech harness in tools/eval.
