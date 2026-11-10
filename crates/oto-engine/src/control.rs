@@ -41,7 +41,7 @@ pub fn decide(enabled: bool, clients_active: bool, driver_installed: bool) -> Mo
 /// The model this build runs for a tier.
 ///
 /// Without the `dfn3` cargo feature every tier is RNNoise (it meets the 50 ms budget, see
-/// PLAN.md), so the tier setting changes nothing. With `dfn3`, [`Tier::Light`] is RNNoise and
+/// docs/models.md), so the tier setting changes nothing. With `dfn3`, [`Tier::Light`] is RNNoise and
 /// [`Tier::Standard`] and [`Tier::Max`] are DeepFilterNet3, which costs ~15× the CPU, adds
 /// 20 ms and allocates inside inference on the audio thread (see `oto_dsp::Model`).
 pub fn model_for(tier: Tier) -> Model {

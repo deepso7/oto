@@ -1,5 +1,5 @@
 //! `oto`: the headless front end. Runs the engine without a window, lists devices, reports
-//! driver status, and hosts the latency and benchmark tools (see PLAN.md, phase 0).
+//! driver status, and hosts the latency and benchmark tools (see docs/roadmap.md).
 
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};

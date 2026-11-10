@@ -2,7 +2,7 @@
 //!
 //! The UI and CLI never touch audio directly. They send [`Command`]s and read [`Event`]s, which
 //! keeps the engine free to move into its own process later without changing its callers.
-//! See PLAN.md for the design. Threads: the caller's, one control thread (`oto-control`) owning
+//! See docs/architecture.md for the design. Threads: the caller's, one control thread (`oto-control`) owning
 //! devices and state, and the two Core Audio IO threads (mic, sink) running the realtime path.
 
 pub use oto_dsp as dsp;
@@ -34,7 +34,7 @@ pub enum Strength {
     Strong,
 }
 
-/// Which model tier runs. See PLAN.md, "Models". [`model_for`] maps a tier to the model this
+/// Which model tier runs. See docs/models.md. [`model_for`] maps a tier to the model this
 /// build runs for it and [`available_tiers`] lists the tiers that actually differ.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum Tier {
