@@ -87,6 +87,51 @@ impl<D: Denoiser> FrameAdapter<D> {
     }
 }
 
+/// The full v1 signal chain: high-pass (80 Hz) → denoise → limiter (−1 dBFS).
+///
+/// Mono, 48 kHz, any block size, in place, allocation-free after construction.
+/// CONTRACT STUB: the real stages land in the DSP work; callers may rely on this API.
+pub struct Chain {
+    enabled: bool,
+    max_attenuation_db: f32,
+}
+
+impl Chain {
+    /// Build the chain at [`SAMPLE_RATE`]. Allocates; call off the realtime thread.
+    pub fn new() -> Self {
+        Self { enabled: true, max_attenuation_db: 24.0 }
+    }
+
+    /// When `false`, denoising is bypassed (high-pass and limiter still run) and no inference runs.
+    pub fn set_enabled(&mut self, enabled: bool) {
+        self.enabled = enabled;
+    }
+
+    /// Strength: the most the denoiser may attenuate any band, in dB. `f32::INFINITY` = no limit.
+    pub fn set_max_attenuation_db(&mut self, db: f32) {
+        self.max_attenuation_db = db;
+    }
+
+    /// Delay the chain adds, in samples at [`SAMPLE_RATE`].
+    pub fn latency(&self) -> usize {
+        0
+    }
+
+    /// Process one block in place.
+    pub fn process(&mut self, _buf: &mut [f32]) {
+        let _ = (self.enabled, self.max_attenuation_db);
+    }
+
+    /// Drop state after a device change or a long gap.
+    pub fn reset(&mut self) {}
+}
+
+impl Default for Chain {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
