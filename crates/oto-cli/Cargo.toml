@@ -1,0 +1,12 @@
+[package]
+name = "oto-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+oto-engine.workspace = true
+
+[[bin]]
+name = "oto"
+path = "src/main.rs"

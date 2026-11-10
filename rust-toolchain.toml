@@ -1,0 +1,4 @@
+# Matches the toolchain Rune pins on its `dev` branch.
+[toolchain]
+channel = "1.99.1"
+components = ["clippy", "rustfmt"]

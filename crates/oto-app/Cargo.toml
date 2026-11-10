@@ -1,0 +1,9 @@
+[package]
+name = "oto-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+oto-engine.workspace = true
+rune.workspace = true

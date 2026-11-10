@@ -1,0 +1,22 @@
+[workspace]
+resolver = "3"
+members = ["crates/oto-dsp", "crates/oto-engine", "crates/oto-cli", "crates/oto-app"]
+# The UI pulls in the whole GPU stack; keep plain `cargo build/test` fast.
+default-members = ["crates/oto-dsp", "crates/oto-engine", "crates/oto-cli"]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+oto-dsp = { path = "crates/oto-dsp" }
+oto-engine = { path = "crates/oto-engine" }
+# Rune is pre-release: always pin a rev of `dev` and bump deliberately.
+rune = { git = "https://github.com/anomalyco/rune", rev = "70eff81165e9854834a75f17753edb6c96ab2ab7" }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = true
