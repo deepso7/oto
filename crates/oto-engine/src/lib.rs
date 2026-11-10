@@ -11,12 +11,19 @@ mod control;
 pub mod latency;
 mod pipeline;
 mod platform;
+mod state;
 
-pub use control::model_for;
+pub use control::{available_tiers, model_for};
 pub use pipeline::Probe;
 
+use std::path::PathBuf;
 use std::sync::atomic::Ordering::Relaxed;
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, mpsc};
+
+/// The exact error [`Engine::start`] and [`Engine::start_with`] return when another engine
+/// (in this or any other process of the same user) is already running. Two engines would both
+/// play into the virtual microphone and double the audio. Compare with `==`.
+pub const ALREADY_RUNNING: &str = "Oto is already running";
 
 /// How hard the denoiser works. Maps to an attenuation limit, not to different models.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -27,7 +34,8 @@ pub enum Strength {
     Strong,
 }
 
-/// Which model tier runs. See PLAN.md, "Models".
+/// Which model tier runs. See PLAN.md, "Models". [`model_for`] maps a tier to the model this
+/// build runs for it and [`available_tiers`] lists the tiers that actually differ.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum Tier {
     Light,
@@ -55,7 +63,12 @@ pub enum Event {
     DevicesChanged,
     /// Share of one core spent in the audio callback, 0.0 to 1.0.
     Load(f32),
+    /// Something is wrong. Stays true until [`Event::Recovered`] (or the next `Error`).
     Error(String),
+    /// The last reported [`Event::Error`] no longer applies: audio is flowing normally again,
+    /// or nothing needs to run (no app is recording and the driver is present). Sent once per
+    /// recovery; UIs clear their error banner on it.
+    Recovered,
 }
 
 impl Strength {
@@ -116,6 +129,10 @@ pub struct InputDevice {
 
 /// The running engine: a control thread owning devices and state. Dropping it shuts down cleanly
 /// (streams stopped, listeners removed) and restores the default input if the engine changed it.
+///
+/// Only one engine runs per user at a time: starting a second fails with [`ALREADY_RUNNING`].
+/// Queries that open no streams ([`list_input_devices`], [`status`], [`Engine::driver_installed`],
+/// `dsp::bench`) are not affected.
 pub struct Engine {
     levels: Arc<Levels>,
     events: mpsc::Receiver<Event>,
@@ -123,17 +140,27 @@ pub struct Engine {
     thread: Option<std::thread::JoinHandle<()>>,
     shared: Arc<pipeline::Shared>,
     uids: platform::Uids,
-    restore_input: Mutex<Option<String>>,
+    restore: Arc<state::RestoreTarget>,
+    /// Released when the engine is dropped (after the streams have stopped).
+    _lock: Option<state::InstanceLock>,
 }
 
 impl Engine {
-    /// Start the control thread. Audio only runs while enabled and an app records from Oto Microphone.
+    /// Start the control thread. Audio only runs while enabled and an app records from Oto
+    /// Microphone. Fails with exactly [`ALREADY_RUNNING`] if another engine holds the instance
+    /// lock.
+    ///
+    /// If a previous run made Oto Microphone the default input and died without restoring it,
+    /// this engine puts the previous microphone back at once. Callers that want Oto as the
+    /// default ask for it again.
     pub fn start(initial: Settings) -> Result<Self, String> {
         Self::start_with(initial, EngineOptions::default())
     }
 
     /// [`Engine::start`] with test and development hooks.
     pub fn start_with(initial: Settings, opts: EngineOptions) -> Result<Self, String> {
+        let dir = opts.state_dir.clone().or_else(state::default_dir);
+        let lock = state::InstanceLock::acquire(dir.as_deref())?;
         let levels = Arc::new(Levels::default());
         levels.set(-120.0, -120.0);
         let mut shared = pipeline::Shared::new(levels.clone(), opts.probe.clone());
@@ -143,14 +170,30 @@ impl Engine {
         let (tx, rx) = mpsc::channel();
         let (etx, events) = mpsc::channel();
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+        let restore = Arc::new(state::RestoreTarget::open(
+            dir.as_deref(),
+            &uids.mic,
+            platform::sys::default_input_uid().as_deref(),
+        ));
+        // Anything pending here is left over from a run that died. A failure keeps the target
+        // for the drop to retry.
+        let _ = restore.restore(platform::sys::default_input_uid, |uid| {
+            platform::sys::set_default_input(uid)
+        });
         let (sh, u, tx2) = (shared.clone(), uids.clone(), tx.clone());
         let force = opts.force_clients_active;
+        let r = restore.clone();
+        // Runs on the control thread when the system default input changes.
+        let on_default: control::Hook =
+            Box::new(move || r.default_changed(platform::sys::default_input_uid));
         let thread = std::thread::Builder::new()
             .name("oto-control".into())
             .spawn(move || match platform::sys::Backend::new(u, tx2) {
                 Ok(p) => {
                     let _ = ready_tx.send(Ok(()));
-                    control::Control::new(p, initial, force, sh, etx).run(rx);
+                    control::Control::new(p, initial, force, sh, etx)
+                        .on_default_input(on_default)
+                        .run(rx);
                 }
                 Err(e) => {
                     let _ = ready_tx.send(Err(e));
@@ -169,7 +212,8 @@ impl Engine {
             thread: Some(thread),
             shared,
             uids,
-            restore_input: Mutex::new(None),
+            restore,
+            _lock: lock,
         })
     }
 
@@ -198,30 +242,24 @@ impl Engine {
     }
 
     /// Make Oto Microphone the system default input. The previous default is restored when the
-    /// engine is dropped (unless the user picked something else in the meantime).
+    /// engine is dropped (unless the user picked something else in the meantime). It is also
+    /// written to the state directory first, so that if this process dies without restoring,
+    /// the next engine to start adopts it. Does file I/O: not for realtime threads.
     pub fn set_default_input_to_oto(&self) -> Result<(), String> {
-        let prev = platform::sys::default_input_uid();
-        if prev.as_deref() == Some(self.uids.mic.as_str()) {
-            return Ok(());
-        }
-        platform::sys::set_default_input(&self.uids.mic)?;
-        *self.restore_input.lock().unwrap_or_else(|e| e.into_inner()) = prev;
-        Ok(())
+        self.restore
+            .switch_to_oto(platform::sys::default_input_uid(), |mic| {
+                platform::sys::set_default_input(mic)
+            })
     }
 
-    /// Undo [`Engine::set_default_input_to_oto`] now. Also runs on drop.
+    /// Undo [`Engine::set_default_input_to_oto`] (from this run or adopted from a crashed one)
+    /// now. Also runs on drop. If putting the old default back fails (e.g. it is unplugged),
+    /// the target is kept and a later call or run retries.
     pub fn restore_default_input(&self) -> Result<(), String> {
-        let prev = self
-            .restore_input
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .take();
-        match prev {
-            Some(uid) if platform::sys::default_input_uid().as_deref() == Some(&self.uids.mic) => {
-                platform::sys::set_default_input(&uid)
-            }
-            _ => Ok(()),
-        }
+        self.restore
+            .restore(platform::sys::default_input_uid, |uid| {
+                platform::sys::set_default_input(uid)
+            })
     }
 }
 
@@ -250,6 +288,10 @@ pub struct EngineOptions {
     /// Development: loop these mono samples in place of the mic signal, at the mic's rate.
     /// The real mic still clocks the stream. Used to prove the full path with a known signal.
     pub source: Option<Arc<[f32]>>,
+    /// Where the instance lock and the pending default-input restore live. `None` (the default)
+    /// is `~/Library/Application Support/oto` on macOS and `$XDG_STATE_HOME/oto` (or
+    /// `~/.local/state/oto`) elsewhere. Tests point it at a temporary directory.
+    pub state_dir: Option<PathBuf>,
 }
 
 impl EngineOptions {

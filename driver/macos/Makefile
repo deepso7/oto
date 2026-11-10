@@ -1,8 +1,15 @@
 # Builds OtoMicrophone.driver (universal arm64 + x86_64) and the oto-verify tool into build/.
-#   make                     build, then sign with $(SIGN_ID) if present in the keychain, else ad-hoc
-#   make SIGN_ID=-           force ad-hoc signing
+#
+#   make                          build and sign ad-hoc (local development)
+#   SIGN_ID="<identity>" make     build and sign with that keychain identity
+#   SIGN_ID="Developer ID Application: Name (TEAMID)" make release
+#                                 build for distribution: hardened runtime + secure timestamp;
+#                                 fails unless SIGN_ID is a Developer ID identity in the keychain
 #   make clean
-# Install with scripts/macos/install-driver.sh (it runs make first).
+#
+# SIGN_ID is a certificate name or SHA-1 hash from `security find-identity -v -p codesigning`.
+# No identity lives in the repo: it always comes from the environment or the command line.
+# Run as yourself, never as root. scripts/macos/install-driver.sh installs the result.
 
 BUILD    := build
 BUNDLE   := $(BUILD)/OtoMicrophone.driver
@@ -12,32 +19,55 @@ VERIFY   := $(BUILD)/oto-verify
 ARCHS    := -arch arm64 -arch x86_64
 MINOS    := -mmacosx-version-min=12.0
 CFLAGS   := -std=c11 -O2 -Wall -Wextra -Werror $(ARCHS) $(MINOS)
-SIGN_ID  ?= Apple Development: deeps.o7o8.y@gmail.com (RH3RCAWYF5)
+SIGN_ID  ?= -
+ifeq ($(strip $(SIGN_ID)),)
+override SIGN_ID := -
+endif
 
-all: $(STAMP) $(VERIFY)
+# Developer ID builds (and everything under `make release`) get the hardened runtime and a
+# secure timestamp, which notarization requires. Other identities skip the timestamp server.
+ifneq ($(or $(RELEASE),$(findstring Developer ID Application,$(SIGN_ID))),)
+SIGN_FLAGS := --options runtime --timestamp
+else
+SIGN_FLAGS := --timestamp=none
+endif
+
+all: sign $(VERIFY)
 
 $(BIN): src/OtoDriver.c Info.plist
 	@mkdir -p $(BUNDLE)/Contents/MacOS
+	@rm -f $(STAMP)
 	cp Info.plist $(BUNDLE)/Contents/Info.plist
 	clang $(CFLAGS) -bundle -fvisibility=hidden -o $@ src/OtoDriver.c \
 		-framework CoreFoundation -framework CoreAudio
 
-$(STAMP): $(BIN)
-	@if [ "$(SIGN_ID)" != "-" ] && security find-identity -v -p codesigning | grep -qF "$(SIGN_ID)"; then \
-		echo "signing with $(SIGN_ID)"; \
-		codesign --force --timestamp=none -s "$(SIGN_ID)" $(BUNDLE); \
-	else \
-		echo "signing ad-hoc"; \
-		codesign --force -s - $(BUNDLE); \
-	fi
-	codesign --verify --strict --verbose=1 $(BUNDLE)
-	@touch $@
+# Signs when the binary was rebuilt or the identity/flags differ from the last signing, which
+# $(STAMP) records. No fallback: if SIGN_ID is not in the keychain, codesign fails and so does
+# the build.
+sign: $(BIN)
+	@if [ "$$(id -u)" = 0 ]; then echo "error: do not build the driver as root" >&2; exit 1; fi
+	@cfg='$(SIGN_ID) $(SIGN_FLAGS)'; \
+	if [ -f $(STAMP) ] && [ "$$(cat $(STAMP))" = "$$cfg" ]; then exit 0; fi; \
+	rm -f $(STAMP); \
+	if [ '$(SIGN_ID)' = - ]; then echo "signing ad-hoc"; else echo "signing with $(SIGN_ID)"; fi; \
+	codesign --force $(SIGN_FLAGS) -s '$(SIGN_ID)' $(BUNDLE) && \
+	codesign --verify --strict --verbose=1 $(BUNDLE) && \
+	printf '%s\n' "$$cfg" > $(STAMP)
 
 $(VERIFY): tools/oto-verify.c
 	@mkdir -p $(BUILD)
 	clang $(CFLAGS) -o $@ $< -framework CoreFoundation -framework CoreAudio
 
+# A distributable driver: refuses ad-hoc, unknown and non-Developer-ID identities.
+release:
+	@if [ '$(SIGN_ID)' = - ]; then \
+		echo "error: make release needs SIGN_ID set to a Developer ID Application identity" >&2; exit 1; fi
+	@security find-identity -v -p codesigning | grep -F -- '$(SIGN_ID)' | grep -q 'Developer ID Application' || { \
+		echo "error: SIGN_ID '$(SIGN_ID)' is not a Developer ID Application identity in the keychain" >&2; exit 1; }
+	@$(MAKE) --no-print-directory all RELEASE=1
+	codesign --verify --strict -R='anchor apple generic and certificate leaf[field.1.2.840.113635.100.6.1.13] exists' $(BUNDLE)
+
 clean:
 	rm -rf $(BUILD)
 
-.PHONY: all clean
+.PHONY: all sign release clean

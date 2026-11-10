@@ -2741,6 +2741,7 @@ name = "oto-app"
 version = "0.0.1"
 dependencies = [
  "auto-launch",
+ "block2 0.6.2",
  "dirs",
  "objc2 0.6.5",
  "objc2-app-kit 0.3.2",

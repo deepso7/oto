@@ -86,7 +86,6 @@ static UInt32 gMicIOCount = 0;  // StartIO minus StopIO, per device
 static UInt32 gSinkIOCount = 0;
 static _Atomic UInt64 gAnchorHostTime = 0; // shared clock anchor, valid while any IO runs
 static Float64 gHostTicksPerFrame = 0;
-static bool gMicStreamActive = true, gSinkStreamActive = true;
 
 static Float32 gRing[RING_FRAMES * CHANNELS];
 static _Atomic UInt64 gStamp[RING_FRAMES]; // sample time held by each slot, EMPTY = none
@@ -291,12 +290,8 @@ static OSStatus get_prop(AudioObjectID obj, const AudioObjectPropertyAddress* a,
         case kAudioObjectPropertyClass: PUT(AudioClassID, kAudioStreamClassID);
         case kAudioObjectPropertyOwner: PUT(AudioObjectID, device_of(obj));
         case kAudioObjectPropertyOwnedObjects: *outSize = 0; return noErr;
-        case kAudioStreamPropertyIsActive: {
-            pthread_mutex_lock(&gStateMutex);
-            UInt32 r = micStream ? gMicStreamActive : gSinkStreamActive;
-            pthread_mutex_unlock(&gStateMutex);
-            PUT(UInt32, r);
-        }
+        // Always active and not settable: the IO path has no notion of a disabled stream.
+        case kAudioStreamPropertyIsActive: PUT(UInt32, 1);
         case kAudioStreamPropertyDirection: PUT(UInt32, micStream ? 1 : 0); // 1 = input
         case kAudioStreamPropertyTerminalType:
             PUT(UInt32, micStream ? kAudioStreamTerminalTypeMicrophone : kAudioStreamTerminalTypeSpeaker);
@@ -376,8 +371,8 @@ static OSStatus Oto_IsPropertySettable(AudioServerPlugInDriverRef d, AudioObject
     if (a == NULL || out == NULL) return kAudioHardwareIllegalOperationError;
     if (!Oto_HasProperty(d, obj, pid, a)) return kAudioHardwareUnknownPropertyError;
     switch (a->mSelector) {
-    case kAudioDevicePropertyNominalSampleRate: *out = is_device(obj); break;
-    case kAudioStreamPropertyIsActive:
+    // The sample rate is fixed, so kAudioDevicePropertyNominalSampleRate is read-only. The
+    // stream formats stay settable because clients routinely "set" the one format we have.
     case kAudioStreamPropertyVirtualFormat:
     case kAudioStreamPropertyPhysicalFormat: *out = is_stream(obj); break;
     default: *out = false;
@@ -411,7 +406,8 @@ static OSStatus Oto_SetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID 
     case kAudioDevicePropertyNominalSampleRate:
         if (!is_device(obj)) break;
         if (inSize < sizeof(Float64)) return kAudioHardwareBadPropertySizeError;
-        return *(const Float64*)inData == SAMPLE_RATE ? noErr : kAudioHardwareIllegalOperationError;
+        // Reported as not settable; a set to the rate we already run at is still a harmless no-op.
+        return *(const Float64*)inData == SAMPLE_RATE ? noErr : kAudioDeviceUnsupportedFormatError;
     case kAudioStreamPropertyVirtualFormat:
     case kAudioStreamPropertyPhysicalFormat: {
         if (!is_stream(obj)) break;
@@ -422,22 +418,6 @@ static OSStatus Oto_SetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID 
                   f->mChannelsPerFrame == ours.mChannelsPerFrame && f->mBitsPerChannel == ours.mBitsPerChannel &&
                   (f->mFormatFlags & kAudioFormatFlagIsFloat);
         return ok ? noErr : kAudioDeviceUnsupportedFormatError;
-    }
-    case kAudioStreamPropertyIsActive: {
-        if (!is_stream(obj)) break;
-        if (inSize < sizeof(UInt32)) return kAudioHardwareBadPropertySizeError;
-        bool v = *(const UInt32*)inData != 0;
-        pthread_mutex_lock(&gStateMutex);
-        bool* cur = obj == kObj_MicStream ? &gMicStreamActive : &gSinkStreamActive;
-        bool changed = *cur != v;
-        *cur = v;
-        pthread_mutex_unlock(&gStateMutex);
-        if (changed && gHost) {
-            AudioObjectPropertyAddress ad = {kAudioStreamPropertyIsActive, kAudioObjectPropertyScopeGlobal,
-                                             kAudioObjectPropertyElementMain};
-            gHost->PropertiesChanged(gHost, obj, 1, &ad);
-        }
-        return noErr;
     }
     }
     return Oto_HasProperty(d, obj, pid, a) ? kAudioHardwareUnsupportedOperationError

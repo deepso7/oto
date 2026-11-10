@@ -8,7 +8,7 @@ use std::sync::atomic::Ordering::Relaxed;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant};
 
-use oto_dsp::Chain;
+use oto_dsp::{Chain, Model};
 
 use crate::pipeline::Shared;
 use crate::platform::{HalEvent, Platform};
@@ -38,26 +38,47 @@ pub fn decide(enabled: bool, clients_active: bool, driver_installed: bool) -> Mo
     }
 }
 
-/// Builds the chain for a tier. Allocates and may load a model: control thread only.
-fn make_chain(tier: Tier) -> Result<Chain, String> {
-    Chain::with_model(model_for(tier))
+/// The model this build runs for a tier.
+///
+/// Without the `dfn3` cargo feature every tier is RNNoise (it meets the 50 ms budget, see
+/// PLAN.md), so the tier setting changes nothing. With `dfn3`, [`Tier::Light`] is RNNoise and
+/// [`Tier::Standard`] and [`Tier::Max`] are DeepFilterNet3, which costs ~15× the CPU, adds
+/// 20 ms and allocates inside inference on the audio thread (see `oto_dsp::Model`).
+pub fn model_for(tier: Tier) -> Model {
+    if cfg!(feature = "dfn3") {
+        match tier {
+            Tier::Light => Model::RNNoise,
+            Tier::Standard | Tier::Max => Model::DeepFilterNet3,
+        }
+    } else {
+        Model::RNNoise
+    }
 }
 
-/// Every tier runs the default model (RNNoise: it meets the 50 ms budget, see PLAN.md) for now.
-/// DeepFilterNet3 (`dfn3` feature) allocates per frame, so it is bench-only until it can run on
-/// the audio thread; `oto bench --model dfn3` times it.
-pub fn model_for(_tier: Tier) -> oto_dsp::Model {
-    oto_dsp::Model::default()
+/// The tiers worth offering: one per distinct model in this build, in ascending order. Always
+/// contains [`Tier::default`]. When it has a single entry the tier setting does nothing and a
+/// UI should hide its picker.
+pub fn available_tiers() -> &'static [Tier] {
+    if cfg!(feature = "dfn3") {
+        &[Tier::Light, Tier::Standard]
+    } else {
+        &[Tier::Standard]
+    }
 }
+
+/// Called on the control thread when the system default input changed.
+pub(crate) type Hook = Box<dyn Fn() + Send>;
 
 const TICK: Duration = Duration::from_millis(250);
 const RETRY: Duration = Duration::from_secs(2);
 const STALL: Duration = Duration::from_millis(1500);
 
+/// What the running streams were built for. Keyed on the resolved model, not the tier: a tier
+/// change that resolves to the same model must not restart audio.
 #[derive(Clone, Debug, PartialEq)]
 struct RunKey {
     input: String,
-    tier: Tier,
+    model: Model,
 }
 
 pub(crate) struct Control<P: Platform> {
@@ -70,9 +91,12 @@ pub(crate) struct Control<P: Platform> {
     driver_reported_missing: bool,
     running: Option<RunKey>,
     last_error: Option<String>,
+    /// An error was reported and `Event::Recovered` has not been sent since.
+    fault: bool,
     retry_at: Option<Instant>,
     watch: (Instant, u64, u64),
     load: (Instant, u64),
+    on_default_input: Option<Hook>,
 }
 
 impl<P: Platform> Control<P> {
@@ -94,10 +118,17 @@ impl<P: Platform> Control<P> {
             driver_reported_missing: false,
             running: None,
             last_error: None,
+            fault: false,
             retry_at: None,
             watch: (now, 0, 0),
             load: (now, 0),
+            on_default_input: None,
         }
+    }
+
+    pub fn on_default_input(mut self, hook: Hook) -> Self {
+        self.on_default_input = Some(hook);
+        self
     }
 
     pub fn run(mut self, rx: Receiver<Msg>) {
@@ -121,6 +152,16 @@ impl<P: Platform> Control<P> {
         if self.last_error.as_ref() != Some(&e) {
             self.emit(Event::Error(e.clone()));
             self.last_error = Some(e);
+            self.fault = true;
+        }
+    }
+
+    /// The reported error no longer applies. Forgets it, so a recurrence is reported again.
+    fn recovered(&mut self) {
+        if self.fault {
+            self.fault = false;
+            self.last_error = None;
+            self.emit(Event::Recovered);
         }
     }
 
@@ -139,7 +180,12 @@ impl<P: Platform> Control<P> {
                 }
                 Command::Shutdown => {}
             },
-            Msg::Hal(HalEvent::DeviceList | HalEvent::DefaultInput) => {
+            Msg::Hal(ev @ (HalEvent::DeviceList | HalEvent::DefaultInput)) => {
+                if ev == HalEvent::DefaultInput
+                    && let Some(hook) = &self.on_default_input
+                {
+                    hook();
+                }
                 self.p.refresh();
                 self.retry_at = None;
                 self.emit(Event::DevicesChanged);
@@ -166,6 +212,8 @@ impl<P: Platform> Control<P> {
         );
         if i != i0 && o != o0 {
             self.watch = (now, i, o);
+            // Both callbacks are being called: whatever went wrong before is over.
+            self.recovered();
         } else if now.duration_since(since) > STALL {
             // Typical after sleep/wake or a device reset: restart the streams.
             let which = if i == i0 { "microphone" } else { "Oto sink" };
@@ -198,6 +246,9 @@ impl<P: Platform> Control<P> {
                 "Oto driver is not installed: Oto Microphone is not available".into(),
             ));
         }
+        if !driver && !self.driver_reported_missing {
+            self.fault = true;
+        }
         self.driver_reported_missing = !driver;
         let clients = driver && (self.force_clients || self.p.clients_active());
         if clients != self.clients {
@@ -213,6 +264,10 @@ impl<P: Platform> Control<P> {
         if mode == Mode::Idle {
             self.stop();
             self.retry_at = None;
+            if driver {
+                // Nothing needs to run and nothing is missing: any earlier error is moot.
+                self.recovered();
+            }
             return;
         }
         let Some(input) = self.p.resolve_input(self.settings.input_device.as_deref()) else {
@@ -222,17 +277,22 @@ impl<P: Platform> Control<P> {
         };
         let key = RunKey {
             input,
-            tier: self.settings.tier,
+            model: model_for(self.settings.tier),
         };
         if self.running.as_ref() == Some(&key) {
             return;
         }
         self.stop();
-        let now = Instant::now();
-        if self.retry_at.is_some_and(|t| now < t) {
+        if self.retry_at.is_some_and(|t| Instant::now() < t) {
             return;
         }
-        match make_chain(key.tier).and_then(|c| self.p.start(&key.input, c, &self.shared)) {
+        // Allocates and may load a model: fine here, this is the control thread.
+        let started =
+            Chain::with_model(key.model).and_then(|c| self.p.start(&key.input, c, &self.shared));
+        // Opening devices can take a while (Bluetooth: seconds). The stall watchdog and the
+        // load meter count from when the streams were actually started, not from before.
+        let now = Instant::now();
+        match started {
             Ok(()) => {
                 self.running = Some(key);
                 self.shared.running.store(true, Relaxed);
@@ -409,7 +469,7 @@ mod tests {
     }
 
     #[test]
-    fn strength_reaches_shared_state_and_tier_restarts() {
+    fn strength_reaches_shared_state_and_tier_restarts_only_for_another_model() {
         let (mut c, _rx) = ctl(
             Fake {
                 clients: true,
@@ -420,9 +480,225 @@ mod tests {
         c.handle(Msg::Cmd(Command::SetStrength(Strength::Light)));
         c.reconcile();
         assert_eq!(f32::from_bits(c.shared.max_atten_bits.load(Relaxed)), 12.0);
+        // Standard → Max is the same model in every build: audio keeps running.
+        assert_eq!(model_for(Tier::Standard), model_for(Tier::Max));
+        c.handle(Msg::Cmd(Command::SetTier(Tier::Max)));
+        c.reconcile();
+        assert_eq!(c.p.started.len(), 1);
+        assert_eq!(c.p.stops, 0);
+        // Standard/Max → Light restarts only if this build has a different model for it.
         c.handle(Msg::Cmd(Command::SetTier(Tier::Light)));
         c.reconcile();
-        assert_eq!(c.p.started.len(), 2);
+        let distinct = model_for(Tier::Light) != model_for(Tier::Max);
+        assert_eq!(distinct, cfg!(feature = "dfn3"));
+        assert_eq!(c.p.started.len(), if distinct { 2 } else { 1 });
+    }
+
+    #[test]
+    fn available_tiers_resolve_to_distinct_available_models() {
+        let tiers = available_tiers();
+        assert!(tiers.contains(&Tier::default()));
+        let models: Vec<_> = tiers.iter().map(|&t| model_for(t)).collect();
+        for (i, m) in models.iter().enumerate() {
+            assert!(m.available(), "{m:?} is not in this build");
+            assert!(!models[..i].contains(m), "{m:?} offered twice");
+        }
+        // Nothing reachable is left out.
+        for t in [Tier::Light, Tier::Standard, Tier::Max] {
+            assert!(models.contains(&model_for(t)));
+        }
+        assert_eq!(tiers.len(), if cfg!(feature = "dfn3") { 2 } else { 1 });
+    }
+
+    fn errors_and_recoveries(rx: &mpsc::Receiver<Event>) -> Vec<Event> {
+        rx.try_iter()
+            .filter(|e| matches!(e, Event::Error(_) | Event::Recovered))
+            .collect()
+    }
+
+    fn advance(c: &Control<Fake>) {
+        c.shared.in_cycles.fetch_add(10, Relaxed);
+        c.shared.out_cycles.fetch_add(10, Relaxed);
+    }
+
+    #[test]
+    fn recovery_is_reported_once_when_audio_flows_again() {
+        let (mut c, rx) = ctl(
+            Fake {
+                clients: true,
+                fail: true,
+                ..fake()
+            },
+            true,
+        );
+        c.reconcile();
+        assert_eq!(errors_and_recoveries(&rx), [Event::Error("boom".into())]);
+        // The start succeeds, but nothing has been heard from the callbacks yet.
+        c.p.fail = false;
+        c.retry_at = None;
+        c.reconcile();
+        assert!(c.p.live);
+        c.tick(Instant::now());
+        assert_eq!(errors_and_recoveries(&rx), []);
+        // Both callbacks run: recovered, exactly once.
+        advance(&c);
+        c.tick(Instant::now());
+        assert_eq!(errors_and_recoveries(&rx), [Event::Recovered]);
+        advance(&c);
+        c.tick(Instant::now());
+        c.reconcile();
+        assert_eq!(errors_and_recoveries(&rx), []);
+    }
+
+    #[test]
+    fn no_recovery_without_a_prior_error() {
+        let (mut c, rx) = ctl(
+            Fake {
+                clients: true,
+                ..fake()
+            },
+            true,
+        );
+        c.reconcile();
+        advance(&c);
+        c.tick(Instant::now());
+        c.p.clients = false;
+        c.reconcile();
+        assert_eq!(errors_and_recoveries(&rx), []);
+    }
+
+    #[test]
+    fn stall_then_restart_reports_recovery_and_a_repeat_is_reported_again() {
+        let (mut c, rx) = ctl(
+            Fake {
+                clients: true,
+                ..fake()
+            },
+            true,
+        );
+        c.reconcile();
+        for round in 0..2 {
+            c.tick(Instant::now() + Duration::from_secs(2));
+            let ev = errors_and_recoveries(&rx);
+            assert!(
+                matches!(&ev[..], [Event::Error(e)] if e.contains("stalled")),
+                "round {round}: {ev:?}"
+            );
+            c.reconcile();
+            assert!(c.p.live);
+            assert_eq!(errors_and_recoveries(&rx), []);
+            advance(&c);
+            c.tick(Instant::now());
+            assert_eq!(errors_and_recoveries(&rx), [Event::Recovered]);
+        }
+    }
+
+    #[test]
+    fn error_is_cleared_when_nothing_needs_to_run() {
+        // No mic while an app records: an error. The app stops recording: nothing is wrong
+        // any more. It records again: the error is reported again.
+        let (mut c, rx) = ctl(
+            Fake {
+                clients: true,
+                inputs: vec![],
+                default: None,
+                ..fake()
+            },
+            true,
+        );
+        c.reconcile();
+        c.reconcile();
+        assert_eq!(
+            errors_and_recoveries(&rx),
+            [Event::Error("no microphone found".into())]
+        );
+        c.p.clients = false;
+        c.reconcile();
+        c.reconcile();
+        assert_eq!(errors_and_recoveries(&rx), [Event::Recovered]);
+        c.p.clients = true;
+        c.reconcile();
+        assert_eq!(
+            errors_and_recoveries(&rx),
+            [Event::Error("no microphone found".into())]
+        );
+    }
+
+    #[test]
+    fn driver_coming_back_clears_its_error() {
+        let (mut c, rx) = ctl(
+            Fake {
+                driver: false,
+                ..fake()
+            },
+            true,
+        );
+        c.reconcile();
+        assert!(matches!(&errors_and_recoveries(&rx)[..], [Event::Error(_)]));
+        c.p.driver = true;
+        c.reconcile();
+        c.reconcile();
+        assert_eq!(errors_and_recoveries(&rx), [Event::Recovered]);
+    }
+
+    #[test]
+    fn stall_clock_starts_after_the_streams_started() {
+        /// A device that takes longer than the stall limit to open.
+        struct Slow(Fake);
+        impl Platform for Slow {
+            fn driver_installed(&self) -> bool {
+                self.0.driver_installed()
+            }
+            fn clients_active(&self) -> bool {
+                self.0.clients_active()
+            }
+            fn input_devices(&self) -> Vec<InputDevice> {
+                Vec::new()
+            }
+            fn resolve_input(&self, p: Option<&str>) -> Option<String> {
+                self.0.resolve_input(p)
+            }
+            fn start(&mut self, i: &str, c: Chain, s: &Arc<Shared>) -> Result<(), String> {
+                std::thread::sleep(STALL + Duration::from_millis(100));
+                self.0.start(i, c, s)
+            }
+            fn stop(&mut self) {
+                self.0.stop()
+            }
+            fn refresh(&mut self) {}
+        }
+        let (tx, rx) = mpsc::channel();
+        let shared = Arc::new(Shared::new(Arc::new(Levels::default()), None));
+        let s = Settings {
+            enabled: true,
+            ..Default::default()
+        };
+        let f = Fake {
+            clients: true,
+            ..fake()
+        };
+        let mut c = Control::new(Slow(f), s, false, shared, tx);
+        c.reconcile();
+        // The first tick right after a slow start must not see a stall.
+        c.tick(Instant::now());
+        assert!(c.p.0.live);
+        assert_eq!(c.p.0.stops, 0);
+        assert!(!rx.try_iter().any(|e| matches!(e, Event::Error(_))));
+    }
+
+    #[test]
+    fn default_input_change_runs_the_hook() {
+        use std::sync::atomic::AtomicUsize;
+        let (c, _rx) = ctl(fake(), true);
+        let n = Arc::new(AtomicUsize::new(0));
+        let n2 = n.clone();
+        let mut c = c.on_default_input(Box::new(move || {
+            n2.fetch_add(1, Relaxed);
+        }));
+        c.handle(Msg::Hal(HalEvent::DeviceList));
+        assert_eq!(n.load(Relaxed), 0);
+        c.handle(Msg::Hal(HalEvent::DefaultInput));
+        assert_eq!(n.load(Relaxed), 1);
     }
 
     #[test]

@@ -4,6 +4,11 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = []
+# Run DeepFilterNet3 for the Standard and Max tiers (see `model_for`). Heavy to build.
+dfn3 = ["oto-dsp/dfn3"]
+
 [dependencies]
 oto-dsp.workspace = true
 rtrb = "0.4"

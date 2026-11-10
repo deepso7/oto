@@ -6,11 +6,12 @@ use rune::tok::{self, Theme, motion, type_};
 use rune::{Color, Cx, El, Icon, TextStyle, col, el, icon, row, text};
 use rune_kit::{
     Button, ButtonVariant, ControlSize, IconButton, IconButtonVariant, Kit, Placement,
-    SegmentedControl, Select, SelectAppearance, Switch,
+    SegmentedControl, Select, SelectAppearance, StateColors,
 };
 
 use crate::meter::{BAR_H, BAR_W};
-use crate::state::{HEAR_TEST, Install, Open, Page, STRENGTHS, State, TIERS};
+use crate::permission::Mic;
+use crate::state::{EngineState, HEAR_TEST, Install, Open, Page, STRENGTHS, State, TIERS};
 
 pub const WIDTH: f32 = 340.0;
 const PAD: f32 = 16.0;
@@ -143,21 +144,30 @@ fn header(p: &Paint, title: &str, leading: Option<El>, trailing: Option<El>) -> 
     r
 }
 
-/// The main on/off: an accent switch bigger than a settings toggle.
-fn big_switch(p: &Paint, on: bool) -> El {
-    let (w, h, k) = (46.0, 28.0, 24.0);
-    let inset = (h - k) / 2.0;
-    el().key("switch")
+/// A switch drawn here rather than rune-kit's: the kit's off track is the card's own colour in
+/// the light theme, which leaves an off switch all but invisible on a card.
+fn switch(
+    p: &Paint,
+    key: &str,
+    label: &str,
+    on: bool,
+    (w, h): (f32, f32),
+    toggle: Option<fn(&mut State)>,
+) -> El {
+    let inset = 2.0;
+    let k = h - 2.0 * inset;
+    let mut e = el()
+        .key(key)
         .role("switch")
-        .label("Noise cancellation")
+        .label(label)
         .checked(on)
-        .focusable(true)
+        .focusable(toggle.is_some())
+        .disabled(toggle.is_none())
         .focus_ring(2.0, 2.0, p.accent)
         .size(w, h)
         .radius(h / 2.0)
         .fill(if on { p.accent } else { p.t.control_off })
         .motion(motion::SNAPPY)
-        .on_press(|s: &mut State| s.toggle())
         .child(
             el().key("knob")
                 .size(k, k)
@@ -167,7 +177,37 @@ fn big_switch(p: &Paint, on: bool) -> El {
                 .shadow(1.0, 3.0, p.t.knob_shadow)
                 .shadow(0.0, 0.5, p.t.edge)
                 .a11y_hidden(),
-        )
+        );
+    e = match toggle {
+        Some(f) => e.on_press(f),
+        // Can't be changed right now: dimmed, and a press does nothing.
+        None => e.opacity(0.45),
+    };
+    e
+}
+
+/// The main on/off: bigger than a settings toggle.
+fn big_switch(p: &Paint, on: bool) -> El {
+    switch(
+        p,
+        "switch",
+        "Noise cancellation",
+        on,
+        (46.0, 28.0),
+        Some(|s| s.toggle()),
+    )
+}
+
+/// A settings-sized switch; `enabled` false shows it dimmed and inert.
+fn small_switch(
+    p: &Paint,
+    key: &str,
+    label: &str,
+    on: bool,
+    enabled: bool,
+    toggle: fn(&mut State),
+) -> El {
+    switch(p, key, label, on, (38.0, 22.0), enabled.then_some(toggle))
 }
 
 fn field_row(p: &Paint, key: &str, label: &str, control: El) -> El {
@@ -232,6 +272,96 @@ fn error_banner(p: &Paint, msg: &str, dismiss: fn(&mut State)) -> El {
         )
 }
 
+/// A notice's button: its label and what it does.
+type Action<'a> = (&'a str, fn(&mut State));
+
+/// A message that isn't an error of the moment: what's missing, and the button that fixes it.
+fn notice(p: &Paint, key: &str, c: &StateColors, msg: &str, action: Option<Action>) -> El {
+    let mut r = row()
+        .key(key)
+        .role("status")
+        .w_full()
+        .pl(12.0)
+        .pr(8.0)
+        .py(8.0)
+        .gap(10.0)
+        .center_y()
+        .radius(8.0)
+        .fill(c.bg)
+        .border(p.hair, c.border)
+        .child(
+            text(msg.to_owned())
+                .key("message")
+                .font(CAPTION)
+                .color(c.fg)
+                .wrap()
+                .grow(1.0)
+                .shrink(),
+        );
+    if let Some((label, f)) = action {
+        r = r.child(
+            Button::new(label)
+                .control_size(ControlSize::Small)
+                .on_press(f)
+                .build(&p.k)
+                .key(format!("{key}-action")),
+        );
+    }
+    r
+}
+
+/// Microphone access, when Oto doesn't have it: without it macOS feeds Oto silence.
+fn mic_notice(s: &State, p: &Paint) -> Option<El> {
+    let c = &p.k.c;
+    match s.mic {
+        Mic::Authorized => None,
+        Mic::NotDetermined => Some(notice(
+            p,
+            "mic",
+            &c.info,
+            "Oto needs your permission to hear the microphone.",
+            Some(("Allow\u{2026}", |s| s.allow_mic())),
+        )),
+        Mic::Denied => Some(notice(
+            p,
+            "mic",
+            &c.warning,
+            "Oto can\u{2019}t hear your microphone. Allow it in System Settings, under Privacy & Security.",
+            Some(("Open Settings", |s| s.allow_mic())),
+        )),
+        Mic::Restricted => Some(notice(
+            p,
+            "mic",
+            &c.warning,
+            "Microphone access is restricted on this Mac, so Oto can\u{2019}t hear it.",
+            None,
+        )),
+    }
+}
+
+/// Stands in for the controls while there's no engine for them to control.
+fn engine_card(p: &Paint, msg: &str) -> El {
+    card(p, "engine")
+        .py(14.0)
+        .gap(6.0)
+        .child(
+            text("Oto isn\u{2019}t running")
+                .key("engine-title")
+                .font(TITLE)
+                .color(p.t.text),
+        )
+        .child(caption(p, "engine-message", msg))
+        .child(
+            row().w_full().pt(6.0).child(
+                Button::new("Try Again")
+                    .variant(ButtonVariant::Contrast)
+                    .on_press(|s: &mut State| s.retry_engine())
+                    .build(&p.k)
+                    .key("retry"),
+            ),
+        )
+}
+
 fn main_page(s: &State, p: &Paint, layer: &mut Vec<El>) -> El {
     let on = s.prefs.enabled;
     let gear = IconButton::new(&SLIDERS)
@@ -243,6 +373,19 @@ fn main_page(s: &State, p: &Paint, layer: &mut Vec<El>) -> El {
         })
         .build(&p.k)
         .key("settings");
+
+    if let EngineState::Failed(msg) = &s.engine {
+        let mut page = col()
+            .key("main")
+            .w_full()
+            .gap(12.0)
+            .child(header(p, "Oto", None, Some(gear)))
+            .child(engine_card(p, msg));
+        if let Some(e) = &s.error {
+            page = page.child(error_banner(p, e, |s| s.dismiss_error()));
+        }
+        return page.child(status_line(s, p));
+    }
 
     let hero = card(p, "hero").py(14.0).child(
         row()
@@ -335,17 +478,31 @@ fn main_page(s: &State, p: &Paint, layer: &mut Vec<El>) -> El {
         .w_full()
         .gap(12.0)
         .child(header(p, "Oto", None, Some(gear)))
-        .child(hero)
-        .child(controls)
-        .child(meter);
+        .child(hero);
+    if !s.driver_installed && s.driver_known {
+        page = page.child(notice(
+            p,
+            "driver-missing",
+            &p.k.c.warning,
+            "The audio driver isn\u{2019}t installed, so there is no Oto Microphone yet.",
+            Some(("Set Up\u{2026}", |s| s.skipped_onboarding = false)),
+        ));
+    } else if let Some(n) = mic_notice(s, p) {
+        page = page.child(n);
+    }
+    page = page.child(controls).child(meter);
     if let Some(e) = &s.error {
-        page = page.child(error_banner(p, e, |s| s.error = None));
+        page = page.child(error_banner(p, e, |s| s.dismiss_error()));
     }
     if s.driver_installed && !s.clients_active {
         page = page.child(caption(
             p,
             "hint",
-            "In your call app, choose \u{201c}Oto Microphone\u{201d} as the microphone. macOS asks for mic access the first time Oto listens.",
+            if s.prefs.system_microphone {
+                "Oto Microphone is the system microphone. Apps that pick their own need \u{201c}Oto Microphone\u{201d} chosen as the microphone."
+            } else {
+                "In your call app, choose \u{201c}Oto Microphone\u{201d} as the microphone."
+            },
         ));
     }
     if HEAR_TEST {
@@ -394,7 +551,9 @@ fn meter_row(p: &Paint, key: &str, label: &str, live: &rune::Live<[f32; 4]>, col
 }
 
 fn status_line(s: &State, p: &Paint) -> El {
-    let dot = if !s.driver_installed {
+    let dot = if !matches!(s.engine, EngineState::Running) || !s.driver_known {
+        p.t.text_secondary.alpha(0.5)
+    } else if !s.driver_installed || s.mic.blocked() {
         p.amber
     } else if s.prefs.enabled && s.clients_active {
         p.green
@@ -444,69 +603,139 @@ fn settings_page(s: &State, p: &Paint, layer: &mut Vec<El>) -> El {
         })
         .build(&p.k)
         .key("back");
-    let login = Switch::new(s.prefs.start_at_login)
-        .label("Start at login")
-        .hide_label()
-        .control_size(ControlSize::Regular)
-        .on_toggle(|s: &mut State| s.set_start_at_login(!s.prefs.start_at_login))
-        .build(&p.k)
-        .key("login");
-    let tier_labels: Vec<&str> = TIERS.iter().map(|(_, l, _)| *l).collect();
-    let (_, tier_label, tier_about) = TIERS
-        .iter()
-        .find(|(t, _, _)| *t == s.prefs.tier)
-        .copied()
-        .unwrap_or(TIERS[1]);
-    let tier = Select::new("tier", &tier_labels)
-        .appearance(SelectAppearance::Field)
-        .width(132.0)
-        .label("Model")
-        .current(Some(tier_label))
-        .open(s.open == Some(Open::Tier))
-        .on_toggle(|s: &mut State| s.toggle_open(Open::Tier))
-        .on_close(|s: &mut State| s.open = None)
-        .on_choose(|s: &mut State, v: &str, _| {
-            if let Some((t, _, _)) = TIERS.iter().find(|(_, l, _)| *l == v) {
-                s.set_tier(*t);
-            }
-        })
-        .build(&p.k, layer);
-    let general = card(p, "general")
-        .child(field_row(p, "login-row", "Start at login", login))
+    let login = small_switch(
+        p,
+        "login",
+        "Start at login",
+        s.prefs.start_at_login,
+        s.login_available,
+        |s| s.set_start_at_login(!s.prefs.start_at_login),
+    );
+    let mut general = card(p, "general").child(field_row(p, "login-row", "Start at login", login));
+    if !s.login_available {
+        general = general.child(caption(p, "login-about", crate::login::UNAVAILABLE).pb(8.0));
+    }
+    let system_mic = small_switch(
+        p,
+        "system-mic",
+        "Use Oto as the system microphone",
+        s.prefs.system_microphone,
+        s.driver_installed,
+        |s| s.set_system_mic(!s.prefs.system_microphone),
+    );
+    general = general
         .child(separator(p, "sep-login"))
-        .child(field_row(p, "tier-row", "Model", tier))
-        .child(caption(p, "tier-about", tier_about).pb(8.0));
+        .child(field_row(
+            p,
+            "system-mic-row",
+            "Use Oto as the system microphone",
+            system_mic,
+        ))
+        .child(
+            caption(
+                p,
+                "system-mic-about",
+                if s.driver_installed {
+                    "Apps that follow the system setting get Oto Microphone. Your previous microphone comes back when you turn this off or quit Oto."
+                } else {
+                    "Needs the audio driver."
+                },
+            )
+            .pb(8.0),
+        );
+    // Only when the choice changes something: with one model in the build there's no picker.
+    let tiers: Vec<_> = TIERS
+        .iter()
+        .filter(|(t, _, _)| s.tiers.contains(t))
+        .collect();
+    if tiers.len() > 1 {
+        let tier_labels: Vec<&str> = tiers.iter().map(|(_, l, _)| *l).collect();
+        let (_, tier_label, tier_about) = tiers
+            .iter()
+            .find(|(t, _, _)| *t == s.prefs.tier)
+            .copied()
+            .unwrap_or(tiers[0]);
+        let tier = Select::new("tier", &tier_labels)
+            .appearance(SelectAppearance::Field)
+            .width(132.0)
+            .label("Model")
+            .current(Some(tier_label))
+            .open(s.open == Some(Open::Tier))
+            .on_toggle(|s: &mut State| s.toggle_open(Open::Tier))
+            .on_close(|s: &mut State| s.open = None)
+            .on_choose(|s: &mut State, v: &str, _| {
+                if let Some((t, _, _)) = TIERS.iter().find(|(_, l, _)| *l == v) {
+                    s.set_tier(*t);
+                }
+            })
+            .build(&p.k, layer);
+        general = general
+            .child(separator(p, "sep-tier"))
+            .child(field_row(p, "tier-row", "Model", tier))
+            .child(caption(p, "tier-about", *tier_about).pb(8.0));
+    }
 
-    let running = s.install == Install::Running;
-    let install = Button::new(match (running, s.driver_installed) {
-        (true, _) => "Installing…",
-        (false, true) => "Reinstall…",
-        (false, false) => "Install…",
+    let busy = s.install.busy();
+    let install = Button::new(match (&s.install, s.driver_installed || s.driver_on_disk) {
+        (Install::Running, _) => "Installing\u{2026}",
+        (_, true) => "Reinstall\u{2026}",
+        (_, false) => "Install\u{2026}",
     })
-    .disabled(running)
+    .disabled(busy)
     .on_press(|s: &mut State| s.start_install())
     .build(&p.k)
     .key("install");
     let mut driver = card(p, "driver").child(field_row(
         p,
         "driver-row",
-        if s.driver_installed {
-            "Audio driver installed"
-        } else {
-            "Audio driver not installed"
+        match (s.driver_installed, s.driver_on_disk) {
+            (true, _) => "Audio driver installed",
+            (false, true) => "Audio driver needs a restart",
+            (false, false) => "Audio driver not installed",
         },
         install,
     ));
-    if let Install::Failed(msg) = &s.install {
-        driver = driver.child(
-            text(msg.clone())
-                .key("install-error")
-                .font(CAPTION)
-                .color(p.k.c.danger.fg)
-                .wrap()
-                .w_full()
-                .pb(8.0),
-        );
+    if s.driver_installed || s.driver_on_disk {
+        let uninstall = Button::new(if s.install == Install::Removing {
+            "Removing\u{2026}"
+        } else {
+            "Uninstall\u{2026}"
+        })
+        .disabled(busy)
+        .on_press(|s: &mut State| s.start_uninstall())
+        .build(&p.k)
+        .key("uninstall");
+        driver = driver.child(separator(p, "sep-uninstall")).child(field_row(
+            p,
+            "uninstall-row",
+            "Remove the driver",
+            uninstall,
+        ));
+    }
+    match &s.install {
+        Install::Failed(msg) => {
+            driver = driver.child(
+                text(msg.clone())
+                    .key("install-error")
+                    .font(CAPTION)
+                    .color(p.k.c.danger.fg)
+                    .wrap()
+                    .w_full()
+                    .pb(8.0),
+            );
+        }
+        Install::Notice(msg) => {
+            driver = driver.child(
+                text(msg.clone())
+                    .key("install-notice")
+                    .font(CAPTION)
+                    .color(p.t.text)
+                    .wrap()
+                    .w_full()
+                    .pb(8.0),
+            );
+        }
+        _ => {}
     }
 
     let mut page = col()
@@ -517,7 +746,7 @@ fn settings_page(s: &State, p: &Paint, layer: &mut Vec<El>) -> El {
         .child(general)
         .child(driver);
     if let Some(e) = &s.error {
-        page = page.child(error_banner(p, e, |s| s.error = None));
+        page = page.child(error_banner(p, e, |s| s.dismiss_error()));
     }
     page.child(
         row()
@@ -545,7 +774,8 @@ fn settings_page(s: &State, p: &Paint, layer: &mut Vec<El>) -> El {
     )
 }
 
-fn step(p: &Paint, n: usize, title: &str, detail: &str, done: bool) -> El {
+/// One setup step: a numbered badge that turns into a tick when the step is really done.
+fn step(p: &Paint, n: usize, title: &str, detail: &str, done: bool, trailing: Option<El>) -> El {
     let badge = el()
         .key("badge")
         .size(20.0, 20.0)
@@ -560,7 +790,7 @@ fn step(p: &Paint, n: usize, title: &str, detail: &str, done: bool) -> El {
                 .font(TextStyle::new(11.0, 600.0).lh(13.0))
                 .color(p.t.text)
         });
-    row()
+    let mut r = row()
         .key(format!("step{n}"))
         .w_full()
         .py(8.0)
@@ -576,27 +806,90 @@ fn step(p: &Paint, n: usize, title: &str, detail: &str, done: bool) -> El {
                     text(title.to_owned())
                         .key("title")
                         .font(TextStyle::new(13.0, 600.0).lh(20.0))
-                        .color(p.t.text),
+                        .color(p.t.text)
+                        .wrap()
+                        .w_full(),
                 )
                 .child(caption(p, "detail", detail.to_owned())),
-        )
+        );
+    if let Some(t) = trailing {
+        r = r.child(t);
+    }
+    r
 }
 
 fn onboarding(s: &State, p: &Paint) -> El {
-    let running = s.install == Install::Running;
+    let restart = !s.driver_installed && s.driver_on_disk;
+    let system_mic = small_switch(
+        p,
+        "system-mic",
+        "Use Oto as the system microphone",
+        s.prefs.system_microphone,
+        s.driver_installed,
+        |s| s.set_system_mic(!s.prefs.system_microphone),
+    );
     let steps = card(p, "steps")
         .py(4.0)
         .child(step(
             p,
             1,
             "Install the audio driver",
-            "Adds \u{201c}Oto Microphone\u{201d}. Asks for your password; sound pauses for a second.",
+            if s.driver_installed {
+                "\u{201c}Oto Microphone\u{201d} is installed."
+            } else if restart {
+                "Installed. Restart your Mac to finish."
+            } else {
+                "Adds \u{201c}Oto Microphone\u{201d}. Asks for your password; sound pauses for a second."
+            },
             s.driver_installed,
+            None,
         ))
         .child(separator(p, "sep1"))
-        .child(step(p, 2, "Allow microphone access", "macOS asks once, the first time Oto listens.", false))
+        .child(step(
+            p,
+            2,
+            "Allow microphone access",
+            match s.mic {
+                Mic::Authorized => "Oto can hear your microphone.",
+                Mic::NotDetermined => {
+                    "macOS asks once. Oto only listens while an app is using Oto Microphone."
+                }
+                Mic::Denied => {
+                    "Turned off. Allow Oto in System Settings, under Privacy & Security, Microphone."
+                }
+                Mic::Restricted => "Microphone access is restricted on this Mac.",
+            },
+            s.mic == Mic::Authorized,
+            None,
+        ))
         .child(separator(p, "sep2"))
-        .child(step(p, 3, "Pick \u{201c}Oto Microphone\u{201d}", "Choose it in Zoom, Meet, Discord or any app.", false));
+        .child(step(
+            p,
+            3,
+            "Use Oto as the system microphone",
+            "Optional. Or choose \u{201c}Oto Microphone\u{201d} in Zoom, Meet, Discord or any app.",
+            s.prefs.system_microphone && s.driver_installed,
+            Some(system_mic),
+        ));
+
+    // The one button that moves setup on: whichever step is next.
+    let (label, enabled, next): (&str, bool, fn(&mut State)) = if !s.driver_installed {
+        (
+            match (&s.install, restart) {
+                (Install::Running, _) => "Installing\u{2026}",
+                (_, true) => "Install Again",
+                (_, false) => "Install Driver",
+            },
+            !s.install.busy(),
+            |s| s.start_install(),
+        )
+    } else {
+        match s.mic {
+            Mic::NotDetermined => ("Allow Microphone", !s.mic_requesting, |s| s.allow_mic()),
+            Mic::Denied => ("Open Settings", true, |s| s.allow_mic()),
+            Mic::Authorized | Mic::Restricted => ("Done", true, |s| s.leave_onboarding()),
+        }
+    };
 
     let mut page = col()
         .key("onboarding")
@@ -620,38 +913,49 @@ fn onboarding(s: &State, p: &Paint) -> El {
                 ),
         )
         .child(steps);
-    if let Install::Failed(msg) = &s.install {
-        page = page.child(error_banner(p, msg, |s| s.install = Install::Idle));
+    match &s.install {
+        Install::Failed(msg) => {
+            page = page.child(error_banner(p, msg, |s| s.install = Install::Idle));
+        }
+        Install::Notice(msg) => page = page.child(notice(p, "restart", &p.k.c.info, msg, None)),
+        _ => {}
     }
+    if let EngineState::Failed(msg) = &s.engine {
+        page = page.child(engine_card(p, msg));
+    }
+    if let Some(e) = &s.error {
+        page = page.child(error_banner(p, e, |s| s.dismiss_error()));
+    }
+    let mut actions = row()
+        .key("actions")
+        .w_full()
+        .gap(8.0)
+        .pt(4.0)
+        .center_y()
+        .justify_between();
+    actions = if label == "Done" {
+        // Nothing left to put off.
+        actions.child(el().key("no-skip").a11y_hidden())
+    } else {
+        actions.child(
+            Button::new("Not Now")
+                .variant(ButtonVariant::Ghost)
+                .control_size(ControlSize::Large)
+                .on_press(|s: &mut State| s.leave_onboarding())
+                .build(&p.k)
+                .key("skip"),
+        )
+    };
     page.child(
-        row()
-            .key("actions")
-            .w_full()
-            .gap(8.0)
-            .pt(4.0)
-            .center_y()
-            .justify_between()
-            .child(
-                Button::new("Not Now")
-                    .variant(ButtonVariant::Ghost)
-                    .control_size(ControlSize::Large)
-                    .on_press(|s: &mut State| s.skipped_onboarding = true)
-                    .build(&p.k)
-                    .key("skip"),
-            )
-            .child(
-                Button::new(if running {
-                    "Installing…"
-                } else {
-                    "Install Driver"
-                })
+        actions.child(
+            Button::new(label)
                 .variant(ButtonVariant::Contrast)
                 .control_size(ControlSize::Large)
-                .disabled(running)
-                .on_press(|s: &mut State| s.start_install())
+                .disabled(!enabled)
+                .on_press(next)
                 .build(&p.k)
-                .key("install"),
-            ),
+                .key("next"),
+        ),
     )
 }
 
@@ -659,17 +963,23 @@ fn onboarding(s: &State, p: &Paint) -> El {
 mod tests {
     use super::*;
     use crate::prefs::Prefs;
-    use oto_engine::{Command, Strength};
+    use crate::state::Request;
+    use oto_engine::{Command, Strength, Tier};
     use rune::{Env, Runtime};
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn runtime(s: State) -> Runtime<State> {
-        let mut rt = Runtime::new(s, view, (WIDTH, 600.0), Env::new(true, 2.0));
+        let mut rt = Runtime::new(s, view, (WIDTH, 900.0), Env::new(true, 2.0));
         rt.frame(0.0);
         rt
     }
 
     fn installed() -> State {
-        let mut s = State::new(Prefs::default(), true);
+        let prefs = Prefs {
+            onboarded: true,
+            ..Prefs::default()
+        };
+        let mut s = State::new(prefs, true);
         s.link = crate::state::Link::Record(Vec::new());
         s
     }
@@ -681,11 +991,21 @@ mod tests {
         rt.frame(1.0 / 60.0);
     }
 
-    fn sent(rt: &Runtime<State>) -> Vec<Command> {
+    fn requests(rt: &Runtime<State>) -> Vec<Request> {
         match &rt.state.link {
             crate::state::Link::Record(v) => v.clone(),
             _ => Vec::new(),
         }
+    }
+
+    fn sent(rt: &Runtime<State>) -> Vec<Command> {
+        requests(rt)
+            .into_iter()
+            .filter_map(|r| match r {
+                Request::Cmd(c) => Some(c),
+                Request::SystemMic(_) => None,
+            })
+            .collect()
     }
 
     #[test]
@@ -743,5 +1063,150 @@ mod tests {
         let mut rt = runtime(s);
         click(&mut rt, "dismiss");
         assert_eq!(rt.state.error, None);
+    }
+
+    #[test]
+    fn setup_walks_through_its_real_steps() {
+        static INSTALLS: AtomicUsize = AtomicUsize::new(0);
+        static ASKS: AtomicUsize = AtomicUsize::new(0);
+        let mut s = State::new(Prefs::default(), false);
+        s.link = crate::state::Link::Record(Vec::new());
+        s.mic = Mic::NotDetermined;
+        s.hooks.install = || {
+            INSTALLS.fetch_add(1, Ordering::Relaxed);
+        };
+        s.hooks.request_mic = || {
+            ASKS.fetch_add(1, Ordering::Relaxed);
+        };
+        let mut rt = runtime(s);
+        // Step one: the driver. The system-microphone switch waits for it.
+        click(&mut rt, "system-mic");
+        assert!(!rt.state.prefs.system_microphone);
+        click(&mut rt, "next");
+        assert_eq!(INSTALLS.load(Ordering::Relaxed), 1);
+        assert_eq!(rt.state.install, Install::Running);
+        let probe = crate::state::Probe {
+            driver: true,
+            on_disk: true,
+            mic: Mic::NotDetermined,
+        };
+        rt.update(|s, _| s.installed(crate::driver::Outcome::Installed, probe));
+        rt.frame(1.0 / 60.0);
+        // Step two: the permission. Setup is still up.
+        assert!(rt.find("onboarding").is_some());
+        click(&mut rt, "next");
+        assert_eq!(ASKS.load(Ordering::Relaxed), 1);
+        assert_eq!(INSTALLS.load(Ordering::Relaxed), 1);
+        rt.update(|s, _| s.mic_answered(Mic::Authorized));
+        rt.frame(1.0 / 60.0);
+        // Step three: optional.
+        click(&mut rt, "system-mic");
+        assert!(rt.state.prefs.system_microphone);
+        assert_eq!(requests(&rt), [Request::SystemMic(true)]);
+        assert!(rt.find("skip").is_none(), "nothing left to put off");
+        click(&mut rt, "next");
+        assert!(rt.state.prefs.onboarded);
+        assert!(rt.find("switch").is_some());
+    }
+
+    #[test]
+    fn a_failed_engine_replaces_the_controls_with_a_retry() {
+        static STARTS: AtomicUsize = AtomicUsize::new(0);
+        let mut s = installed();
+        s.hooks.start_engine = |_, _| {
+            STARTS.fetch_add(1, Ordering::Relaxed);
+            crate::state::Link::Record(Vec::new())
+        };
+        s.engine_failed("no audio hardware");
+        let mut rt = runtime(s);
+        assert!(rt.find("switch").is_none());
+        assert!(rt.find("segment0").is_none());
+        assert!(rt.find("settings").is_some(), "Quit stays reachable");
+        click(&mut rt, "retry");
+        assert_eq!(STARTS.load(Ordering::Relaxed), 1);
+        assert_eq!(rt.state.engine, EngineState::Starting);
+        assert!(rt.find("switch").is_some());
+    }
+
+    #[test]
+    fn a_denied_microphone_says_so_and_opens_settings() {
+        static OPENED: AtomicUsize = AtomicUsize::new(0);
+        let mut s = installed();
+        assert!(runtime(installed()).find("mic").is_none());
+        s.mic = Mic::Denied;
+        s.hooks.open_mic_settings = || {
+            OPENED.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        };
+        let mut rt = runtime(s);
+        assert!(rt.find("mic").is_some());
+        click(&mut rt, "mic-action");
+        assert_eq!(OPENED.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn the_model_picker_shows_only_with_a_choice() {
+        let mut s = installed();
+        s.page = Page::Settings;
+        s.tiers = vec![Tier::Standard];
+        assert!(runtime(s).find("tier-row").is_none());
+
+        let mut s = installed();
+        s.page = Page::Settings;
+        s.tiers = vec![Tier::Light, Tier::Standard];
+        assert!(runtime(s).find("tier-row").is_some());
+
+        // What this build offers decides the default state.
+        let mut s = installed();
+        s.page = Page::Settings;
+        assert_eq!(
+            runtime(s).find("tier-row").is_some(),
+            oto_engine::available_tiers().len() > 1
+        );
+    }
+
+    #[test]
+    fn settings_switches_and_uninstall() {
+        static UNINSTALLS: AtomicUsize = AtomicUsize::new(0);
+        let mut s = installed();
+        s.page = Page::Settings;
+        s.hooks.uninstall = || {
+            UNINSTALLS.fetch_add(1, Ordering::Relaxed);
+        };
+        let mut rt = runtime(s);
+        click(&mut rt, "system-mic");
+        assert_eq!(requests(&rt), [Request::SystemMic(true)]);
+        click(&mut rt, "login");
+        assert!(rt.state.prefs.start_at_login);
+        click(&mut rt, "uninstall");
+        assert_eq!(UNINSTALLS.load(Ordering::Relaxed), 1);
+        assert_eq!(rt.state.install, Install::Removing);
+        // Busy: neither button starts anything more.
+        click(&mut rt, "uninstall");
+        click(&mut rt, "install");
+        assert_eq!(UNINSTALLS.load(Ordering::Relaxed), 1);
+        assert_eq!(rt.state.install, Install::Removing);
+    }
+
+    #[test]
+    fn start_at_login_is_disabled_with_its_reason_when_unavailable() {
+        let mut s = installed();
+        s.page = Page::Settings;
+        s.login_available = false;
+        s.hooks.set_login = |_| panic!("a disabled switch must not act");
+        let mut rt = runtime(s);
+        assert!(rt.find("login-about").is_some());
+        click(&mut rt, "login");
+        assert!(!rt.state.prefs.start_at_login);
+    }
+
+    #[test]
+    fn without_a_driver_the_main_page_leads_back_to_setup() {
+        let mut s = State::new(Prefs::default(), false);
+        s.leave_onboarding();
+        let mut rt = runtime(s);
+        assert!(rt.find("uninstall").is_none());
+        click(&mut rt, "driver-missing-action");
+        assert!(rt.find("onboarding").is_some());
     }
 }
