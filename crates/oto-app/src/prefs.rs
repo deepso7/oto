@@ -4,10 +4,9 @@
 use std::path::PathBuf;
 
 use oto_engine::{Settings, Strength, Tier};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct Prefs {
     pub enabled: bool,
     /// `None` follows the system default input.
@@ -19,6 +18,10 @@ pub struct Prefs {
     #[serde(with = "TierDef")]
     pub tier: Tier,
     pub start_at_login: bool,
+    /// "Use Oto as the system microphone": Oto Microphone is the default input while Oto runs.
+    pub system_microphone: bool,
+    /// Setup was finished (or wasn't needed), so it isn't shown again while the driver is in.
+    pub onboarded: bool,
 }
 
 impl Default for Prefs {
@@ -30,6 +33,8 @@ impl Default for Prefs {
             strength: Strength::default(),
             tier: Tier::default(),
             start_at_login: false,
+            system_microphone: false,
+            onboarded: false,
         }
     }
 }
@@ -45,8 +50,54 @@ impl Prefs {
         }
     }
 
-    pub fn from_toml(src: &str) -> Result<Prefs, String> {
-        toml::from_str(src).map_err(|e| e.to_string())
+    /// Reads a settings file field by field: a missing, mistyped or unknown value leaves that
+    /// one field at its default and is named in the returned warnings; the rest still load.
+    /// Only a file that isn't TOML at all gives pure defaults.
+    pub fn parse(src: &str) -> (Prefs, Vec<String>) {
+        let mut p = Prefs::default();
+        let mut warnings = Vec::new();
+        let table: toml::Table = match toml::from_str(src) {
+            Ok(t) => t,
+            Err(e) => return (p, vec![e.to_string()]),
+        };
+        let mut bad = |key: &str, v: &toml::Value| warnings.push(format!("{key} = {v}"));
+        let mut flag = |key: &str, into: &mut bool| match table.get(key) {
+            Some(toml::Value::Boolean(b)) => *into = *b,
+            Some(v) => bad(key, v),
+            None => {}
+        };
+        flag("enabled", &mut p.enabled);
+        flag("start_at_login", &mut p.start_at_login);
+        flag("system_microphone", &mut p.system_microphone);
+        flag("onboarded", &mut p.onboarded);
+        let mut string = |key: &str, into: &mut Option<String>| match table.get(key) {
+            Some(toml::Value::String(s)) => *into = Some(s.clone()),
+            Some(v) => bad(key, v),
+            None => {}
+        };
+        string("input_device", &mut p.input_device);
+        string("input_device_name", &mut p.input_device_name);
+        if let Some(v) = table.get("strength") {
+            match v.as_str() {
+                Some("light") => p.strength = Strength::Light,
+                Some("balanced") => p.strength = Strength::Balanced,
+                Some("strong") => p.strength = Strength::Strong,
+                _ => bad("strength", v),
+            }
+        }
+        if let Some(v) = table.get("tier") {
+            match v.as_str() {
+                Some("light") => p.tier = Tier::Light,
+                Some("standard") => p.tier = Tier::Standard,
+                Some("max") => p.tier = Tier::Max,
+                _ => bad("tier", v),
+            }
+        }
+        // A device's name without the device says nothing.
+        if p.input_device.is_none() {
+            p.input_device_name = None;
+        }
+        (p, warnings)
     }
 
     pub fn to_toml(&self) -> String {
@@ -54,7 +105,7 @@ impl Prefs {
     }
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize)]
 #[serde(remote = "Strength", rename_all = "lowercase")]
 enum StrengthDef {
     Light,
@@ -62,7 +113,7 @@ enum StrengthDef {
     Strong,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize)]
 #[serde(remote = "Tier", rename_all = "lowercase")]
 enum TierDef {
     Light,
@@ -79,18 +130,19 @@ pub fn path() -> Option<PathBuf> {
     dirs::config_dir().map(|d| d.join(folder).join("settings.toml"))
 }
 
-/// The saved preferences, or defaults when there are none or they don't parse.
+/// The saved preferences. Anything missing or unreadable takes its default.
 pub fn load() -> Prefs {
     let Some(path) = path() else {
         return Prefs::default();
     };
-    match std::fs::read_to_string(&path) {
-        Ok(src) => Prefs::from_toml(&src).unwrap_or_else(|e| {
-            eprintln!("oto: ignoring {}: {e}", path.display());
-            Prefs::default()
-        }),
-        Err(_) => Prefs::default(),
+    let Ok(src) = std::fs::read_to_string(&path) else {
+        return Prefs::default();
+    };
+    let (prefs, warnings) = Prefs::parse(&src);
+    for w in warnings {
+        eprintln!("oto: ignoring in {}: {w}", path.display());
     }
+    prefs
 }
 
 pub fn save(prefs: &Prefs) -> Result<(), String> {
@@ -117,15 +169,19 @@ mod tests {
             strength: Strength::Strong,
             tier: Tier::Max,
             start_at_login: true,
+            system_microphone: true,
+            onboarded: true,
         };
         let src = p.to_toml();
         assert!(src.contains("strength = \"strong\""), "{src}");
-        assert_eq!(Prefs::from_toml(&src).unwrap(), p);
+        assert_eq!(Prefs::parse(&src), (p, Vec::new()));
+        let d = Prefs::default();
+        assert_eq!(Prefs::parse(&d.to_toml()), (d, Vec::new()));
     }
 
     #[test]
     fn missing_fields_take_defaults() {
-        let p = Prefs::from_toml("strength = \"light\"\n").unwrap();
+        let (p, warnings) = Prefs::parse("strength = \"light\"\n");
         assert_eq!(
             p,
             Prefs {
@@ -133,10 +189,32 @@ mod tests {
                 ..Prefs::default()
             }
         );
+        assert!(warnings.is_empty());
     }
 
     #[test]
-    fn bad_values_are_errors() {
-        assert!(Prefs::from_toml("tier = \"huge\"").is_err());
+    fn one_bad_value_costs_only_its_own_field() {
+        let src = "enabled = false\ntier = \"huge\"\nstrength = \"strong\"\n\
+                   start_at_login = \"yes\"\ninput_device = \"usb\"\nonboarded = true\n\
+                   colour = \"teal\"\n";
+        let (p, warnings) = Prefs::parse(src);
+        assert_eq!(
+            p,
+            Prefs {
+                enabled: false,
+                strength: Strength::Strong,
+                input_device: Some("usb".into()),
+                onboarded: true,
+                ..Prefs::default()
+            }
+        );
+        assert_eq!(warnings, ["start_at_login = \"yes\"", "tier = \"huge\""]);
+    }
+
+    #[test]
+    fn a_file_that_is_not_toml_gives_defaults_and_says_why() {
+        let (p, warnings) = Prefs::parse("enabled = = false");
+        assert_eq!(p, Prefs::default());
+        assert_eq!(warnings.len(), 1);
     }
 }

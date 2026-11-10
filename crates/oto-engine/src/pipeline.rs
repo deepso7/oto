@@ -22,9 +22,19 @@
 //! latency. Corrections are clamped to ±2000 ppm (≈3.5 cents), far below audibility, and real
 //! crystals are within ±200 ppm, so steady-state corrections are tiny.
 //!
-//! If the ring runs dry the output plays silence and re-primes to the target (counted as an
-//! underrun). If it ever holds far more than the target (e.g. the output stalled), the excess
-//! is dropped in one go (counted as a resync).
+//! The integrator only runs while the correction is not clamped (anti-windup), so a large
+//! transient cannot wind it up and cause an undershoot afterwards.
+//!
+//! If the ring runs dry the output plays silence, re-primes to the target (counted as an
+//! underrun) and fades back in over [`FADE_S`]. Excess latency, e.g. after the output stalled,
+//! is handled in three bands, each counted as a resync when frames are dropped:
+//!
+//! - more than [`MAX_EXCESS`] (100 ms) over target: dropped at once, down to a fill that is safe
+//!   at any phase of the input cycle, then faded in;
+//! - a mean of more than [`TRIM_EXCESS`] (10 ms) over target across [`TRIM_WINDOW_S`]: the
+//!   output fades out, exactly the mean excess is dropped, and it fades back in (a ~6 ms dip
+//!   instead of tens of seconds of extra latency);
+//! - less than that: bled off by the drift controller at up to 2000 ppm (under ~5 s).
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering::Relaxed};
@@ -48,6 +58,14 @@ pub const IN_CHUNK: usize = 64;
 pub const MARGIN_FRAMES: usize = 96;
 /// Fill beyond `target + MAX_EXCESS` is dropped at once (100 ms).
 pub const MAX_EXCESS: usize = 4800;
+/// A mean fill beyond `target + TRIM_EXCESS` (10 ms) over [`TRIM_WINDOW_S`] is trimmed with a
+/// short fade; anything smaller is left to the drift controller.
+pub const TRIM_EXCESS: usize = 480;
+/// Window over which the mean fill is measured for trimming, seconds. Long enough to average
+/// the input block sawtooth of any realistic device.
+pub const TRIM_WINDOW_S: f64 = 0.25;
+/// Length of the fade applied when audio resumes after priming or a resync, seconds.
+pub const FADE_S: f64 = 0.003;
 
 const RATE: f64 = SAMPLE_RATE as f64;
 
@@ -56,6 +74,42 @@ pub fn target_fill(in_block: usize, in_rate: f64, out_block: usize, out_rate: f6
     let in48 = in_block as f64 * RATE / in_rate;
     let out48 = out_block as f64 * RATE / out_rate;
     (out48 + in48 / 2.0).ceil() as usize + OUT_CHUNK + MARGIN_FRAMES
+}
+
+/// IO buffer size to request from a device running at `rate`, lasting as long as
+/// `frames_at_48k` does at 48 kHz (so a 16 kHz headset is not asked for a 3× longer buffer).
+pub fn scaled_io_frames(frames_at_48k: u32, rate: f64) -> u32 {
+    if !rate.is_finite() || rate <= 0.0 {
+        return frames_at_48k;
+    }
+    ((frames_at_48k as f64 * rate / RATE).round() as u32).max(1)
+}
+
+/// `want` limited to a device's allowed buffer range. Devices occasionally report nonsense
+/// (min > max, NaN); such a range is ignored rather than trusted (`f64::clamp` would panic).
+pub fn clamp_io_frames(want: u32, min: f64, max: f64) -> u32 {
+    if min.is_finite() && max.is_finite() && min <= max && max >= 1.0 {
+        (want as f64).clamp(min.max(1.0), max) as u32
+    } else {
+        want.max(1)
+    }
+}
+
+/// Estimated mic-to-sink latency in seconds. Latencies and blocks are in frames at their own
+/// device's rate; `chain48` (input resampler + chain) and `target48` are at 48 kHz. The ring
+/// target already contains the output block, so that is not added again.
+pub fn estimate_latency_s(
+    in_block: usize,
+    in_latency: usize,
+    in_rate: f64,
+    chain48: usize,
+    target48: usize,
+    out_latency: usize,
+    out_rate: f64,
+) -> f64 {
+    (in_block + in_latency) as f64 / in_rate
+        + (chain48 + target48) as f64 / RATE
+        + out_latency as f64 / out_rate
 }
 
 /// State shared between the control thread and both callbacks. All lock-free.
@@ -167,9 +221,8 @@ impl ProbeGen {
 }
 
 /// Mixes interleaved `input` (with `channels` channels) into `out`, scaled by `scale`.
-/// `out` must hold `input.len() / channels` frames. Call once per device buffer with
-/// `scale = 1 / total_channels` after zeroing `out` to average all channels.
-pub fn downmix_add(input: &[f32], channels: usize, out: &mut [f32], scale: f32) {
+/// `out` must hold `input.len() / channels` frames.
+fn downmix_add(input: &[f32], channels: usize, out: &mut [f32], scale: f32) {
     if channels == 1 {
         for (o, x) in out.iter_mut().zip(input) {
             *o += x * scale;
@@ -178,6 +231,42 @@ pub fn downmix_add(input: &[f32], channels: usize, out: &mut [f32], scale: f32) 
     }
     for (o, frame) in out.iter_mut().zip(input.chunks_exact(channels)) {
         *o += frame.iter().sum::<f32>() * scale;
+    }
+}
+
+/// Downmixes one device callback's buffers to mono in `out`.
+///
+/// `buffers` yields each device buffer as `(interleaved samples, channel count)`: an interleaved
+/// device has one buffer with all channels, a non-interleaved one has a mono buffer per channel,
+/// and mixtures occur. Buffers must cover the same frames; an empty slice stands for a buffer
+/// with no data.
+///
+/// Devices with one or two input channels are averaged (a stereo mic). Devices with more are
+/// audio interfaces, where a mic sits on one input and the others carry nothing or something
+/// else: only the first channel is used, at full level, instead of an average that would bury
+/// it by `20·log10(channels)` dB under the other inputs' noise.
+pub fn downmix<'a, I>(buffers: I, out: &mut [f32])
+where
+    I: Iterator<Item = (&'a [f32], usize)> + Clone,
+{
+    out.fill(0.0);
+    let total: usize = buffers.clone().map(|(_, ch)| ch).sum();
+    if total > 2 {
+        if let Some((data, ch)) = buffers.into_iter().find(|(d, ch)| *ch > 0 && !d.is_empty()) {
+            for (o, frame) in out.iter_mut().zip(data.chunks_exact(ch)) {
+                *o = frame[0];
+            }
+        }
+        return;
+    }
+    if total == 0 {
+        return;
+    }
+    let scale = 1.0 / total as f32;
+    for (data, ch) in buffers {
+        if ch > 0 {
+            downmix_add(data, ch, out, scale);
+        }
     }
 }
 
@@ -296,6 +385,8 @@ impl CaptureStage {
             self.primed = true;
         }
         let n = n.min(MAX_BLOCK);
+        // A glitching device can hand us NaN or infinity; keep it out of the resampler too.
+        oto_dsp::sanitize(&mut self.mono[..n]);
         if let Some(p) = &mut self.probe {
             p.fill(&mut self.mono[..n], first_ns);
         }
@@ -398,14 +489,26 @@ impl DriftController {
         };
         self.ema = Some(ema);
         let err = ema - self.target;
-        let lim = Self::MAX_CORR / Self::KI;
-        self.integ = (self.integ + err * dt).clamp(-lim, lim);
+        // Anti-windup: while the output is clamped and the error still pushes it further into
+        // the clamp, integrating would only store up an overshoot for later.
+        let raw = Self::KP * err + Self::KI * self.integ;
+        if raw.abs() < Self::MAX_CORR || raw * err < 0.0 {
+            let lim = Self::MAX_CORR / Self::KI;
+            self.integ = (self.integ + err * dt).clamp(-lim, lim);
+        }
         (Self::KP * err + Self::KI * self.integ).clamp(-Self::MAX_CORR, Self::MAX_CORR)
     }
 
-    /// Forget the smoothed fill (after a re-prime), keeping the learned clock offset.
+    /// Forget the smoothed fill (after a re-prime), keeping the learned clock offset. The next
+    /// [`update`](Self::update) seeds it from the fill it is given.
     pub fn rebase(&mut self) {
         self.ema = None;
+    }
+
+    /// Set the smoothed fill to a known mean (after trimming a measured excess), keeping the
+    /// learned clock offset.
+    pub fn reseed(&mut self, mean_fill: f64) {
+        self.ema = Some(mean_fill);
     }
 }
 
@@ -421,6 +524,18 @@ pub struct OutputStage {
     priming: bool,
     rate: f64,
     shared: Arc<Shared>,
+    /// Output gain and its per-sample step. `gain_step == 0` means steady at 1.0; positive is
+    /// a fade-in; negative a fade-out that holds at 0.0 until the pending trim is done.
+    gain: f32,
+    gain_step: f32,
+    fade_step: f32,
+    /// Frames to drop from the ring once the fade-out has reached silence.
+    trim_pending: usize,
+    /// Fill integrated over the current trim window (frame·seconds) and the window's length.
+    win_sum: f64,
+    win_t: f64,
+    /// The previous callback saw more than `target + TRIM_EXCESS`.
+    was_over: bool,
 }
 
 impl OutputStage {
@@ -454,7 +569,49 @@ impl OutputStage {
             priming: true,
             rate,
             shared,
+            gain: 0.0,
+            gain_step: 0.0,
+            fade_step: (1.0 / (FADE_S * rate).max(1.0)) as f32,
+            trim_pending: 0,
+            win_sum: 0.0,
+            win_t: 0.0,
+            was_over: false,
         })
+    }
+
+    /// Start from silence and ramp up: audio is (re)entering after silence or a discontinuity.
+    fn restart_faded(&mut self) {
+        self.gain = 0.0;
+        self.gain_step = self.fade_step;
+        self.trim_pending = 0;
+        self.win_sum = 0.0;
+        self.win_t = 0.0;
+        self.was_over = false;
+    }
+
+    fn discard(&mut self, frames: usize) {
+        let n = frames.min(self.consumer.slots());
+        if let Ok(chunk) = self.consumer.read_chunk(n) {
+            chunk.commit_all();
+        }
+    }
+
+    fn fill_now(&self) -> f64 {
+        self.consumer.slots() as f64 + (self.pend_len - self.pend_pos) as f64 * RATE / self.rate
+    }
+
+    #[inline]
+    fn apply_gain(&mut self, buf: &mut [f32]) {
+        if self.gain_step == 0.0 {
+            return;
+        }
+        for s in buf {
+            self.gain = (self.gain + self.gain_step).clamp(0.0, 1.0);
+            *s *= self.gain;
+        }
+        if self.gain_step > 0.0 && self.gain >= 1.0 {
+            self.gain_step = 0.0;
+        }
     }
 
     /// Delay of the output resampler, in output frames.
@@ -464,30 +621,65 @@ impl OutputStage {
 
     /// Fill `out` (mono, device rate).
     pub fn render(&mut self, out: &mut [f32]) {
-        let pending48 = (self.pend_len - self.pend_pos) as f64 * RATE / self.rate;
-        let ring = self.consumer.slots();
-        let fill = ring as f64 + pending48;
+        let dt = out.len() as f64 / self.rate;
+        let mut fill = self.fill_now();
         let target = self.ctl.target();
-        self.shared.fill_frames.store(fill as u32, Relaxed);
 
         if self.priming {
             if fill < target {
+                self.shared.fill_frames.store(fill as u32, Relaxed);
                 out.fill(0.0);
                 return;
             }
             self.priming = false;
             self.ctl.rebase();
+            self.restart_faded();
         }
         if fill > target + MAX_EXCESS as f64 {
-            let drop = ring.saturating_sub(target as usize);
-            if let Ok(chunk) = self.consumer.read_chunk(drop) {
-                chunk.commit_all();
-            }
+            // Far behind (the output stalled): drop the stale audio now. We are at an unknown
+            // phase of the input cycle, so keep what priming would leave at its lowest phase
+            // plus half an input block; the trim below or the controller removes the rest.
+            let out48 = out.len() as f64 * RATE / self.rate;
+            let half_in = (target - out48 - (OUT_CHUNK + MARGIN_FRAMES) as f64).max(0.0);
+            let keep = (target + half_in).ceil() as usize;
+            self.discard(self.consumer.slots().saturating_sub(keep));
             self.shared.resyncs.fetch_add(1, Relaxed);
             self.ctl.rebase();
+            self.restart_faded();
+            // The controller must see the fill that is left, not the one that was dropped.
+            fill = self.fill_now();
+        } else if self.trim_pending > 0 {
+            if self.gain <= 0.0 {
+                // Faded out: drop the measured excess while nothing is audible, then fade in.
+                self.discard(self.trim_pending);
+                self.shared.resyncs.fetch_add(1, Relaxed);
+                self.ctl.reseed(target);
+                self.restart_faded();
+                fill = self.fill_now();
+            }
+        } else {
+            let over = fill > target + TRIM_EXCESS as f64;
+            if over && !self.was_over {
+                // Excess just appeared: measure it from here, undiluted by what came before.
+                self.win_sum = 0.0;
+                self.win_t = 0.0;
+            }
+            self.was_over = over;
+            self.win_sum += fill * dt;
+            self.win_t += dt;
+            if self.win_t >= TRIM_WINDOW_S {
+                let excess = self.win_sum / self.win_t - target;
+                if excess > TRIM_EXCESS as f64 {
+                    self.trim_pending = excess as usize;
+                    self.gain_step = -self.fade_step;
+                }
+                self.win_sum = 0.0;
+                self.win_t = 0.0;
+            }
         }
+        self.shared.fill_frames.store(fill as u32, Relaxed);
 
-        let corr = self.ctl.update(fill, out.len() as f64 / self.rate);
+        let corr = self.ctl.update(fill, dt);
         self.shared
             .correction_ppm
             .store((corr * 1e6) as i32, Relaxed);
@@ -498,6 +690,7 @@ impl OutputStage {
             if self.pend_pos < self.pend_len {
                 let n = (self.pend_len - self.pend_pos).min(out.len() - at);
                 out[at..at + n].copy_from_slice(&self.pend[self.pend_pos..self.pend_pos + n]);
+                self.apply_gain(&mut out[at..at + n]);
                 self.pend_pos += n;
                 at += n;
                 continue;
@@ -545,16 +738,99 @@ mod tests {
     }
 
     #[test]
-    fn downmix_averages_interleaved_channels() {
-        let input = [1.0, 0.0, 0.5, 0.5, -1.0, 1.0];
-        let mut out = [0.0; 3];
-        downmix_add(&input, 2, &mut out, 0.5);
+    fn downmix_averages_mono_and_stereo() {
+        // Stale contents of `out` must not leak into the mix.
+        let mut out = [9.0; 3];
+        downmix([(&[0.1f32, 0.2, 0.3][..], 1)].into_iter(), &mut out);
+        assert_eq!(out, [0.1, 0.2, 0.3]);
+        // Interleaved stereo.
+        let input = [1.0f32, 0.0, 0.5, 0.5, -1.0, 1.0];
+        downmix([(&input[..], 2)].into_iter(), &mut out);
         assert_eq!(out, [0.5, 0.5, 0.0]);
-        // A second buffer (e.g. a non-interleaved device) adds into the same mix.
-        let mut out = [0.0; 2];
-        downmix_add(&[1.0, 1.0], 1, &mut out, 0.5);
-        downmix_add(&[0.0, -1.0], 1, &mut out, 0.5);
+        // Non-interleaved stereo: one mono buffer per channel.
+        let mut out = [9.0; 2];
+        let (l, r) = ([1.0f32, 1.0], [0.0f32, -1.0]);
+        downmix([(&l[..], 1), (&r[..], 1)].into_iter(), &mut out);
         assert_eq!(out, [0.5, 0.0]);
+    }
+
+    #[test]
+    fn downmix_takes_first_channel_of_multichannel_devices() {
+        // Interleaved 8-input interface: mic on input 1, noise elsewhere.
+        let mut inter = [-0.9f32; 8 * 3];
+        for f in 0..3 {
+            inter[f * 8] = 0.25 * (f + 1) as f32;
+        }
+        let mut out = [9.0; 3];
+        downmix([(&inter[..], 8)].into_iter(), &mut out);
+        assert_eq!(out, [0.25, 0.5, 0.75]);
+        // Non-interleaved, 3 mono buffers.
+        let (a, b, c) = ([0.5f32, -0.5, 0.25], [1.0f32; 3], [1.0f32; 3]);
+        downmix(
+            [(&a[..], 1), (&b[..], 1), (&c[..], 1)].into_iter(),
+            &mut out,
+        );
+        assert_eq!(out, [0.5, -0.5, 0.25]);
+        // Mixed layout (a stereo buffer then mono ones): still channel 0 of the first buffer.
+        let st = [0.1f32, 0.9, 0.2, 0.9, 0.3, 0.9];
+        downmix([(&st[..], 2), (&b[..], 1)].into_iter(), &mut out);
+        assert_eq!(out, [0.1, 0.2, 0.3]);
+        // A leading buffer without data is skipped rather than read.
+        downmix([(&[][..], 2), (&a[..], 1)].into_iter(), &mut out);
+        assert_eq!(out, [0.5, -0.5, 0.25]);
+        // Nothing at all is silence.
+        downmix(std::iter::empty(), &mut out);
+        assert_eq!(out, [0.0; 3]);
+    }
+
+    #[test]
+    fn io_frames_scale_with_rate_and_survive_bad_ranges() {
+        assert_eq!(scaled_io_frames(256, 48_000.0), 256);
+        assert_eq!(scaled_io_frames(256, 16_000.0), 85);
+        assert_eq!(scaled_io_frames(256, 44_100.0), 235);
+        assert_eq!(scaled_io_frames(128, 96_000.0), 256);
+        assert_eq!(scaled_io_frames(128, 0.0), 128);
+        assert_eq!(scaled_io_frames(128, f64::NAN), 128);
+        assert_eq!(clamp_io_frames(85, 16.0, 4096.0), 85);
+        assert_eq!(clamp_io_frames(85, 240.0, 4096.0), 240);
+        assert_eq!(clamp_io_frames(512, 16.0, 256.0), 256);
+        // min > max, NaN or an empty range must not panic.
+        assert_eq!(clamp_io_frames(128, 512.0, 64.0), 128);
+        assert_eq!(clamp_io_frames(128, f64::NAN, 64.0), 128);
+        assert_eq!(clamp_io_frames(128, 0.0, 0.0), 128);
+        assert_eq!(clamp_io_frames(0, 0.0, 1e9), 1);
+    }
+
+    #[test]
+    fn latency_estimate_counts_the_output_block_once() {
+        // 256 in, 128 out at 48 kHz, no device latency, 960-frame chain: the ring target (384)
+        // already holds the output block.
+        let target = target_fill(256, 48_000.0, 128, 48_000.0);
+        let s = estimate_latency_s(256, 0, 48_000.0, 960, target, 0, 48_000.0);
+        assert!((s - (256 + 960 + 384) as f64 / 48_000.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn capture_survives_non_finite_input() {
+        let (prod, mut cons) = RingBuffer::new(1 << 16);
+        let mut cap = CaptureStage::new(44_100.0, Chain::new(), prod, shared()).unwrap();
+        for block in 0..200 {
+            for (i, s) in cap.mono_mut()[..441].iter_mut().enumerate() {
+                let k = (block * 441 + i) as f64;
+                *s = 0.3 * (2.0 * std::f64::consts::PI * 1000.0 * k / 44_100.0).sin() as f32;
+            }
+            if block == 20 {
+                cap.mono_mut()[7] = f32::NAN;
+                cap.mono_mut()[8] = f32::INFINITY;
+            }
+            cap.process(441, 0);
+        }
+        let mut out = vec![0.0; cons.slots()];
+        cons.pop_entire_slice(&mut out).unwrap();
+        assert!(out.iter().all(|s| s.is_finite()));
+        let (f, rms) = freq_rms(&out, 48_000.0, 48_000);
+        assert!((f - 1000.0).abs() < 2.0, "frequency {f}");
+        assert!((rms - 0.3 / 2f64.sqrt()).abs() < 0.01, "rms {rms}");
     }
 
     #[test]
@@ -743,13 +1019,21 @@ mod tests {
         let mut buf = [1.0f32; 128];
         out.render(&mut buf);
         assert!(buf.iter().all(|&s| s == 0.0), "silence while priming");
-        prod.push_entire_slice(&[0.5; 300]).unwrap();
+        prod.push_entire_slice(&[0.5; 600]).unwrap();
+        out.render(&mut buf);
+        // Audio re-enters through a short fade, not a step.
+        assert!(buf[0].abs() < 0.01, "starts from silence, got {}", buf[0]);
+        assert!(
+            buf.windows(2)
+                .all(|w| w[1] >= w[0] - 1e-6 && w[1] - w[0] < 0.02),
+            "fade-in is a smooth ramp"
+        );
         out.render(&mut buf);
         assert!(
-            buf[100..].iter().all(|&s| (s - 0.5).abs() < 1e-3),
-            "plays once primed"
+            buf[32..].iter().all(|&s| (s - 0.5).abs() < 1e-3),
+            "plays at full level once faded in"
         );
-        for _ in 0..3 {
+        for _ in 0..4 {
             out.render(&mut buf);
         }
         assert!(sh.underruns.load(Relaxed) >= 1);
@@ -757,5 +1041,211 @@ mod tests {
         prod.push_entire_slice(&[0.5; 100]).unwrap();
         out.render(&mut buf);
         assert!(buf.iter().all(|&s| s == 0.0));
+        // And the re-entry fades in again.
+        prod.push_entire_slice(&[0.5; 600]).unwrap();
+        out.render(&mut buf);
+        assert!(
+            buf[0].abs() < 0.01 && buf[127] > 0.3,
+            "{} {}",
+            buf[0],
+            buf[127]
+        );
+    }
+
+    struct StallResult {
+        /// Underruns counted after the stall ended.
+        underruns: u64,
+        resyncs: u64,
+        /// Seconds after the stall until the fill stayed within 5 ms of the target.
+        cleared_after: f64,
+        /// Lowest fill seen at an output callback after the stall, frames.
+        min_fill: f64,
+        /// Largest sample-to-sample step in the output after the stall.
+        max_step: f32,
+        /// Mean correction and fill over the last second.
+        corr_ppm: f64,
+        mean_fill: f64,
+        target: f64,
+    }
+
+    /// Steady 256/128 streams with the mic 50 ppm fast; at 10 s the output misses callbacks for
+    /// `stall_s` while the mic keeps delivering, then `after_s` more seconds of steady running.
+    fn simulate_stall(stall_s: f64, after_s: f64) -> StallResult {
+        const PPM: f64 = 50.0;
+        let (in_block, out_block) = (256usize, 128usize);
+        let sh = shared();
+        let (prod, cons) = RingBuffer::new(RING_CAPACITY);
+        let mut cap = CaptureStage::new(48_000.0, Chain::new(), prod, sh.clone()).unwrap();
+        let target = target_fill(in_block, 48_000.0, out_block, 48_000.0);
+        let mut out = OutputStage::new(cons, 48_000.0, target, sh.clone()).unwrap();
+        let in_period = in_block as f64 / (48_000.0 * (1.0 + PPM * 1e-6));
+        let out_period = out_block as f64 / 48_000.0;
+        let stall_at = 10.0;
+        let resume = stall_at + stall_s;
+        let end = resume + after_s;
+        let (mut tp, mut tc) = (0.0, 0.003);
+        let mut phase = 0u64;
+        let mut buf = vec![0.0; out_block];
+        let mut stalled = false;
+        let mut underruns_at_resume = 0;
+        let mut r = StallResult {
+            underruns: 0,
+            resyncs: 0,
+            cleared_after: 0.0,
+            min_fill: f64::MAX,
+            max_step: 0.0,
+            corr_ppm: 0.0,
+            mean_fill: 0.0,
+            target: target as f64,
+        };
+        let mut last = 0.0f32;
+        let (mut n_tail, mut corr_sum, mut fill_sum) = (0u64, 0.0, 0.0);
+        while tc < end {
+            if tp <= tc {
+                for s in cap.mono_mut()[..in_block].iter_mut() {
+                    *s = 0.25
+                        * (2.0 * std::f64::consts::PI * 300.0 * phase as f64 / 48_000.0).sin()
+                            as f32;
+                    phase += 1;
+                }
+                cap.process(in_block, 0);
+                tp += in_period;
+                continue;
+            }
+            if !stalled && tc >= stall_at {
+                stalled = true;
+                assert_eq!(sh.resyncs.load(Relaxed), 0, "no resync in steady state");
+                underruns_at_resume = sh.underruns.load(Relaxed);
+                tc += stall_s;
+                continue;
+            }
+            out.render(&mut buf);
+            if stalled {
+                let fill = sh.fill_frames.load(Relaxed) as f64;
+                r.min_fill = r.min_fill.min(fill);
+                if (fill - target as f64).abs() > 240.0 {
+                    r.cleared_after = tc + out_period - resume;
+                }
+                for &s in &buf {
+                    r.max_step = r.max_step.max((s - last).abs());
+                    last = s;
+                }
+                if tc > end - 1.0 {
+                    corr_sum += sh.correction_ppm.load(Relaxed) as f64;
+                    fill_sum += fill;
+                    n_tail += 1;
+                }
+            } else {
+                last = *buf.last().unwrap();
+            }
+            tc += out_period;
+        }
+        r.underruns = sh.underruns.load(Relaxed) - underruns_at_resume;
+        r.resyncs = sh.resyncs.load(Relaxed);
+        r.corr_ppm = corr_sum / n_tail as f64;
+        r.mean_fill = fill_sum / n_tail as f64;
+        r
+    }
+
+    /// A long output stall overfills the ring past `MAX_EXCESS`. The resync must leave the
+    /// controller looking at the fill that remains: seeded with the pre-drop fill it pins at
+    /// maximum correction and runs the ring dry a few seconds later.
+    #[test]
+    fn resync_after_long_stall_does_not_cause_a_follow_on_underrun() {
+        let r = simulate_stall(0.3, 10.0);
+        eprintln!(
+            "0.3 s stall: {} resyncs, cleared after {:.2} s, min fill {}, correction {:.1} ppm",
+            r.resyncs, r.cleared_after, r.min_fill, r.corr_ppm
+        );
+        assert!(r.resyncs >= 1, "the stale audio was dropped");
+        assert_eq!(r.underruns, 0, "no underrun or re-prime after the resync");
+        assert!(r.min_fill >= 128.0, "min fill {}", r.min_fill);
+        assert!(r.cleared_after < 5.0, "cleared after {} s", r.cleared_after);
+        assert!(
+            (r.mean_fill - r.target).abs() < 0.1 * r.target,
+            "fill {} vs target {}",
+            r.mean_fill,
+            r.target
+        );
+        // Back to tracking the 50 ppm clock offset, nowhere near the 2000 ppm clamp.
+        assert!(
+            (r.corr_ppm - 50.0).abs() < 100.0,
+            "correction {}",
+            r.corr_ppm
+        );
+    }
+
+    /// A 50 ms stall leaves +50 ms in the ring, below the hard resync threshold. Bleeding that
+    /// at 2000 ppm would take ~25 s; it must clear within a few seconds, without swinging below
+    /// what one output block needs and without a click.
+    #[test]
+    fn moderate_excess_clears_quickly_without_undershoot() {
+        let r = simulate_stall(0.05, 10.0);
+        eprintln!(
+            "50 ms stall: {} resyncs, cleared after {:.2} s, min fill {}, correction {:.1} ppm, \
+             max step {:.4}",
+            r.resyncs, r.cleared_after, r.min_fill, r.corr_ppm, r.max_step
+        );
+        assert_eq!(r.underruns, 0);
+        assert!(r.cleared_after < 3.0, "cleared after {} s", r.cleared_after);
+        assert!(r.min_fill >= 128.0, "min fill {}", r.min_fill);
+        assert!(
+            (r.mean_fill - r.target).abs() < 0.1 * r.target,
+            "fill {} vs target {}",
+            r.mean_fill,
+            r.target
+        );
+        assert!(
+            (r.corr_ppm - 50.0).abs() < 100.0,
+            "correction {}",
+            r.corr_ppm
+        );
+        // The trim is faded: a 300 Hz tone at 0.25 moves at most ~0.01 per sample, and the
+        // 3 ms fades add little to that. A hard cut would step by up to 0.5.
+        assert!(r.max_step < 0.03, "largest output step {}", r.max_step);
+    }
+
+    /// A small excess (5 ms) is bled by the controller alone, with no drop.
+    #[test]
+    fn small_excess_is_bled_without_a_drop_or_windup() {
+        let r = simulate_stall(0.005, 12.0);
+        eprintln!(
+            "5 ms stall: {} resyncs, cleared after {:.2} s, min fill {}, mean fill {:.1}, \
+             correction {:.1} ppm",
+            r.resyncs, r.cleared_after, r.min_fill, r.mean_fill, r.corr_ppm
+        );
+        assert_eq!(r.resyncs, 0);
+        assert_eq!(r.underruns, 0);
+        assert!(r.min_fill >= 128.0, "min fill {}", r.min_fill);
+        assert!(r.cleared_after < 6.0, "cleared after {} s", r.cleared_after);
+        assert!(
+            (r.mean_fill - r.target).abs() < 0.1 * r.target,
+            "fill {} vs target {}",
+            r.mean_fill,
+            r.target
+        );
+        // Settling on the 50 ppm offset again, far from the 2000 ppm clamp.
+        assert!(
+            (r.corr_ppm - 50.0).abs() < 200.0,
+            "correction {}",
+            r.corr_ppm
+        );
+    }
+
+    #[test]
+    fn integrator_does_not_wind_up_while_saturated() {
+        // 20 s pinned far above target, then back at target: the correction must drop to
+        // (near) zero at once instead of staying high from a wound-up integrator.
+        let mut c = DriftController::new(400);
+        let dt = 128.0 / 48_000.0;
+        c.update(400.0, dt);
+        let mut corr = 0.0;
+        for _ in 0..(20.0 / dt) as usize {
+            corr = c.update(3000.0, dt);
+        }
+        assert_eq!(corr, DriftController::MAX_CORR);
+        c.reseed(400.0);
+        let corr = c.update(400.0, dt);
+        assert!(corr.abs() < 20e-6, "correction after saturation {corr}");
     }
 }

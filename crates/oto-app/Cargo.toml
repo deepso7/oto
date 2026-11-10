@@ -8,7 +8,6 @@ license.workspace = true
 oto-engine.workspace = true
 rune.workspace = true
 rune-kit.workspace = true
-auto-launch = "0.6"
 dirs = "6"
 serde = { version = "1", features = ["derive"] }
 toml = "0.9"
@@ -19,4 +18,10 @@ toml = "0.9"
 tray-icon = { version = "0.26", default-features = false }
 objc2 = "0.6"
 objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "objc2-core-foundation", "NSResponder", "NSView", "NSWindow", "NSScreen", "NSStatusItem", "NSStatusBarButton", "NSButton", "NSControl"] }
-objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSGeometry", "NSArray"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSGeometry", "NSArray", "NSString"] }
+# The microphone-permission completion handler (permission.rs).
+block2 = "0.6"
+
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+# Start at login off macOS (login.rs); macOS writes its own LaunchAgent.
+auto-launch = "0.6"

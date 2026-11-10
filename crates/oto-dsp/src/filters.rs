@@ -13,6 +13,9 @@ const DENORMAL_FLOOR: f64 = 1e-9;
 ///
 /// `f64` because an 80 Hz corner at 48 kHz puts the poles very close to the unit circle, where
 /// `f32` coefficients and state add audible noise and corner drift.
+///
+/// A non-finite input sample yields 0.0 and clears the state, so the filter recovers on the next
+/// finite sample instead of emitting NaN forever.
 #[derive(Clone, Debug)]
 pub struct Biquad {
     b0: f64,
@@ -52,6 +55,12 @@ impl Biquad {
         if self.s1.abs() < DENORMAL_FLOOR && self.s2.abs() < DENORMAL_FLOOR {
             self.s1 = 0.0;
             self.s2 = 0.0;
+        }
+        // Self-heal: a NaN or infinity in the state would otherwise recirculate forever.
+        if !(y.is_finite() && self.s1.is_finite() && self.s2.is_finite()) {
+            self.s1 = 0.0;
+            self.s2 = 0.0;
+            return 0.0;
         }
         y
     }

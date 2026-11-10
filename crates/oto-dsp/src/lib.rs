@@ -25,6 +25,24 @@ pub const HIGH_PASS_HZ: f32 = 80.0;
 /// Limiter ceiling of the chain, in dBFS.
 pub const LIMITER_CEILING_DB: f32 = -1.0;
 
+/// Largest input magnitude the chain accepts (+40 dBFS); anything beyond is clamped on entry.
+/// Real devices stay within ±1.0, so this only catches garbage before it can overflow a filter
+/// or a model.
+pub const MAX_INPUT: f32 = 100.0;
+
+/// Makes a block safe to feed to filters and models: NaN and ±infinity become 0.0 and the rest
+/// is clamped to ±[`MAX_INPUT`]. One non-finite sample would otherwise stick in recursive state
+/// (filters, the model's GRUs) and silence everything after it. Allocation-free.
+pub fn sanitize(buf: &mut [f32]) {
+    for s in buf {
+        *s = if s.is_finite() {
+            s.clamp(-MAX_INPUT, MAX_INPUT)
+        } else {
+            0.0
+        };
+    }
+}
+
 /// A streaming mono denoiser that consumes and produces fixed-size frames.
 pub trait Denoiser: Send {
     /// Samples per frame (the model's hop size), e.g. 480 for 10 ms at 48 kHz.
@@ -455,8 +473,10 @@ impl Chain {
         self.denoise.denoiser().inferences
     }
 
-    /// Process one block in place.
+    /// Process one block in place. Non-finite input samples are treated as silence (see
+    /// [`sanitize`]), so a glitching device cannot poison the filters or the model.
     pub fn process(&mut self, buf: &mut [f32]) {
+        sanitize(buf);
         self.hp.process(buf);
         self.denoise.process_in_place(buf);
         self.limiter.process(buf);

@@ -1,4 +1,5 @@
-//! RNNoise 0.2-era model via `nnnoiseless`, a pure-Rust port (BSD-3-Clause).
+//! The original RNNoise model (2018 weights) via `nnnoiseless` 0.5, a pure-Rust port
+//! (BSD-3-Clause). This is not the newer RNNoise 0.2 model.
 
 use crate::Denoiser;
 use nnnoiseless::DenoiseState;

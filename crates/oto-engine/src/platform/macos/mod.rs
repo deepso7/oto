@@ -15,19 +15,21 @@ use std::sync::mpsc::Sender;
 use std::sync::{Arc, Once, OnceLock};
 
 use ffi::*;
-use oto_dsp::{Chain, SAMPLE_RATE};
+use oto_dsp::Chain;
 use rtrb::RingBuffer;
 
 use super::{HalEvent, Platform, Uids};
 use crate::InputDevice;
 use crate::control::Msg;
 use crate::pipeline::{
-    CaptureStage, MAX_BLOCK, OutputStage, RING_CAPACITY, Shared, downmix_add, target_fill,
+    CaptureStage, MAX_BLOCK, OutputStage, RING_CAPACITY, Shared, clamp_io_frames, downmix,
+    estimate_latency_s, scaled_io_frames, target_fill,
 };
 
-/// IO buffer we ask the mic for, in frames (5.3 ms at 48 kHz; leaves room for model inference).
+/// IO buffer we ask the mic for, in frames at 48 kHz (5.3 ms; leaves room for model inference).
+/// Scaled to the device's rate, so the duration stays the same.
 pub const IN_IO_FRAMES: u32 = 256;
-/// IO buffer we ask the sink for, in frames (2.7 ms at 48 kHz; the output callback is cheap).
+/// IO buffer we ask the sink for, in frames at 48 kHz (2.7 ms; the output callback is cheap).
 pub const OUT_IO_FRAMES: u32 = 128;
 
 // ---------------------------------------------------------------------------------------------
@@ -271,7 +273,7 @@ fn set_buffer_frames(dev: AudioObjectID, frames: u32) -> u32 {
             mMaximum: 1e9,
         },
     );
-    let want = (frames as f64).clamp(range.mMinimum, range.mMaximum) as u32;
+    let want = clamp_io_frames(frames, range.mMinimum, range.mMaximum);
     let _ = set(dev, kAudioDevicePropertyBufferFrameSize, g, &want);
     get::<u32>(dev, kAudioDevicePropertyBufferFrameSize, g).unwrap_or(want)
 }
@@ -478,31 +480,30 @@ unsafe extern "C" fn input_proc(
         return 0;
     }
     let bufs = unsafe { abl_slice(input) };
-    let total: u32 = bufs.iter().map(|b| b.mNumberChannels).sum();
     let frames = bufs
         .iter()
         .filter(|b| b.mNumberChannels > 0)
         .map(|b| b.mDataByteSize as usize / 4 / b.mNumberChannels as usize)
         .min()
         .unwrap_or(0);
-    if total == 0 || frames == 0 {
+    if frames == 0 {
         return 0;
     }
     let first_ns = first_sample_ns(input_time);
-    let scale = 1.0 / total as f32;
     let mut at = 0;
     while at < frames {
         let n = (frames - at).min(MAX_BLOCK);
         let mono = &mut ctx.stage.mono_mut()[..n];
-        mono.fill(0.0);
-        for b in bufs {
+        // Each buffer's frames `at..at + n`; a buffer without data is passed as empty.
+        let parts = bufs.iter().map(|b| {
             let ch = b.mNumberChannels as usize;
             if b.mData.is_null() || ch == 0 {
-                continue;
+                return (&[][..], ch);
             }
             let data = unsafe { std::slice::from_raw_parts(b.mData as *const f32, frames * ch) };
-            downmix_add(&data[at * ch..(at + n) * ch], ch, mono, scale);
-        }
+            (&data[at * ch..(at + n) * ch], ch)
+        });
+        downmix(parts, mono);
         let ns = if first_ns == 0 {
             0
         } else {
@@ -716,24 +717,27 @@ impl Platform for Mac {
         if channels(in_dev, ins) == 0 || channels(out_dev, outs) == 0 {
             return Err("device has no channels in the needed direction".into());
         }
-        let in_frames = set_buffer_frames(in_dev, IN_IO_FRAMES);
-        let out_frames = set_buffer_frames(out_dev, OUT_IO_FRAMES);
         let (in_rate, out_rate) = (rate_of(in_dev), rate_of(out_dev));
-        if in_rate <= 0.0 || out_rate <= 0.0 {
+        if !(in_rate > 0.0 && out_rate > 0.0) {
             return Err("cannot read device sample rates".into());
         }
+        // Same buffer duration whatever the device rate (a 16 kHz headset gets 85 frames, not 256).
+        let in_frames = set_buffer_frames(in_dev, scaled_io_frames(IN_IO_FRAMES, in_rate));
+        let out_frames = set_buffer_frames(out_dev, scaled_io_frames(OUT_IO_FRAMES, out_rate));
         let (prod, cons) = RingBuffer::new(RING_CAPACITY);
         let target = target_fill(in_frames as usize, in_rate, out_frames as usize, out_rate);
         let cap = CaptureStage::new(in_rate, chain, prod, shared.clone())?;
         let out = OutputStage::new(cons, out_rate, target, shared.clone())?;
 
-        let sr = SAMPLE_RATE as f64;
-        let est_s = (in_frames + io_latency_frames(in_dev, ins)) as f64 / in_rate
-            + (cap.latency_frames() + target) as f64 / sr
-            + (out_frames as usize
-                + io_latency_frames(out_dev, outs) as usize
-                + out.latency_frames()) as f64
-                / out_rate;
+        let est_s = estimate_latency_s(
+            in_frames as usize,
+            io_latency_frames(in_dev, ins) as usize,
+            in_rate,
+            cap.latency_frames(),
+            target,
+            io_latency_frames(out_dev, outs) as usize + out.latency_frames(),
+            out_rate,
+        );
         shared.estimate_us.store((est_s * 1e6) as u32, Relaxed);
         shared.in_rate.store(in_rate as u32, Relaxed);
         shared.out_rate.store(out_rate as u32, Relaxed);

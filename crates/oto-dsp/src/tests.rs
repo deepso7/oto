@@ -414,3 +414,62 @@ fn bench_all() {
         println!("{}", bench(model, 20.0));
     }
 }
+
+#[test]
+fn biquad_recovers_from_non_finite_input() {
+    for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        let mut f = filters::Biquad::high_pass(SR as f64, 80.0, 0.707);
+        let mut clean = f.clone();
+        for i in 0..100 {
+            f.tick((i as f64 * 0.1).sin());
+        }
+        assert_eq!(f.tick(bad), 0.0);
+        // From here it behaves like a freshly reset filter.
+        for i in 0..1000 {
+            let x = (i as f64 * 0.1).sin();
+            assert_eq!(f.tick(x), clean.tick(x));
+        }
+    }
+}
+
+#[test]
+fn sanitize_zeroes_non_finite_and_clamps() {
+    let mut x = [0.5, f32::NAN, f32::INFINITY, f32::NEG_INFINITY, -1e30, 1e30];
+    sanitize(&mut x);
+    assert_eq!(x, [0.5, 0.0, 0.0, 0.0, -MAX_INPUT, MAX_INPUT]);
+}
+
+/// One NaN or infinity from a glitching device must not silence the chain for good.
+#[test]
+fn full_chain_recovers_after_nan_and_inf() {
+    for enabled in [true, false] {
+        let input = noisy_speech(SR * 4, 5);
+        let mut reference = Chain::with_model(Model::RNNoise).unwrap();
+        reference.set_enabled(enabled);
+        let want = run_chain(&mut reference, &input, 256);
+
+        let mut bad = input.clone();
+        bad[SR] = f32::NAN;
+        bad[SR + SR / 2] = f32::INFINITY;
+        bad[SR + SR / 2 + 1] = f32::NEG_INFINITY;
+        bad[SR + SR / 2 + 2] = f32::MAX;
+        let mut chain = Chain::with_model(Model::RNNoise).unwrap();
+        chain.set_enabled(enabled);
+        let got = run_chain(&mut chain, &bad, 256);
+
+        assert!(got.iter().all(|s| s.is_finite()), "output stays finite");
+        let c = chain.limiter.ceiling();
+        assert!(
+            got.iter().all(|s| s.abs() <= c),
+            "output stays under the ceiling"
+        );
+        // Half a second after the last bad sample the chain is back to normal audio.
+        let tail = 2 * SR + SR / 2..;
+        let (g, w) = (rms(&got[tail.clone()]), rms(&want[tail]));
+        assert!(w > 1e-3, "reference has signal ({w})");
+        assert!(
+            db(g / w).abs() < 1.0,
+            "enabled={enabled}: level after recovery {g} vs reference {w}"
+        );
+    }
+}
