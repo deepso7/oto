@@ -1070,4 +1070,181 @@ mod tests {
             );
         }
     }
+
+    /// Live proof of plan 0001 step 5 on the real devices: a running engine (forced client,
+    /// denoise bypassed so a steady tone passes whatever the model; the model's delay is kept)
+    /// switches Standard → Light → Standard several times while Oto Microphone is recorded like
+    /// an app would. For each switch: the longest silent run and the largest sample-to-sample
+    /// step around it against the steady state's (a click is a step well above it). Needs the
+    /// Oto driver and no other running engine.
+    ///
+    /// `cargo test --release -p oto-engine --lib live_tier_switch -- --ignored --nocapture`
+    /// (`OTO_LIVE_MIC=UID` picks the mic that clocks the stream; default the built-in one;
+    /// `OTO_LIVE_SWITCHES` the number of switches, default 6).
+    #[test]
+    #[ignore = "live: runs the engine on the real mic and Oto devices"]
+    fn live_tier_switch_is_short_and_click_free() {
+        use crate::{Command, Engine, EngineOptions, Settings, Tier, names};
+        use std::sync::Mutex;
+        const QUIET: f32 = 0.01;
+        const AMP: f32 = 0.3;
+        const HZ: f64 = 480.0;
+        let uid = std::env::var("OTO_LIVE_MIC").unwrap_or("BuiltInMicrophoneDevice".into());
+        let n_switches: usize = std::env::var("OTO_LIVE_SWITCHES")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(6);
+        let spacing = Duration::from_secs(3);
+        let in_rate = rate_of(device_for_uid(&uid).expect("no such microphone"));
+        let mic = device_for_uid(names::MIC_UID).expect("Oto driver not installed");
+        let rec_rate = rate_of(mic);
+        // One second of a 480 Hz tone at the mic's rate: whole periods, so the loop is seamless.
+        let n = in_rate as usize;
+        let tone: Arc<[f32]> = (0..n)
+            .map(|k| AMP * (2.0 * std::f64::consts::PI * HZ * k as f64 / in_rate).sin() as f32)
+            .collect();
+        let engine = Engine::start_with(
+            Settings {
+                enabled: false,
+                input_device: Some(uid.clone()),
+                tier: Tier::Standard,
+                ..Default::default()
+            },
+            EngineOptions {
+                force_clients_active: true,
+                source: Some(tone),
+                ..Default::default()
+            },
+        )
+        .expect("engine start");
+
+        // Channel 0 of Oto Microphone, plus (sample index, host ns) of each callback's start.
+        type Rec = (Vec<f32>, Vec<(usize, u64)>);
+        let rec: Arc<Mutex<Rec>> = Arc::new(Mutex::new((
+            Vec::with_capacity(rec_rate as usize * 30),
+            Vec::new(),
+        )));
+        let r = rec.clone();
+        let recorder = Recorder::start(
+            names::MIC_UID,
+            Box::new(move |data, ch, ns| {
+                let mut g = r.lock().unwrap();
+                let at = g.0.len();
+                g.1.push((at, ns));
+                g.0.extend(data.chunks_exact(ch).map(|f| f[0]));
+            }),
+        )
+        .expect("record Oto Microphone");
+        let now_ns = || host_to_ns(unsafe { mach_absolute_time() });
+
+        std::thread::sleep(spacing);
+        let s0 = engine.stats();
+        eprintln!(
+            "start: model {:?}, mic {uid} at {in_rate} Hz, Oto Microphone at {rec_rate} Hz, \
+             latency est {:.1} ms",
+            s0.model, s0.estimated_latency_ms
+        );
+        let mut switches = Vec::new();
+        let mut models = vec![s0.model];
+        for i in 0..n_switches {
+            let tier = if i % 2 == 0 {
+                Tier::Light
+            } else {
+                Tier::Standard
+            };
+            switches.push((tier, now_ns()));
+            engine.send(Command::SetTier(tier));
+            std::thread::sleep(spacing);
+            models.push(engine.stats().model);
+        }
+        let s1 = engine.stats();
+        drop(recorder);
+        drop(engine);
+
+        let (samples, stamps) = std::mem::take(&mut *rec.lock().unwrap());
+        // Sample index for a host time, from the nearest preceding callback stamp.
+        let index_at = |t: u64| -> usize {
+            let k = stamps.partition_point(|&(_, ns)| ns <= t).saturating_sub(1);
+            let (i, ns) = stamps[k];
+            i + (t.saturating_sub(ns) as f64 * rec_rate / 1e9) as usize
+        };
+        let ms = |samples: usize| samples as f64 * 1000.0 / rec_rate;
+        let max_step = |a: usize, b: usize| -> (f32, usize) {
+            (a.max(1)..b.min(samples.len()))
+                .map(|i| ((samples[i] - samples[i - 1]).abs(), i))
+                .fold((0.0, 0), |m, x| if x.0 > m.0 { x } else { m })
+        };
+        let at = |t: u64, off_ms: f64| -> usize {
+            (index_at(t) as f64 + off_ms * rec_rate / 1000.0).max(0.0) as usize
+        };
+
+        eprintln!(
+            "models after each step: {:?}",
+            models
+                .iter()
+                .map(|m| m.map_or("none", |m| m.name()))
+                .collect::<Vec<_>>()
+        );
+        eprintln!(
+            "underruns {} -> {}, resyncs {} -> {}, overflows {} -> {}, starvations {} -> {}",
+            s0.underruns,
+            s1.underruns,
+            s0.resyncs,
+            s1.resyncs,
+            s0.overflows,
+            s1.overflows,
+            s0.starvations,
+            s1.starvations
+        );
+        let mut failures = Vec::new();
+        for (i, &(tier, t)) in switches.iter().enumerate() {
+            // Steady state: the 2 s before the switch, ending 200 ms before it.
+            let (steady, _) = max_step(at(t, -2200.0), at(t, -200.0));
+            // Around the switch: from 100 ms before to 2.5 s after (load + fade + restart).
+            let (a, b) = (at(t, -100.0), at(t, 2500.0).min(samples.len()));
+            let (step, step_i) = max_step(a, b);
+            let (mut gap, mut gap_at, mut run) = (0usize, 0usize, 0usize);
+            for (k, x) in samples.iter().enumerate().take(b).skip(a) {
+                if x.abs() < QUIET {
+                    run += 1;
+                    if run > gap {
+                        gap = run;
+                        gap_at = k + 1 - run;
+                    }
+                } else {
+                    run = 0;
+                }
+            }
+            let rel = |k: usize| ms(k) - ms(index_at(t));
+            eprintln!(
+                "switch {i} -> {tier:?}: silent gap {:.1} ms (from +{:.1} ms), largest step \
+                 {step:.4} at +{:.1} ms, steady-state max step {steady:.4} (ratio {:.2})",
+                ms(gap),
+                rel(gap_at),
+                rel(step_i),
+                step / steady.max(1e-9),
+            );
+            if ms(gap) >= 500.0 {
+                failures.push(format!("switch {i}: gap {:.1} ms", ms(gap)));
+            }
+            if ms(gap) < 1.0 {
+                failures.push(format!("switch {i}: no gap at all: did it switch?"));
+            }
+            // The tone moves ≤ 2π·480/rate·0.3 per sample (0.019 at 48 kHz); fades only lower it.
+            if step > steady * 1.5 + 1e-3 {
+                failures.push(format!("switch {i}: click, step {step} vs steady {steady}"));
+            }
+        }
+        let want = |tier: Tier| Some(crate::model_for(tier));
+        assert_eq!(models[0], want(Tier::Standard), "starting model");
+        for (i, &(tier, _)) in switches.iter().enumerate() {
+            assert_eq!(models[i + 1], want(tier), "model after switch {i}");
+        }
+        assert_eq!(
+            (s1.underruns, s1.resyncs, s1.overflows),
+            (s0.underruns, s0.resyncs, s0.overflows),
+            "glitches during the switches"
+        );
+        assert!(failures.is_empty(), "{failures:#?}");
+    }
 }

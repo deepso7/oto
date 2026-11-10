@@ -28,9 +28,9 @@
 |---|---|
 | CPU, no app recording | 0% |
 | CPU in a call, default model, 2020+ laptop | under 10% of one core |
-| Added latency, end to end | 50 ms or less (stretch: 35 ms) |
+| Added latency, end to end | 65 ms or less in the default mode (DeepFilterNet3); 40 ms or less in Low CPU mode (RNNoise). Measured: 61–63 ms and 34–35 ms |
 | RAM | under 50 MB, excluding the UI's GPU surfaces |
-| Download | under 25 MB |
+| Download | under 25 MB (measured: 22.5 MB zipped; the bundle is 38 MB unpacked) |
 | Network use | update checks only; no account, no telemetry by default |
 
-The latency target is the hard one; see [Models](models.md).
+The latency target is the hard one; see [Models](models.md). It was 50 ms until [plan 0001](plans/0001-deepfilternet3-default.md) accepted DeepFilterNet3's 30 ms of model delay for the default mode.

@@ -35,7 +35,7 @@ The bake-off harness: `oto bench` for timing in Rust; `tools/eval` (VERSA: PESQ,
 | macOS driver loading or signing breaks on a new OS release (a BlackHole signature failure on 26.5 is unexplained) | Test on betas; keep the driver tiny and close to Apple's sample; reboot fallback if coreaudiod restart fails |
 | Rune API churn or a blocking bug | Pin revisions; keep UI thin and all logic in `oto-engine`, so swapping the UI layer stays a contained job. Rune takes no pull requests, so we cannot upstream fixes |
 | Rune + third-party tray on macOS do not coexist | Spike in phase 0; fall back to raw `NSStatusItem` on Rune's main thread |
-| DeepFilterNet upstream is unmaintained | Vendor it; it is small and we need to own the realtime path anyway |
+| DeepFilterNet upstream is unmaintained | Pinned to `tract` 0.21.4 and kept off the audio thread on a worker (plan 0001); vendor it if the pin becomes a problem |
 | "Oto" is hard to search for and shared with other apps (a tinnitus app, an iOS voice companion) | Name is settled as Oto; check trademarks before a public launch |
 
 ## Decisions
