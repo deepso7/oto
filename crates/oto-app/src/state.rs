@@ -576,9 +576,15 @@ impl State {
                 "The installer finished, but Core Audio doesn't list Oto Microphone yet.".into(),
             ),
             Outcome::Installed => {
-                // Whatever the engine last complained about (most likely the missing driver)
-                // is stale; it reports again if something is still wrong.
-                self.clear_engine_error();
+                // Only the missing-driver complaint is stale. Any other error stays until the
+                // engine reports recovery: it does not repeat an error it has already sent.
+                if self
+                    .error
+                    .as_deref()
+                    .is_some_and(|e| e.starts_with("Oto driver is not installed"))
+                {
+                    self.clear_engine_error();
+                }
                 Install::Idle
             }
             Outcome::Cancelled => Install::Idle,
@@ -803,6 +809,15 @@ mod tests {
         assert_eq!(s.error, None);
         assert_eq!(s.install, Install::Idle);
         assert!(s.driver_installed);
+    }
+
+    #[test]
+    fn a_successful_install_keeps_other_engine_errors() {
+        let mut s = State::new(Prefs::default(), false);
+        s.on_event(Event::Error("No microphone found".into()));
+        s.start_install();
+        s.installed(Outcome::Installed, probe(true));
+        assert_eq!(s.error.as_deref(), Some("No microphone found"));
     }
 
     #[test]

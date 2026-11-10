@@ -151,7 +151,8 @@ impl Engine {
     /// lock.
     ///
     /// If a previous run made Oto Microphone the default input and died without restoring it,
-    /// this engine adopts that pending restore and performs it when dropped.
+    /// this engine puts the previous microphone back at once. Callers that want Oto as the
+    /// default ask for it again.
     pub fn start(initial: Settings) -> Result<Self, String> {
         Self::start_with(initial, EngineOptions::default())
     }
@@ -174,6 +175,11 @@ impl Engine {
             &uids.mic,
             platform::sys::default_input_uid().as_deref(),
         ));
+        // Anything pending here is left over from a run that died. A failure keeps the target
+        // for the drop to retry.
+        let _ = restore.restore(platform::sys::default_input_uid, |uid| {
+            platform::sys::set_default_input(uid)
+        });
         let (sh, u, tx2) = (shared.clone(), uids.clone(), tx.clone());
         let force = opts.force_clients_active;
         let r = restore.clone();
