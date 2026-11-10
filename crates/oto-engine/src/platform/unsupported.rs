@@ -58,6 +58,10 @@ pub fn set_default_input(_uid: &str) -> Result<(), String> {
 pub fn device_status(_uid: &str, _input: bool) -> Option<crate::DeviceStatus> {
     None
 }
+/// No realtime scheduling here yet; the DSP worker runs at normal priority.
+pub fn promote_dsp_thread(_period_ns: u64) -> Result<&'static str, String> {
+    Err(UNSUPPORTED.into())
+}
 pub struct Recorder;
 
 impl Recorder {

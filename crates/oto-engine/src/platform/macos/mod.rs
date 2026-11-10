@@ -22,8 +22,8 @@ use super::{HalEvent, Platform, Uids};
 use crate::InputDevice;
 use crate::control::Msg;
 use crate::pipeline::{
-    CaptureStage, MAX_BLOCK, OutputStage, RING_CAPACITY, Shared, clamp_io_frames, downmix,
-    estimate_latency_s, scaled_io_frames, target_fill,
+    CaptureStage, DspSetup, DspThread, MAX_BLOCK, OutputStage, RING_CAPACITY, Shared,
+    clamp_io_frames, downmix, estimate_latency_s, placement_for, scaled_io_frames, target_fill,
 };
 
 /// IO buffer we ask the mic for, in frames at 48 kHz (5.3 ms; leaves room for model inference).
@@ -297,6 +297,111 @@ pub fn host_to_ns(t: u64) -> u64 {
     (t as u128 * n as u128 / d as u128) as u64
 }
 
+/// Gives the calling thread (the DSP worker) realtime scheduling: Mach time-constraint policy
+/// with a `period_ns` period, the whole period as its deadline and half of it as its expected
+/// computation, like an audio IO thread. If the kernel refuses, falls back to the
+/// user-interactive QoS class. Returns which one applied.
+pub fn promote_dsp_thread(period_ns: u64) -> Result<&'static str, String> {
+    let (n, d) = timebase();
+    let ticks = |ns: u64| (ns as u128 * d as u128 / n as u128).min(u32::MAX as u128) as u32;
+    // The kernel rejects computation below 50 µs or above 50 ms.
+    let period_ns = period_ns.clamp(1_000_000, 50_000_000);
+    let mut policy = ThreadTimeConstraintPolicy {
+        period: ticks(period_ns),
+        computation: ticks(period_ns / 2),
+        constraint: ticks(period_ns),
+        preemptible: 1,
+    };
+    let st = unsafe {
+        thread_policy_set(
+            pthread_mach_thread_np(pthread_self()),
+            THREAD_TIME_CONSTRAINT_POLICY,
+            (&raw mut policy).cast(),
+            THREAD_TIME_CONSTRAINT_POLICY_COUNT,
+        )
+    };
+    if st == 0 {
+        return Ok("time-constraint");
+    }
+    if unsafe { pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0) } == 0 {
+        return Ok("user-interactive QoS");
+    }
+    Err(format!("thread_policy_set failed ({st})"))
+}
+
+/// A retained `os_workgroup_t`.
+struct Workgroup(*mut c_void);
+
+// SAFETY: os_workgroup objects are thread-safe, reference-counted OS objects; joining from
+// another thread is their purpose.
+unsafe impl Send for Workgroup {}
+
+impl Drop for Workgroup {
+    fn drop(&mut self) {
+        unsafe { os_release(self.0) };
+    }
+}
+
+/// The audio workgroup of `dev`'s IO thread, if the system provides one.
+fn io_workgroup(dev: AudioObjectID) -> Option<Workgroup> {
+    let a = addr(
+        kAudioDevicePropertyIOThreadOSWorkgroup,
+        kAudioObjectPropertyScopeGlobal,
+    );
+    let mut wg: *mut c_void = ptr::null_mut();
+    let mut size = size_of::<*mut c_void>() as u32;
+    let st = unsafe {
+        AudioObjectGetPropertyData(dev, &a, 0, ptr::null(), &mut size, (&raw mut wg).cast())
+    };
+    (st == 0 && !wg.is_null()).then_some(Workgroup(wg))
+}
+
+/// Membership of a workgroup; leaves it on drop, which must happen on the thread that joined.
+struct Joined {
+    wg: Workgroup,
+    token: OsWorkgroupJoinToken,
+    joined: bool,
+}
+
+impl Drop for Joined {
+    fn drop(&mut self) {
+        if self.joined {
+            unsafe { os_workgroup_leave(self.wg.0, &mut self.token) };
+        }
+    }
+}
+
+/// The DSP worker's setup for a capture device: realtime priority, then membership of the
+/// device's IO-thread workgroup. Without the workgroup, Apple Silicon runs the worker's short
+/// bursts on efficiency cores or at low clocks when the machine is otherwise idle; in it, the
+/// scheduler knows the worker shares the audio deadline. Measured on an M2 Pro (release,
+/// `live_worker_on_a_real_mic`, 256-frame mic): DeepFilterNet3 worker time per block p99
+/// 3.67 ms / max 3.94 ms without, 1.57 ms / 1.59 ms with, of a 5.33 ms period.
+fn dsp_setup(dev: AudioObjectID) -> DspSetup {
+    let wg = io_workgroup(dev);
+    Box::new(move |period_ns| {
+        let realtime = promote_dsp_thread(period_ns).is_ok();
+        let guard = wg.and_then(|wg| {
+            // Boxed first: the token must stay where it was when joining.
+            let mut j = Box::new(Joined {
+                wg,
+                token: OsWorkgroupJoinToken {
+                    sig: 0,
+                    opaque: [0; 36],
+                },
+                joined: false,
+            });
+            j.joined = unsafe { os_workgroup_join(j.wg.0, &mut j.token) } == 0;
+            j.joined.then_some(j as Box<dyn std::any::Any>)
+        });
+        DspThread {
+            realtime,
+            workgroup: guard.is_some(),
+            guard,
+        }
+    })
+}
+
 fn use_hal_notification_thread() {
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
@@ -515,6 +620,7 @@ unsafe extern "C" fn input_proc(
     ctx.shared.in_cycles.fetch_add(1, Relaxed);
     let dt = host_to_ns(unsafe { mach_absolute_time() } - t0);
     ctx.shared.busy_ns.fetch_add(dt, Relaxed);
+    ctx.shared.capture_times.record(dt);
     0
 }
 
@@ -562,6 +668,7 @@ unsafe extern "C" fn output_proc(
     ctx.shared.out_cycles.fetch_add(1, Relaxed);
     let dt = host_to_ns(unsafe { mach_absolute_time() } - t0);
     ctx.shared.busy_ns.fetch_add(dt, Relaxed);
+    ctx.shared.output_times.record(dt);
     0
 }
 
@@ -726,7 +833,16 @@ impl Platform for Mac {
         let out_frames = set_buffer_frames(out_dev, scaled_io_frames(OUT_IO_FRAMES, out_rate));
         let (prod, cons) = RingBuffer::new(RING_CAPACITY);
         let target = target_fill(in_frames as usize, in_rate, out_frames as usize, out_rate);
-        let cap = CaptureStage::new(in_rate, chain, prod, shared.clone())?;
+        let placement = placement_for(chain.model());
+        let cap = CaptureStage::build(
+            in_rate,
+            in_frames as usize,
+            chain,
+            prod,
+            shared.clone(),
+            placement,
+            dsp_setup(in_dev),
+        )?;
         let out = OutputStage::new(cons, out_rate, target, shared.clone())?;
 
         let est_s = estimate_latency_s(
@@ -741,6 +857,15 @@ impl Platform for Mac {
         shared.estimate_us.store((est_s * 1e6) as u32, Relaxed);
         shared.in_rate.store(in_rate as u32, Relaxed);
         shared.out_rate.store(out_rate as u32, Relaxed);
+        // The callbacks are not running yet: start their timing statistics afresh.
+        for (t, frames, rate) in [
+            (&shared.capture_times, in_frames, in_rate),
+            (&shared.output_times, out_frames, out_rate),
+        ] {
+            t.reset();
+            t.period_ns
+                .store((frames as f64 * 1e9 / rate) as u64, Relaxed);
+        }
 
         let in_ctx = InCtx {
             stage: cap,
@@ -842,5 +967,284 @@ impl Recorder {
         let mut io = IoProc::new(dev, record_proc, RecCtx { f }, uid)?;
         io.start(uid)?;
         Ok(Self { _io: io })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Levels;
+    use crate::pipeline::{Placement, default_dsp_setup};
+    use oto_dsp::Model;
+    use std::time::Duration;
+
+    /// Live check of the DSP worker on a real mic's IO thread, without Oto's devices (so it
+    /// runs next to a running Oto app): the mic's callback drives `CaptureStage` exactly like
+    /// the engine's and its output is discarded. Compares the worker with and without the mic's
+    /// audio workgroup. Opens the mic for `OTO_LIVE_SECONDS` (default 15) per variant. The
+    /// signal is synthetic noisy speech in place of the mic's (like `oto run --input-raw`).
+    ///
+    /// `cargo test --release -p oto-engine --lib live_worker -- --ignored --nocapture`
+    /// (`OTO_LIVE_MIC=UID` picks the mic; default the built-in one).
+    #[test]
+    #[ignore = "live: opens a real microphone"]
+    fn live_worker_on_a_real_mic() {
+        let uid = std::env::var("OTO_LIVE_MIC").unwrap_or("BuiltInMicrophoneDevice".into());
+        let secs: f64 = std::env::var("OTO_LIVE_SECONDS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(15.0);
+        let dev = device_for_uid(&uid).expect("no such microphone");
+        let rate = rate_of(dev);
+        let frames = set_buffer_frames(dev, scaled_io_frames(IN_IO_FRAMES, rate)) as usize;
+        let model = if Model::DeepFilterNet3.available() {
+            Model::DeepFilterNet3
+        } else {
+            Model::RNNoise
+        };
+        for workgroup in [false, true] {
+            // The mic clocks the callbacks; the signal is synthetic noisy speech, so the model
+            // really runs (a mic without permission delivers digital silence, which it skips).
+            let mut shared = Shared::new(Arc::new(Levels::default()), None);
+            shared.source = Some(oto_dsp::signal::noisy_speech(rate as usize * 4, 1).into());
+            let shared = Arc::new(shared);
+            let (prod, mut cons) = RingBuffer::new(RING_CAPACITY);
+            let setup = if workgroup {
+                dsp_setup(dev)
+            } else {
+                default_dsp_setup()
+            };
+            let chain = Chain::with_model(model).unwrap();
+            let mut cap = CaptureStage::build(
+                rate,
+                frames,
+                chain,
+                prod,
+                shared.clone(),
+                Placement::Worker,
+                setup,
+            )
+            .unwrap();
+            let sh = shared.clone();
+            let rec = Recorder::start(
+                &uid,
+                Box::new(move |data, ch, ns| {
+                    let t0 = unsafe { mach_absolute_time() };
+                    let n = (data.len() / ch).min(MAX_BLOCK);
+                    downmix(
+                        [(&data[..n * ch], ch)].into_iter(),
+                        &mut cap.mono_mut()[..n],
+                    );
+                    cap.process(n, ns);
+                    if let Ok(c) = cons.read_chunk(cons.slots()) {
+                        c.commit_all();
+                    }
+                    let dt = host_to_ns(unsafe { mach_absolute_time() } - t0);
+                    sh.capture_times.record(dt);
+                }),
+            )
+            .unwrap();
+            std::thread::sleep(Duration::from_secs_f64(secs));
+            drop(rec);
+            let s = crate::Stats::from_shared(&shared);
+            let w = s.worker;
+            eprintln!(
+                "{} on {uid} ({rate} Hz, {frames} frames), workgroup {} (joined {}), realtime \
+                 {}: worker p50 {:.0} µs, p99 {:.0} µs, max {:.0} µs of {:.0} µs over {} \
+                 blocks; starvations {}, overflows {}, reserve {:.2} ms; callback p99 {:.0} \
+                 µs, max {:.0} µs",
+                model.name(),
+                workgroup,
+                s.worker_workgroup,
+                s.worker_realtime,
+                w.p50_us,
+                w.p99_us,
+                w.max_us,
+                w.period_us,
+                w.callbacks,
+                s.starvations,
+                s.worker_overflows,
+                s.worker_reserve_ms,
+                s.capture.p99_us,
+                s.capture.max_us,
+            );
+        }
+    }
+
+    /// Live proof of plan 0001 step 5 on the real devices: a running engine (forced client,
+    /// denoise bypassed so a steady tone passes whatever the model; the model's delay is kept)
+    /// switches Standard → Light → Standard several times while Oto Microphone is recorded like
+    /// an app would. For each switch: the longest silent run and the largest sample-to-sample
+    /// step around it against the steady state's (a click is a step well above it). Needs the
+    /// Oto driver and no other running engine.
+    ///
+    /// `cargo test --release -p oto-engine --lib live_tier_switch -- --ignored --nocapture`
+    /// (`OTO_LIVE_MIC=UID` picks the mic that clocks the stream; default the built-in one;
+    /// `OTO_LIVE_SWITCHES` the number of switches, default 6).
+    #[test]
+    #[ignore = "live: runs the engine on the real mic and Oto devices"]
+    fn live_tier_switch_is_short_and_click_free() {
+        use crate::{Command, Engine, EngineOptions, Settings, Tier, names};
+        use std::sync::Mutex;
+        const QUIET: f32 = 0.01;
+        const AMP: f32 = 0.3;
+        const HZ: f64 = 480.0;
+        let uid = std::env::var("OTO_LIVE_MIC").unwrap_or("BuiltInMicrophoneDevice".into());
+        let n_switches: usize = std::env::var("OTO_LIVE_SWITCHES")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(6);
+        let spacing = Duration::from_secs(3);
+        let in_rate = rate_of(device_for_uid(&uid).expect("no such microphone"));
+        let mic = device_for_uid(names::MIC_UID).expect("Oto driver not installed");
+        let rec_rate = rate_of(mic);
+        // One second of a 480 Hz tone at the mic's rate: whole periods, so the loop is seamless.
+        let n = in_rate as usize;
+        let tone: Arc<[f32]> = (0..n)
+            .map(|k| AMP * (2.0 * std::f64::consts::PI * HZ * k as f64 / in_rate).sin() as f32)
+            .collect();
+        let engine = Engine::start_with(
+            Settings {
+                enabled: false,
+                input_device: Some(uid.clone()),
+                tier: Tier::Standard,
+                ..Default::default()
+            },
+            EngineOptions {
+                force_clients_active: true,
+                source: Some(tone),
+                ..Default::default()
+            },
+        )
+        .expect("engine start");
+
+        // Channel 0 of Oto Microphone, plus (sample index, host ns) of each callback's start.
+        type Rec = (Vec<f32>, Vec<(usize, u64)>);
+        let rec: Arc<Mutex<Rec>> = Arc::new(Mutex::new((
+            Vec::with_capacity(rec_rate as usize * 30),
+            Vec::new(),
+        )));
+        let r = rec.clone();
+        let recorder = Recorder::start(
+            names::MIC_UID,
+            Box::new(move |data, ch, ns| {
+                let mut g = r.lock().unwrap();
+                let at = g.0.len();
+                g.1.push((at, ns));
+                g.0.extend(data.chunks_exact(ch).map(|f| f[0]));
+            }),
+        )
+        .expect("record Oto Microphone");
+        let now_ns = || host_to_ns(unsafe { mach_absolute_time() });
+
+        std::thread::sleep(spacing);
+        let s0 = engine.stats();
+        eprintln!(
+            "start: model {:?}, mic {uid} at {in_rate} Hz, Oto Microphone at {rec_rate} Hz, \
+             latency est {:.1} ms",
+            s0.model, s0.estimated_latency_ms
+        );
+        let mut switches = Vec::new();
+        let mut models = vec![s0.model];
+        for i in 0..n_switches {
+            let tier = if i % 2 == 0 {
+                Tier::Light
+            } else {
+                Tier::Standard
+            };
+            switches.push((tier, now_ns()));
+            engine.send(Command::SetTier(tier));
+            std::thread::sleep(spacing);
+            models.push(engine.stats().model);
+        }
+        let s1 = engine.stats();
+        drop(recorder);
+        drop(engine);
+
+        let (samples, stamps) = std::mem::take(&mut *rec.lock().unwrap());
+        // Sample index for a host time, from the nearest preceding callback stamp.
+        let index_at = |t: u64| -> usize {
+            let k = stamps.partition_point(|&(_, ns)| ns <= t).saturating_sub(1);
+            let (i, ns) = stamps[k];
+            i + (t.saturating_sub(ns) as f64 * rec_rate / 1e9) as usize
+        };
+        let ms = |samples: usize| samples as f64 * 1000.0 / rec_rate;
+        let max_step = |a: usize, b: usize| -> (f32, usize) {
+            (a.max(1)..b.min(samples.len()))
+                .map(|i| ((samples[i] - samples[i - 1]).abs(), i))
+                .fold((0.0, 0), |m, x| if x.0 > m.0 { x } else { m })
+        };
+        let at = |t: u64, off_ms: f64| -> usize {
+            (index_at(t) as f64 + off_ms * rec_rate / 1000.0).max(0.0) as usize
+        };
+
+        eprintln!(
+            "models after each step: {:?}",
+            models
+                .iter()
+                .map(|m| m.map_or("none", |m| m.name()))
+                .collect::<Vec<_>>()
+        );
+        eprintln!(
+            "underruns {} -> {}, resyncs {} -> {}, overflows {} -> {}, starvations {} -> {}",
+            s0.underruns,
+            s1.underruns,
+            s0.resyncs,
+            s1.resyncs,
+            s0.overflows,
+            s1.overflows,
+            s0.starvations,
+            s1.starvations
+        );
+        let mut failures = Vec::new();
+        for (i, &(tier, t)) in switches.iter().enumerate() {
+            // Steady state: the 2 s before the switch, ending 200 ms before it.
+            let (steady, _) = max_step(at(t, -2200.0), at(t, -200.0));
+            // Around the switch: from 100 ms before to 2.5 s after (load + fade + restart).
+            let (a, b) = (at(t, -100.0), at(t, 2500.0).min(samples.len()));
+            let (step, step_i) = max_step(a, b);
+            let (mut gap, mut gap_at, mut run) = (0usize, 0usize, 0usize);
+            for (k, x) in samples.iter().enumerate().take(b).skip(a) {
+                if x.abs() < QUIET {
+                    run += 1;
+                    if run > gap {
+                        gap = run;
+                        gap_at = k + 1 - run;
+                    }
+                } else {
+                    run = 0;
+                }
+            }
+            let rel = |k: usize| ms(k) - ms(index_at(t));
+            eprintln!(
+                "switch {i} -> {tier:?}: silent gap {:.1} ms (from +{:.1} ms), largest step \
+                 {step:.4} at +{:.1} ms, steady-state max step {steady:.4} (ratio {:.2})",
+                ms(gap),
+                rel(gap_at),
+                rel(step_i),
+                step / steady.max(1e-9),
+            );
+            if ms(gap) >= 500.0 {
+                failures.push(format!("switch {i}: gap {:.1} ms", ms(gap)));
+            }
+            if ms(gap) < 1.0 {
+                failures.push(format!("switch {i}: no gap at all: did it switch?"));
+            }
+            // The tone moves ≤ 2π·480/rate·0.3 per sample (0.019 at 48 kHz); fades only lower it.
+            if step > steady * 1.5 + 1e-3 {
+                failures.push(format!("switch {i}: click, step {step} vs steady {steady}"));
+            }
+        }
+        let want = |tier: Tier| Some(crate::model_for(tier));
+        assert_eq!(models[0], want(Tier::Standard), "starting model");
+        for (i, &(tier, _)) in switches.iter().enumerate() {
+            assert_eq!(models[i + 1], want(tier), "model after switch {i}");
+        }
+        assert_eq!(
+            (s1.underruns, s1.resyncs, s1.overflows),
+            (s0.underruns, s0.resyncs, s0.overflows),
+            "glitches during the switches"
+        );
+        assert!(failures.is_empty(), "{failures:#?}");
     }
 }

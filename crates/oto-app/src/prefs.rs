@@ -16,6 +16,7 @@ pub struct Prefs {
     #[serde(with = "StrengthDef")]
     pub strength: Strength,
     #[serde(with = "TierDef")]
+    /// Saved as "standard" (DeepFilterNet3) or "light" (RNNoise, "Low CPU mode").
     pub tier: Tier,
     pub start_at_login: bool,
     /// "Use Oto as the system microphone": Oto Microphone is the default input while Oto runs.
@@ -88,8 +89,8 @@ impl Prefs {
         if let Some(v) = table.get("tier") {
             match v.as_str() {
                 Some("light") => p.tier = Tier::Light,
-                Some("standard") => p.tier = Tier::Standard,
-                Some("max") => p.tier = Tier::Max,
+                // Max isn't offered; a saved one (from before Low CPU mode) means the default.
+                Some("standard") | Some("max") => p.tier = Tier::Standard,
                 _ => bad("tier", v),
             }
         }
@@ -167,7 +168,7 @@ mod tests {
             input_device: Some("BuiltInMicrophoneDevice".into()),
             input_device_name: Some("MacBook Pro Microphone".into()),
             strength: Strength::Strong,
-            tier: Tier::Max,
+            tier: Tier::Light,
             start_at_login: true,
             system_microphone: true,
             onboarded: true,
@@ -177,6 +178,18 @@ mod tests {
         assert_eq!(Prefs::parse(&src), (p, Vec::new()));
         let d = Prefs::default();
         assert_eq!(Prefs::parse(&d.to_toml()), (d, Vec::new()));
+    }
+
+    #[test]
+    fn saved_tiers_map_to_low_cpu_mode() {
+        let tier = |v: &str| Prefs::parse(&format!("tier = \"{v}\"\n")).0.tier;
+        assert_eq!(tier("standard"), Tier::Standard);
+        assert_eq!(tier("light"), Tier::Light);
+        // Max isn't offered any more and loads as the default, without a warning.
+        assert_eq!(tier("max"), Tier::Standard);
+        assert!(Prefs::parse("tier = \"max\"\n").1.is_empty());
+        assert_eq!(Prefs::default().tier, Tier::Standard);
+        assert!(Prefs::default().to_toml().contains("tier = \"standard\""));
     }
 
     #[test]

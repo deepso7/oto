@@ -2,21 +2,21 @@
 
 [← Docs index](README.md)
 
-> **Today the app runs the original RNNoise for every tier.** [Plan 0001](plans/0001-deepfilternet3-default.md) switches the default to DeepFilterNet3. The rest of this page is the research behind the model choices.
+> **Today the app runs DeepFilterNet3 by default and the original RNNoise (2018 weights) in Low CPU mode** ([plan 0001](plans/0001-deepfilternet3-default.md)). The rest of this page is the research behind the model choices.
 
 All run on one CPU thread. No GPU: it costs battery and wakes hardware for a job a single core can do.
 
 | Tier | Model | Rate | Model delay | Cost | Licence | Rust path |
 |---|---|---|---|---|---|---|
-| Standard (default) | DeepFilterNet3 | 48 kHz | 40 ms | about 3–8% of a recent core; 19% of a 2017 U-series core | MIT/Apache, weights included | native `libDF` + `tract`, vendored |
-| Light | RNNoise 0.2 | 48 kHz | 10 ms frames | about 3% of a core | BSD-3 | C library or an audited port (`nnnoiseless`, used today, is the older 2018 model) |
+| Standard (default) | DeepFilterNet3 | 48 kHz | 30 ms (40 ms chain with the 10 ms frame) | 6.7% of an M2 Pro core in `oto bench`; 3% in a live call (worker p50 0.2 ms, p99 1.3–1.6 ms per 5.3 ms block); 19% of a 2017 U-series core | MIT/Apache, weights included | upstream `libDF` + `tract` 0.21.4, pinned, on a realtime worker thread |
+| Light (Low CPU mode) | RNNoise (2018 weights today; 0.2 is the upgrade) | 48 kHz | 10 ms (20 ms chain) | 0.44% of an M2 Pro core in `oto bench`; 0.6% live | BSD-3 | `nnnoiseless`, inside the audio callback |
 | Max | DPDFNet-2 / -8 (48 kHz) | 48 kHz | unpublished | 4–20× DeepFilterNet3's compute | Apache-2.0 | ONNX via `ort` |
 | Challenger | FastEnhancer-S (48 kHz) | 48 kHz | about 21 ms | about 4% of a core (M5) | MIT code; weights licence unstated | ONNX, or hand-written inference |
 
 **Why DeepFilterNet3 first.** It is the only fullband model with a native Rust streaming implementation, clearly permissive weights, and years of field use. Two real problems:
 
-- **Latency.** 40 ms of model delay plus one 10 ms frame of buffering plus device I/O lands around 55–65 ms, over our 50 ms target. Phase 0 must either find a lower-lookahead configuration that still sounds good, or the default becomes FastEnhancer.
-- **Maintenance.** Upstream is near-dormant and pinned to an old `tract`. We vendor `libDF` and own it. Compare against the DeepFilterNetPlus fork, which fixes NaN-on-silence and per-frame allocations.
+- **Latency.** 30 ms of model delay plus one 10 ms frame of buffering, the worker thread's 7.3 ms reserve and device I/O measure 61–63 ms end to end. Plan 0001 raised the default-mode target to 65 ms rather than retrain for less lookahead.
+- **Maintenance.** Upstream is near-dormant and pinned to `tract` 0.21.4; we keep the pin. Inference allocates about 1,700 times (0.95 MB) per 10 ms frame, 94% of it inside `tract`, whose ops always allocate their outputs. So it runs on a worker thread instead of the audio callback, rather than vendoring `libDF`. Compare against the DeepFilterNetPlus fork, which fixes NaN-on-silence.
 
 **FastEnhancer is the one to beat it.** Half the delay and less CPU, but no published 48 kHz quality numbers, an unstated weights licence, and training data that includes export-restricted corpora. Shipping it means retraining it ourselves on clean data.
 

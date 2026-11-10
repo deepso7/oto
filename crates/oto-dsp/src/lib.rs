@@ -176,7 +176,7 @@ impl<D: Denoiser> FrameAdapter<D> {
 
 /// Which denoising model a [`Chain`] runs.
 ///
-/// RNNoise is the v1 default. Measured with [`bench`] on an M2 Pro (release, 20 s): RNNoise
+/// The default is DeepFilterNet3 with the `dfn3` feature (on by default) and RNNoise without. Measured with [`bench`] on an M2 Pro (release, 20 s): RNNoise
 /// p50 43 µs / p99 50 µs per 10 ms block, 0.44% of a core, 20 ms chain latency; DeepFilterNet3
 /// p50 730 µs / p99 810–900 µs, 6.5% of a core, 40 ms chain latency, and it allocates per
 /// frame. With ~11 ms of macOS loopback plus device buffers on top, only RNNoise fits the
@@ -185,9 +185,10 @@ impl<D: Denoiser> FrameAdapter<D> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
 pub enum Model {
     /// RNNoise via `nnnoiseless` (BSD-3-Clause). Always available.
-    #[default]
+    #[cfg_attr(not(feature = "dfn3"), default)]
     RNNoise,
     /// DeepFilterNet3 via `libDF` + `tract`. Needs the `dfn3` cargo feature.
+    #[cfg_attr(feature = "dfn3", default)]
     DeepFilterNet3,
 }
 

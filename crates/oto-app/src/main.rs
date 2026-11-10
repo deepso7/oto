@@ -73,6 +73,7 @@ fn demo() -> State {
 fn active(s: &mut State) {
     s.on_event(oto_engine::Event::ClientsActive(true));
     s.on_event(oto_engine::Event::Load(0.042));
+    s.set_running(Some((oto_engine::model_for(Tier::Standard), 56.0)));
     s.meter.show(-14.0, -21.0);
 }
 
@@ -166,14 +167,19 @@ const SCENES: &[Scene] = &[
             },
         );
     }),
-    ("settings-tiers", |s| {
+    ("settings-low-cpu", |s| {
         s.page = Page::Settings;
         s.tiers = vec![Tier::Light, Tier::Standard];
+        s.prefs.tier = Tier::Light;
     }),
-    ("settings-tier-picker", |s| {
-        s.page = Page::Settings;
-        s.tiers = vec![Tier::Light, Tier::Standard];
-        s.open = Some(Open::Tier);
+    ("main-model-fallback", |s| {
+        active(s);
+        s.on_event(oto_engine::Event::ModelFallback {
+            requested: oto_engine::dsp::Model::DeepFilterNet3,
+            effective: oto_engine::dsp::Model::RNNoise,
+            reason: "running pass codegen".into(),
+        });
+        s.set_running(Some((oto_engine::dsp::Model::RNNoise, 36.0)));
     }),
 ];
 

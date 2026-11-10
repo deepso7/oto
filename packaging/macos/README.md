@@ -7,7 +7,7 @@ Oto.app/Contents/
   Info.plist                      from Info.plist.in (version from the workspace Cargo.toml)
   MacOS/oto-app                   release build of crates/oto-app
   Resources/OtoMicrophone.driver  the prebuilt, signed HAL driver the app installs
-  Resources/LICENSE-MIT, LICENSE-APACHE
+  Resources/LICENSE-MIT, LICENSE-APACHE, THIRD_PARTY_NOTICES.md
 ```
 
 The app installs the driver from its own `Resources` and nowhere else, so the driver has to be

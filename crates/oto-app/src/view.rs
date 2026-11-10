@@ -11,7 +11,7 @@ use rune_kit::{
 
 use crate::meter::{BAR_H, BAR_W};
 use crate::permission::Mic;
-use crate::state::{EngineState, HEAR_TEST, Install, Open, Page, STRENGTHS, State, TIERS};
+use crate::state::{EngineState, HEAR_TEST, Install, LOW_CPU_ABOUT, Open, Page, STRENGTHS, State};
 
 pub const WIDTH: f32 = 340.0;
 const PAD: f32 = 16.0;
@@ -68,7 +68,7 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
     } else {
         match s.page {
             Page::Main => main_page(s, &p, &mut layer),
-            Page::Settings => settings_page(s, &p, &mut layer),
+            Page::Settings => settings_page(s, &p),
         }
     };
     let mut window = col()
@@ -490,6 +490,15 @@ fn main_page(s: &State, p: &Paint, layer: &mut Vec<El>) -> El {
     } else if let Some(n) = mic_notice(s, p) {
         page = page.child(n);
     }
+    if let Some(msg) = &s.model_notice {
+        page = page.child(notice(
+            p,
+            "model-notice",
+            &p.k.c.info,
+            msg,
+            Some(("OK", |s| s.model_notice = None)),
+        ));
+    }
     page = page.child(controls).child(meter);
     if let Some(e) = &s.error {
         page = page.child(error_banner(p, e, |s| s.dismiss_error()));
@@ -582,6 +591,14 @@ fn status_line(s: &State, p: &Paint) -> El {
                 .shrink()
                 .truncate(),
         );
+    if let Some(model) = s.running_model() {
+        r = r.child(
+            text(model)
+                .key("model")
+                .font(CAPTION_NUM)
+                .color(p.t.text_secondary),
+        );
+    }
     if let Some(cpu) = s.cpu() {
         r = r.child(
             text(cpu)
@@ -593,7 +610,7 @@ fn status_line(s: &State, p: &Paint) -> El {
     r
 }
 
-fn settings_page(s: &State, p: &Paint, layer: &mut Vec<El>) -> El {
+fn settings_page(s: &State, p: &Paint) -> El {
     let back = IconButton::new(&CHEVRON_LEFT)
         .variant(IconButtonVariant::GhostMuted)
         .label("Back")
@@ -643,36 +660,15 @@ fn settings_page(s: &State, p: &Paint, layer: &mut Vec<El>) -> El {
             )
             .pb(8.0),
         );
-    // Only when the choice changes something: with one model in the build there's no picker.
-    let tiers: Vec<_> = TIERS
-        .iter()
-        .filter(|(t, _, _)| s.tiers.contains(t))
-        .collect();
-    if tiers.len() > 1 {
-        let tier_labels: Vec<&str> = tiers.iter().map(|(_, l, _)| *l).collect();
-        let (_, tier_label, tier_about) = tiers
-            .iter()
-            .find(|(t, _, _)| *t == s.prefs.tier)
-            .copied()
-            .unwrap_or(tiers[0]);
-        let tier = Select::new("tier", &tier_labels)
-            .appearance(SelectAppearance::Field)
-            .width(132.0)
-            .label("Model")
-            .current(Some(tier_label))
-            .open(s.open == Some(Open::Tier))
-            .on_toggle(|s: &mut State| s.toggle_open(Open::Tier))
-            .on_close(|s: &mut State| s.open = None)
-            .on_choose(|s: &mut State, v: &str, _| {
-                if let Some((t, _, _)) = TIERS.iter().find(|(_, l, _)| *l == v) {
-                    s.set_tier(*t);
-                }
-            })
-            .build(&p.k, layer);
+    // Only when the choice changes something: with one model in the build there's no switch.
+    if s.offers_low_cpu() {
+        let low_cpu = small_switch(p, "low-cpu", "Low CPU mode", s.low_cpu(), true, |s| {
+            s.set_low_cpu(!s.low_cpu())
+        });
         general = general
-            .child(separator(p, "sep-tier"))
-            .child(field_row(p, "tier-row", "Model", tier))
-            .child(caption(p, "tier-about", *tier_about).pb(8.0));
+            .child(separator(p, "sep-low-cpu"))
+            .child(field_row(p, "low-cpu-row", "Low CPU mode", low_cpu))
+            .child(caption(p, "low-cpu-about", LOW_CPU_ABOUT).pb(8.0));
     }
 
     let busy = s.install.busy();
@@ -1145,24 +1141,57 @@ mod tests {
     }
 
     #[test]
-    fn the_model_picker_shows_only_with_a_choice() {
+    fn low_cpu_mode_shows_only_with_a_choice_and_switches_tiers() {
         let mut s = installed();
         s.page = Page::Settings;
         s.tiers = vec![Tier::Standard];
-        assert!(runtime(s).find("tier-row").is_none());
+        assert!(runtime(s).find("low-cpu-row").is_none());
 
         let mut s = installed();
         s.page = Page::Settings;
         s.tiers = vec![Tier::Light, Tier::Standard];
-        assert!(runtime(s).find("tier-row").is_some());
+        let mut rt = runtime(s);
+        assert!(rt.find("low-cpu-about").is_some());
+        assert!(!rt.state.low_cpu(), "off by default");
+        click(&mut rt, "low-cpu");
+        assert_eq!(rt.state.prefs.tier, Tier::Light);
+        click(&mut rt, "low-cpu");
+        assert_eq!(rt.state.prefs.tier, Tier::Standard);
+        assert_eq!(
+            sent(&rt),
+            [
+                Command::SetTier(Tier::Light),
+                Command::SetTier(Tier::Standard)
+            ]
+        );
 
         // What this build offers decides the default state.
         let mut s = installed();
         s.page = Page::Settings;
         assert_eq!(
-            runtime(s).find("tier-row").is_some(),
+            runtime(s).find("low-cpu-row").is_some(),
             oto_engine::available_tiers().len() > 1
         );
+    }
+
+    #[test]
+    fn a_model_fallback_is_a_notice_with_the_running_model() {
+        use oto_engine::Event;
+        use oto_engine::dsp::Model;
+        let mut s = installed();
+        s.on_event(Event::ClientsActive(true));
+        s.on_event(Event::ModelFallback {
+            requested: Model::DeepFilterNet3,
+            effective: Model::RNNoise,
+            reason: "no".into(),
+        });
+        s.set_running(Some((Model::RNNoise, 36.0)));
+        let mut rt = runtime(s);
+        assert!(rt.find("error").is_none(), "not an error banner");
+        assert!(rt.find("model").is_some());
+        click(&mut rt, "model-notice-action");
+        assert!(rt.state.model_notice.is_none());
+        assert!(rt.find("model-notice").is_none());
     }
 
     #[test]

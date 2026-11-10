@@ -17,7 +17,7 @@
             └───────────────────────────────────────────────────┘
 ```
 
-**One process, three kinds of thread.** The realtime audio thread runs the DSP chain and never allocates, locks or blocks. A control thread owns devices and reacts to hot-plug, sleep and default-device changes. The UI thread is Rune's. They talk through lock-free ring buffers (`rtrb`) for audio and channels for control.
+**One process, three kinds of thread.** The realtime audio thread runs the DSP chain and never allocates, locks or blocks once a stream is running. The one exception is the first callback of a stream, which primes RNNoise's per-thread state. DeepFilterNet3 allocates inside `tract` on every frame, so with it the capture callback only moves audio through two `rtrb` rings to a realtime worker thread (`oto-dsp`, joined to the mic's audio workgroup), which owns the chain and may allocate. A fixed reserve of one capture block plus 2 ms covers the worker's turnaround. When the worker is late, the callback cross-fades to the dry signal at the same delay ([plan 0001](plans/0001-deepfilternet3-default.md)). A control thread owns devices and reacts to hot-plug, sleep and default-device changes. The UI thread is Rune's. They talk through lock-free ring buffers (`rtrb`) for audio and channels for control.
 
 **The engine is a library with a message boundary.** The UI and the `oto` CLI only send `Command`s and receive `Event`s. That keeps a headless mode cheap now (useful on GNOME, where tray icons need an extension) and lets the engine move into its own daemon later without touching callers. We do not build the daemon in v1.
 
@@ -103,6 +103,6 @@ Rune is a native GPU-rendered Rust UI framework: winit + wgpu, plain-Rust builde
 
 1. **Popover / main window:** big switch, input device picker, strength, live meter (raw vs cleaned), which apps are using Oto Microphone, current CPU cost.
 2. **Onboarding:** mic permission → install driver (macOS) → offer to make Oto Microphone the system default → test recording.
-3. **Settings:** model tier, start at login, shortcut, updates.
+3. **Settings:** Low CPU mode (RNNoise instead of DeepFilterNet3), start at login, shortcut, updates.
 
 On quit, restore the previous default input.

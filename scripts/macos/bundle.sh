@@ -1,7 +1,8 @@
 #!/bin/bash
 # SPDX-License-Identifier: MIT OR Apache-2.0
-# Builds target/bundle/Oto.app: the release oto-app binary, its Info.plist, and the prebuilt
-# driver the app installs (Contents/Resources/OtoMicrophone.driver). See packaging/macos/README.md.
+# Builds target/bundle/Oto.app: the release oto-app binary, its Info.plist, the licence and
+# third-party notice files, and the prebuilt driver the app installs
+# (Contents/Resources/OtoMicrophone.driver). See packaging/macos/README.md.
 #
 #   scripts/macos/bundle.sh                                         ad-hoc signed, for this Mac
 #   SIGN_ID="Developer ID Application: Name (TEAMID)" scripts/macos/bundle.sh
@@ -68,7 +69,7 @@ cp "$TARGET_DIR/release/oto-app" "$APP/Contents/MacOS/oto-app"
 sed "s/@VERSION@/$VERSION/g" "$PKG/Info.plist.in" > "$APP/Contents/Info.plist"
 plutil -lint -s "$APP/Contents/Info.plist" || die "the generated Info.plist is invalid."
 printf 'APPL????' > "$APP/Contents/PkgInfo"
-cp "$ROOT/LICENSE-MIT" "$ROOT/LICENSE-APACHE" "$APP/Contents/Resources/"
+cp "$ROOT/LICENSE-MIT" "$ROOT/LICENSE-APACHE" "$ROOT/THIRD_PARTY_NOTICES.md" "$APP/Contents/Resources/"
 # The driver is already signed by its Makefile; cp -R keeps that signature intact.
 cp -R "$ROOT/driver/macos/build/$DRIVER" "$APP/Contents/Resources/$DRIVER"
 xattr -cr "$APP"

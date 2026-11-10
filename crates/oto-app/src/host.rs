@@ -67,6 +67,7 @@ fn run(
     });
     let visible = h.clone();
     meter::spawn(engine.levels(), meter, move || visible.is_visible());
+    let mut running = None;
 
     loop {
         match requests.recv_timeout(EVENT_POLL) {
@@ -84,6 +85,16 @@ fn run(
                 }
             }
             Err(RecvTimeoutError::Timeout) => {}
+        }
+        // The running model and delay change only when streams restart; send them on change.
+        let stats = engine.stats();
+        let now = stats
+            .model
+            .filter(|_| stats.running)
+            .map(|m| (m, stats.estimated_latency_ms.round()));
+        if now != running {
+            running = now;
+            h.update(move |s, _| s.set_running(now));
         }
         let events = engine.try_events();
         if events.is_empty() {

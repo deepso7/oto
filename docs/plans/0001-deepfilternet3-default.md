@@ -1,6 +1,6 @@
 # 0001: DeepFilterNet3 as the default model
 
-**Status:** Accepted · 2026-11-10
+**Status:** Implemented · 2026-11-11 (design B, the worker thread). Listening comparison by ear still to do.
 
 [← Docs index](../README.md)
 

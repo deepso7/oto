@@ -10,8 +10,9 @@ edition = "2024"
 license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
-oto-dsp = { path = "crates/oto-dsp" }
-oto-engine = { path = "crates/oto-engine" }
+# Without default features, so each crate opts in to `dfn3` itself and forwards it.
+oto-dsp = { path = "crates/oto-dsp", default-features = false }
+oto-engine = { path = "crates/oto-engine", default-features = false }
 # Rune is pre-release: always pin a rev of `dev` and bump deliberately.
 rune = { git = "https://github.com/anomalyco/rune", rev = "70eff81165e9854834a75f17753edb6c96ab2ab7" }
 rune-kit = { git = "https://github.com/anomalyco/rune", rev = "70eff81165e9854834a75f17753edb6c96ab2ab7" }
@@ -21,3 +22,62 @@ lto = "thin"
 codegen-units = 1
 panic = "abort"
 strip = true
+
+# DeepFilterNet3 (`oto-dsp/dfn3`) in debug builds.
+#
+# tract-core 0.21.4 runs `Graph::check_compact` after every graph compaction when
+# `debug_assertions` is on (src/model/graph.rs). Its codegen pass leaves two nodes named
+# `/convt3/Conv.bias` in the DFN3 encoder, so the check fails and the model cannot load:
+# "running pass codegen: after pass codegen: after graph compaction: duplicate name
+# /convt3/Conv.bias". The duplicate name is cosmetic (release builds skip the check and run
+# fine), so turn tract's debug assertions off. That alone fixes loading.
+#
+# The opt-levels are for speed: unoptimised, DFN3 takes about 6.6 ms per 10 ms frame, too slow
+# to run in an audio callback. Dependencies only; our own crates stay unoptimised.
+[profile.dev.package.tract-core]
+opt-level = 3
+debug-assertions = false
+
+[profile.dev.package.tract-data]
+opt-level = 3
+debug-assertions = false
+
+[profile.dev.package.tract-hir]
+opt-level = 3
+debug-assertions = false
+
+[profile.dev.package.tract-linalg]
+opt-level = 3
+debug-assertions = false
+
+[profile.dev.package.tract-nnef]
+opt-level = 3
+debug-assertions = false
+
+[profile.dev.package.tract-onnx]
+opt-level = 3
+debug-assertions = false
+
+[profile.dev.package.tract-onnx-opl]
+opt-level = 3
+debug-assertions = false
+
+[profile.dev.package.tract-pulse]
+opt-level = 3
+debug-assertions = false
+
+[profile.dev.package.tract-pulse-opl]
+opt-level = 3
+debug-assertions = false
+
+[profile.dev.package.deep_filter]
+opt-level = 3
+
+[profile.dev.package.ndarray]
+opt-level = 3
+
+[profile.dev.package.rustfft]
+opt-level = 3
+
+[profile.dev.package.realfft]
+opt-level = 3

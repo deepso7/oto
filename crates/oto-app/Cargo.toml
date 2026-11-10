@@ -4,6 +4,11 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = ["dfn3"]
+# DeepFilterNet3 as the default model. `--no-default-features` builds an RNNoise-only app.
+dfn3 = ["oto-engine/dfn3"]
+
 [dependencies]
 oto-engine.workspace = true
 rune.workspace = true

@@ -15,7 +15,7 @@ A plan describes one piece of work before it is built. Plans live in [`plans/`](
 
 | # | Plan | Status |
 |---|---|---|
-| 0001 | [DeepFilterNet3 as the default model](plans/0001-deepfilternet3-default.md) | Accepted |
+| 0001 | [DeepFilterNet3 as the default model](plans/0001-deepfilternet3-default.md) | Implemented |
 
 Each plan starts with a status line: **Proposed** (written, not agreed), **Accepted** (agreed, not started), **In progress**, **Done** or **Dropped**. When a plan is done, its outcome moves into [Status](status.md) and, if it changed the design, into [Architecture](architecture.md) or [Models](models.md). The plan file stays as the record of why.
 
