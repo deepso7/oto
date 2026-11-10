@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+lexopt = "0.3"
 oto-engine.workspace = true
 
 [[bin]]

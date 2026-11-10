@@ -6,3 +6,5 @@ license.workspace = true
 
 [dependencies]
 oto-dsp.workspace = true
+rtrb = "0.4"
+rubato = "5"
