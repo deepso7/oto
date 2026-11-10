@@ -427,6 +427,15 @@ fn run(a: Args) -> Result<(), String> {
                     callback_times(&s.capture),
                     callback_times(&s.output),
                 );
+                if s.worker.callbacks > 0 {
+                    // DeepFilterNet3 runs on the worker thread (design B in docs/plans/0001).
+                    print!(
+                        "worker {} starved {} ovf {} ",
+                        callback_times(&s.worker),
+                        s.starvations,
+                        s.worker_overflows,
+                    );
+                }
                 line_shown = true;
                 let _ = std::io::stdout().flush();
             }
