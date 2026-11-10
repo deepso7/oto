@@ -136,7 +136,9 @@ impl Engine {
     pub fn start_with(initial: Settings, opts: EngineOptions) -> Result<Self, String> {
         let levels = Arc::new(Levels::default());
         levels.set(-120.0, -120.0);
-        let shared = Arc::new(pipeline::Shared::new(levels.clone(), opts.probe.clone()));
+        let mut shared = pipeline::Shared::new(levels.clone(), opts.probe.clone());
+        shared.source = opts.source.clone();
+        let shared = Arc::new(shared);
         let uids = opts.uids();
         let (tx, rx) = mpsc::channel();
         let (etx, events) = mpsc::channel();
@@ -245,6 +247,9 @@ pub struct EngineOptions {
     pub sink_uid: Option<String>,
     /// Behave as if an app is always recording from the mic.
     pub force_clients_active: bool,
+    /// Development: loop these mono samples in place of the mic signal, at the mic's rate.
+    /// The real mic still clocks the stream. Used to prove the full path with a known signal.
+    pub source: Option<Arc<[f32]>>,
 }
 
 impl EngineOptions {

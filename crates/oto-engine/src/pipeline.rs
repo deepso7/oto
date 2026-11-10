@@ -81,6 +81,8 @@ pub struct Shared {
     /// Estimated input-to-sink latency of the running streams, microseconds.
     pub estimate_us: AtomicU32,
     pub probe: Option<Arc<Probe>>,
+    /// Development: mono samples looped in place of the mic signal (see `EngineOptions::source`).
+    pub source: Option<Arc<[f32]>>,
 }
 
 impl Shared {
@@ -103,6 +105,7 @@ impl Shared {
             out_rate: AtomicU32::new(0),
             estimate_us: AtomicU32::new(0),
             probe,
+            source: None,
         }
     }
 }
@@ -201,6 +204,7 @@ pub struct CaptureStage {
     producer: Producer<f32>,
     shared: Arc<Shared>,
     probe: Option<ProbeGen>,
+    source: Option<(Arc<[f32]>, usize)>,
     level_raw: f32,
     level_clean: f32,
     /// Whether `Chain::prime` has run on the audio thread yet.
@@ -240,6 +244,11 @@ impl CaptureStage {
             burst: (Probe::BURST_S * rate) as usize,
             pos: 0,
         });
+        let source = shared
+            .source
+            .clone()
+            .filter(|s| !s.is_empty())
+            .map(|s| (s, 0));
         let mut chain = chain;
         let denoise = shared.denoise.load(Relaxed);
         let atten = f32::from_bits(shared.max_atten_bits.load(Relaxed));
@@ -256,6 +265,7 @@ impl CaptureStage {
             atten,
             producer,
             shared,
+            source,
             probe,
             level_raw: -120.0,
             level_clean: -120.0,
@@ -288,6 +298,12 @@ impl CaptureStage {
         let n = n.min(MAX_BLOCK);
         if let Some(p) = &mut self.probe {
             p.fill(&mut self.mono[..n], first_ns);
+        }
+        if let Some((src, pos)) = &mut self.source {
+            for s in &mut self.mono[..n] {
+                *s = src[*pos];
+                *pos = (*pos + 1) % src.len();
+            }
         }
         let len = match &mut self.resampler {
             None => {

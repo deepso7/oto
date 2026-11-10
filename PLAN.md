@@ -2,7 +2,7 @@
 
 Oto is a lightweight, realtime noise-cancelling virtual microphone for Linux and macOS (Windows later), written in Rust with a [Rune](https://github.com/anomalyco/rune) UI. Any app that can pick a microphone picks "Oto Microphone" and gets a clean voice.
 
-Status: research done, workspace scaffolded, nothing audio-related built yet. Research date: 2026-11-10.
+Status: macOS v1 path built (driver, engine, CLI, menu-bar app); Linux backend next. Research date: 2026-11-10.
 
 ## 1. Product
 
@@ -226,18 +226,28 @@ The bake-off harness: `oto bench` for timing in Rust; `tools/eval` (VERSA: PESQ,
 
 ## 10. What exists today
 
-- Cargo workspace with the four crates, toolchain pinned to 1.99.1 to match Rune.
-- `oto-dsp`: `Denoiser` trait, `Passthrough`, and `FrameAdapter` (lets a fixed-frame model run in callbacks of any block size, allocation-free), with tests.
-- `oto-engine`: the `Command` / `Event` boundary only.
-- `oto-app`: a one-switch Rune window pinned to Rune `70eff81`.
-- `oto-cli`: a stub.
+- **`oto-dsp`**: the v1 chain (80 Hz high-pass → denoise → −1 dBFS limiter), allocation-free on the audio thread. RNNoise (`nnnoiseless`) is the default model: 20 ms chain latency, about 0.5% of an M2 Pro core. DeepFilterNet3 builds behind the `dfn3` feature (40 ms, 6.5% of a core, allocates per frame) and is used for the Max tier when compiled in. `oto bench` times either.
+- **DeepFilterNet3 weights licence**: cleared. Upstream commit `7b14b89` (closing issue #700) states that code and weights are MIT/Apache-2.0.
+- **`driver/macos`**: the C HAL plug-in. A visible "Oto Microphone" and a hidden "Oto Sink" share one clock; the sink loops to the mic through time-tagged slots, so it plays silence (never stale audio) when nothing is playing. `scripts/macos/install-driver.sh` installs it, and `driver/macos/build/oto-verify` checks it.
+- **`oto-engine`**: the Core Audio backend behind a `Platform` trait (Linux PipeWire comes next). It captures the chosen mic, runs the chain, and plays into Oto Sink with fill-driven `rubato` drift control. It runs only while an app records from Oto Microphone, and it handles hot-plug and default-device changes.
+- **`oto-cli`**: `oto run | devices | status | latency | bench`.
+- **`oto-app`**: Rune menu-bar app with a status item via `tray-icon`, a popover, onboarding with driver install, strength and device controls, meters, settings, and start at login.
+
+Measured on an M2 Pro running macOS 27.0.1:
+- **Latency**: 35 ms end to end (mic IO buffer → chain → sink → driver → recorder), measured with `oto latency`.
+- **CPU**: 0% when idle.
+
+Not done yet:
+- Developer ID signing and notarized installer.
+- "Hear the difference" test.
+- Live checks for unplug and sleep.
+- Linux.
 
 ```bash
 cargo test
-```
-
-```bash
-cargo run -p oto-app
+make -C driver/macos && scripts/macos/install-driver.sh
+cargo run --release -p oto-cli -- run
+cargo run --release -p oto-app
 ```
 
 ## Sources

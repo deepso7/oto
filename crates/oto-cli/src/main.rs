@@ -27,7 +27,8 @@ USAGE:
         Time the DSP chain on synthetic audio.
 
 Development flags (run, latency): --mic-uid UID, --sink-uid UID stand in for Oto's devices;
---force-clients runs as if an app were recording.
+--force-clients runs as if an app were recording; --input-raw FILE loops mono f32le samples
+in place of the mic signal (the mic still clocks the stream).
 ";
 
 #[derive(Default)]
@@ -71,6 +72,17 @@ fn parse() -> Result<Args, lexopt::Error> {
             Long("mic-uid") => a.opts.mic_uid = Some(p.value()?.string()?),
             Long("sink-uid") => a.opts.sink_uid = Some(p.value()?.string()?),
             Long("force-clients") => a.opts.force_clients_active = true,
+            Long("input-raw") => {
+                let path = p.value()?.string()?;
+                let bytes = std::fs::read(&path).map_err(|e| format!("{path}: {e}"))?;
+                let samples: Vec<f32> = bytes
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|b| f32::from_le_bytes(*b))
+                    .collect();
+                a.opts.source = Some(samples.into());
+            }
             Short('h') | Long("help") => {
                 print!("{USAGE}");
                 std::process::exit(0);
@@ -286,6 +298,6 @@ fn bench(a: Args) -> Result<(), String> {
     let seconds = a.seconds.unwrap_or(10.0);
     let model = oto_engine::model_for(a.tier);
     let report = dsp::try_bench(model, seconds as f32)?;
-    println!("{}: {report}", model.name());
+    println!("{report}");
     Ok(())
 }
