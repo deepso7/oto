@@ -62,7 +62,10 @@ notarize() {
 }
 
 echo "==> Bundle"
-UNIVERSAL=1 SIGN_ID="$SIGN_ID" "$ROOT/scripts/macos/bundle.sh"
+# FastEnhancer's weights licence is unstated upstream: releases leave the `fastenhancer`
+# feature out and ship DeepFilterNet3, DPDFNet-2 and RNNoise (bundle.sh builds the Intel slice
+# without `onnx`, which has no prebuilt x86_64 macOS runtime).
+OTO_FEATURES=dfn3,onnx UNIVERSAL=1 SIGN_ID="$SIGN_ID" "$ROOT/scripts/macos/bundle.sh"
 
 VERSION="$(plutil -extract CFBundleShortVersionString raw "$APP/Contents/Info.plist")"
 ARCHS="$(lipo -archs "$APP/Contents/MacOS/oto-app")"

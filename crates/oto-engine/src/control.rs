@@ -40,32 +40,44 @@ pub fn decide(enabled: bool, clients_active: bool, driver_installed: bool) -> Mo
 
 /// The model this build runs for a tier.
 ///
-/// With the `dfn3` cargo feature (the default), [`Tier::Standard`] is DeepFilterNet3,
-/// [`Tier::Light`] ("Low CPU mode") is RNNoise, and [`Tier::Max`], kept for a later model,
-/// resolves to Standard's. DeepFilterNet3 costs ~15× RNNoise's CPU and adds ~20 ms of model
-/// delay plus the DSP worker's reserve; it runs on a realtime worker thread rather than in the
-/// audio callback ([`crate::pipeline::placement_for`]). Without `dfn3` every tier is RNNoise and
-/// the tier setting changes nothing.
+/// [`Tier::Light`] ("Low CPU mode") is RNNoise. [`Tier::Standard`] is DeepFilterNet3 with the
+/// `dfn3` cargo feature and RNNoise without. [`Tier::Max`] is DPDFNet-2 with the `onnx`
+/// feature and [`Tier::Fast`] FastEnhancer-S with `fastenhancer`; without them they resolve to
+/// Standard's model. Every model
+/// but RNNoise allocates during inference and runs on a realtime worker thread rather than in
+/// the audio callback ([`crate::pipeline::placement_for`]).
 pub fn model_for(tier: Tier) -> Model {
-    if cfg!(feature = "dfn3") {
-        match tier {
-            Tier::Light => Model::RNNoise,
-            Tier::Standard | Tier::Max => Model::DeepFilterNet3,
-        }
+    let standard = if cfg!(feature = "dfn3") {
+        Model::DeepFilterNet3
     } else {
         Model::RNNoise
+    };
+    match tier {
+        Tier::Light => Model::RNNoise,
+        Tier::Standard => standard,
+        Tier::Max if cfg!(feature = "onnx") => Model::DpdfNet,
+        Tier::Fast if cfg!(feature = "fastenhancer") => Model::FastEnhancer,
+        Tier::Max | Tier::Fast => standard,
     }
 }
 
-/// The tiers worth offering: one per distinct model in this build, in ascending order. Always
-/// contains [`Tier::default`]. `[Light, Standard]` with `dfn3`, `[Standard]` without; with a
-/// single entry the tier setting does nothing and a UI should hide its picker.
+/// The tiers worth offering: one per distinct model in this build, Light first. Always
+/// contains [`Tier::default`]. With a single entry the tier setting does nothing and a UI
+/// should hide its picker.
 pub fn available_tiers() -> &'static [Tier] {
-    if cfg!(feature = "dfn3") {
-        &[Tier::Light, Tier::Standard]
-    } else {
-        &[Tier::Standard]
-    }
+    static TIERS: std::sync::OnceLock<Vec<Tier>> = std::sync::OnceLock::new();
+    TIERS.get_or_init(|| {
+        let mut out: Vec<Tier> = Vec::new();
+        for t in [Tier::Light, Tier::Standard, Tier::Max, Tier::Fast] {
+            let m = model_for(t);
+            // Folded tiers resolve to Standard's model; offer that once, as Standard.
+            if !out.iter().any(|&o| model_for(o) == m) || t == Tier::Standard {
+                out.retain(|&o| model_for(o) != m);
+                out.push(t);
+            }
+        }
+        out
+    })
 }
 
 /// Called on the control thread when the system default input changed.
@@ -564,18 +576,19 @@ mod tests {
         c.handle(Msg::Cmd(Command::SetStrength(Strength::Light)));
         c.reconcile();
         assert_eq!(f32::from_bits(c.shared.max_atten_bits.load(Relaxed)), 12.0);
-        // Standard → Max is the same model in every build: audio keeps running.
-        assert_eq!(model_for(Tier::Standard), model_for(Tier::Max));
-        c.handle(Msg::Cmd(Command::SetTier(Tier::Max)));
-        c.reconcile();
-        assert_eq!(c.p.started.len(), 1);
-        assert_eq!(c.p.stops, 0);
-        // Standard/Max → Light restarts only if this build has a different model for it.
-        c.handle(Msg::Cmd(Command::SetTier(Tier::Light)));
-        c.reconcile();
-        let distinct = model_for(Tier::Light) != model_for(Tier::Max);
-        assert_eq!(distinct, cfg!(feature = "dfn3"));
-        assert_eq!(c.p.started.len(), if distinct { 2 } else { 1 });
+        // Each tier change restarts audio only if it resolves to another model.
+        let mut starts = 1;
+        let mut last = model_for(Tier::Standard);
+        for t in [Tier::Max, Tier::Fast, Tier::Light, Tier::Standard] {
+            c.handle(Msg::Cmd(Command::SetTier(t)));
+            c.reconcile();
+            if model_for(t) != last {
+                starts += 1;
+                last = model_for(t);
+            }
+            assert_eq!(c.p.started.len(), starts, "after {t:?}");
+        }
+        assert_eq!(starts > 1, available_tiers().len() > 1);
     }
 
     #[test]
@@ -588,10 +601,14 @@ mod tests {
             assert!(!models[..i].contains(m), "{m:?} offered twice");
         }
         // Nothing reachable is left out.
-        for t in [Tier::Light, Tier::Standard, Tier::Max] {
+        for t in [Tier::Light, Tier::Standard, Tier::Max, Tier::Fast] {
             assert!(models.contains(&model_for(t)));
         }
-        assert_eq!(tiers.len(), if cfg!(feature = "dfn3") { 2 } else { 1 });
+        let expected = 1
+            + cfg!(feature = "dfn3") as usize
+            + cfg!(feature = "onnx") as usize
+            + cfg!(feature = "fastenhancer") as usize;
+        assert_eq!(tiers.len(), expected);
     }
 
     fn errors_and_recoveries(rx: &mpsc::Receiver<Event>) -> Vec<Event> {
@@ -814,15 +831,15 @@ mod tests {
     fn dfn3_fails(c: &mut Control<Fake>) -> std::rc::Rc<std::cell::RefCell<Vec<Model>>> {
         c.tier_model = |t| match t {
             Tier::Light => Model::RNNoise,
-            Tier::Standard | Tier::Max => Model::DeepFilterNet3,
+            Tier::Standard | Tier::Max | Tier::Fast => Model::DeepFilterNet3,
         };
         let loads = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
         let l = loads.clone();
         c.loader = Box::new(move |m| {
             l.borrow_mut().push(m);
             match m {
-                Model::DeepFilterNet3 => Err("cannot load DeepFilterNet3".into()),
                 Model::RNNoise => Chain::with_model(m),
+                _ => Err(format!("cannot load {}", m.name())),
             }
         });
         loads
@@ -1076,7 +1093,7 @@ mod tests {
         let mut c = Control::new(Sim::default(), s, true, Arc::new(sh), tx);
         c.tier_model = |t| match t {
             Tier::Light => Model::RNNoise,
-            Tier::Standard | Tier::Max => Model::DeepFilterNet3,
+            Tier::Standard | Tier::Max | Tier::Fast => Model::DeepFilterNet3,
         };
         if !cfg!(feature = "dfn3") {
             // No DeepFilterNet3 in this build: an RNNoise chain stands in, on the worker.

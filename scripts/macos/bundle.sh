@@ -68,18 +68,30 @@ else
 fi
 
 export MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-12.0}"
+# OTO_FEATURES replaces the app's default cargo features, e.g. "dfn3,onnx" for a release.
+FEATURE_ARGS=()
+if [ -n "${OTO_FEATURES:-}" ]; then
+    FEATURE_ARGS=(--no-default-features --features "$OTO_FEATURES")
+fi
 build_app() {
     if [ "$RELEASE" -eq 1 ]; then
-        (cd "$ROOT" && OTO_TEAM_ID="$TEAM_ID" cargo build --release -p oto-app "$@")
+        (cd "$ROOT" && OTO_TEAM_ID="$TEAM_ID" cargo build --release -p oto-app ${FEATURE_ARGS[@]+"${FEATURE_ARGS[@]}"} "$@")
     else
-        (cd "$ROOT" && env -u OTO_TEAM_ID cargo build --release -p oto-app "$@")
+        (cd "$ROOT" && env -u OTO_TEAM_ID cargo build --release -p oto-app ${FEATURE_ARGS[@]+"${FEATURE_ARGS[@]}"} "$@")
     fi
 }
 if [ "$UNIVERSAL" = 1 ]; then
     BINS=()
     for t in "${TARGETS[@]}"; do
         echo "==> oto-app $VERSION (release, $t)"
-        build_app --target "$t"
+        if [ "$t" = x86_64-apple-darwin ]; then
+            # ONNX Runtime (`ort`) has no prebuilt x86_64 macOS library, so Intel Macs get
+            # DeepFilterNet3 and RNNoise only; the app offers just the models in its slice.
+            (FEATURE_ARGS=(--no-default-features --features "${OTO_FEATURES_X86_64:-dfn3}")
+                build_app --target "$t")
+        else
+            build_app --target "$t"
+        fi
         BINS+=("$TARGET_DIR/$t/release/oto-app")
     done
     APP_BIN="$OUT/oto-app.universal"

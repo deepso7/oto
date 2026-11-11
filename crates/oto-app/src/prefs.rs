@@ -89,8 +89,10 @@ impl Prefs {
         if let Some(v) = table.get("tier") {
             match v.as_str() {
                 Some("light") => p.tier = Tier::Light,
-                // Max isn't offered; a saved one (from before Low CPU mode) means the default.
-                Some("standard") | Some("max") => p.tier = Tier::Standard,
+                Some("standard") => p.tier = Tier::Standard,
+                // A tier this build doesn't offer falls back to the default in `State::new`.
+                Some("max") => p.tier = Tier::Max,
+                Some("fast") => p.tier = Tier::Fast,
                 _ => bad("tier", v),
             }
         }
@@ -120,6 +122,7 @@ enum TierDef {
     Light,
     Standard,
     Max,
+    Fast,
 }
 
 pub fn path() -> Option<PathBuf> {
@@ -181,13 +184,20 @@ mod tests {
     }
 
     #[test]
-    fn saved_tiers_map_to_low_cpu_mode() {
+    fn saved_tiers_round_trip() {
         let tier = |v: &str| Prefs::parse(&format!("tier = \"{v}\"\n")).0.tier;
         assert_eq!(tier("standard"), Tier::Standard);
         assert_eq!(tier("light"), Tier::Light);
-        // Max isn't offered any more and loads as the default, without a warning.
-        assert_eq!(tier("max"), Tier::Standard);
-        assert!(Prefs::parse("tier = \"max\"\n").1.is_empty());
+        assert_eq!(tier("max"), Tier::Max);
+        assert_eq!(tier("fast"), Tier::Fast);
+        for t in [Tier::Light, Tier::Standard, Tier::Max, Tier::Fast] {
+            let p = Prefs {
+                tier: t,
+                ..Prefs::default()
+            };
+            assert_eq!(Prefs::parse(&p.to_toml()), (p, Vec::new()));
+        }
+        assert!(!Prefs::parse("tier = \"huge\"\n").1.is_empty());
         assert_eq!(Prefs::default().tier, Tier::Standard);
         assert!(Prefs::default().to_toml().contains("tier = \"standard\""));
     }

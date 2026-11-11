@@ -21,8 +21,13 @@ pub const STRENGTHS: [(Strength, &str); 3] = [
     (Strength::Balanced, "Balanced"),
     (Strength::Strong, "Strong"),
 ];
-/// What "Low CPU mode" trades, under its switch in Settings.
-pub const LOW_CPU_ABOUT: &str = "Lower quality, but less CPU and less delay.";
+/// The model picker's rows, in the order offered. Only tiers in [`State::tiers`] show.
+pub const TIERS: [(Tier, &str); 4] = [
+    (Tier::Standard, "DeepFilterNet3"),
+    (Tier::Max, "DPDFNet-2 (stronger)"),
+    (Tier::Fast, "FastEnhancer-S (low delay)"),
+    (Tier::Light, "RNNoise (low CPU)"),
+];
 pub const SYSTEM_DEFAULT: &str = "System default";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -74,6 +79,7 @@ pub struct Probe {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Open {
     Device,
+    Model,
 }
 
 /// What the UI asks of the engine's host thread.
@@ -326,17 +332,32 @@ impl State {
         }
     }
 
-    /// "Low CPU mode": RNNoise ([`Tier::Light`]) instead of DeepFilterNet3 ([`Tier::Standard`]).
-    pub fn low_cpu(&self) -> bool {
-        self.prefs.tier == Tier::Light
+    /// The model picker's labels: one per tier this build offers.
+    pub fn tier_options(&self) -> Vec<&'static str> {
+        TIERS
+            .iter()
+            .filter(|(t, _)| self.tiers.contains(t))
+            .map(|(_, l)| *l)
+            .collect()
     }
 
-    pub fn set_low_cpu(&mut self, on: bool) {
-        self.set_tier(if on { Tier::Light } else { Tier::Standard });
+    pub fn tier_label(&self) -> &'static str {
+        TIERS
+            .iter()
+            .find(|(t, _)| *t == self.prefs.tier)
+            .map_or("", |(_, l)| *l)
     }
 
-    /// Whether the build offers a choice of model, so "Low CPU mode" does something.
-    pub fn offers_low_cpu(&self) -> bool {
+    /// Picks a model by its label in [`TIERS`].
+    pub fn choose_tier(&mut self, label: &str) {
+        self.open = None;
+        if let Some((t, _)) = TIERS.iter().find(|(_, l)| *l == label) {
+            self.set_tier(*t);
+        }
+    }
+
+    /// Whether the build offers a choice of model, so the picker does something.
+    pub fn offers_tiers(&self) -> bool {
         self.tiers.len() > 1
     }
 
@@ -980,39 +1001,33 @@ mod tests {
     }
 
     #[test]
-    fn low_cpu_mode_is_the_light_tier() {
+    fn the_model_picker_offers_only_this_builds_tiers() {
         let mut s = state();
-        s.tiers = vec![Tier::Light, Tier::Standard];
-        assert!(s.offers_low_cpu());
-        assert!(!s.low_cpu(), "off by default");
-        s.set_low_cpu(true);
-        assert!(s.low_cpu());
+        s.tiers = vec![Tier::Light, Tier::Standard, Tier::Max, Tier::Fast];
+        assert!(s.offers_tiers());
+        assert_eq!(s.tier_label(), "DeepFilterNet3");
+        assert_eq!(s.tier_options().len(), 4);
+        s.choose_tier("DPDFNet-2 (stronger)");
+        s.choose_tier("DPDFNet-2 (stronger)");
+        s.choose_tier("FastEnhancer-S (low delay)");
+        s.choose_tier("RNNoise (low CPU)");
+        s.choose_tier("no such model");
         assert_eq!(s.prefs.tier, Tier::Light);
-        s.set_low_cpu(true);
-        s.set_low_cpu(false);
-        assert_eq!(s.prefs.tier, Tier::Standard);
         assert_eq!(
             sent(&s),
             [
-                Command::SetTier(Tier::Light),
-                Command::SetTier(Tier::Standard)
+                Command::SetTier(Tier::Max),
+                Command::SetTier(Tier::Fast),
+                Command::SetTier(Tier::Light)
             ]
         );
-        s.tiers = vec![Tier::Standard];
-        assert!(!s.offers_low_cpu());
-    }
-
-    #[test]
-    fn a_saved_max_tier_runs_as_standard() {
-        let s = State::new(
-            Prefs {
-                tier: Tier::Max,
-                ..Prefs::default()
-            },
-            true,
+        s.tiers = vec![Tier::Light, Tier::Standard];
+        assert_eq!(
+            s.tier_options(),
+            ["DeepFilterNet3", "RNNoise (low CPU)"]
         );
-        assert_eq!(s.prefs.tier, Tier::Standard);
-        assert!(!s.low_cpu());
+        s.tiers = vec![Tier::Standard];
+        assert!(!s.offers_tiers());
     }
 
     #[test]
@@ -1035,8 +1050,8 @@ mod tests {
         // A recovery is about errors, not the model.
         s.on_event(Event::Recovered);
         assert!(s.model_notice.is_some());
-        // Changing the mode makes the engine try again, so the notice goes.
-        s.set_low_cpu(true);
+        // Changing the model makes the engine try again, so the notice goes.
+        s.set_tier(Tier::Light);
         assert_eq!(s.model_notice, None);
 
         // Nothing runs while no app records.
@@ -1046,10 +1061,12 @@ mod tests {
 
     #[test]
     fn an_unavailable_saved_tier_falls_back() {
-        let unavailable = [Tier::Light, Tier::Standard, Tier::Max]
+        let Some(unavailable) = [Tier::Light, Tier::Standard, Tier::Max, Tier::Fast]
             .into_iter()
             .find(|t| !oto_engine::available_tiers().contains(t))
-            .expect("some tier is always folded into another");
+        else {
+            return; // Every tier has its own model in this build.
+        };
         let s = State::new(
             Prefs {
                 tier: unavailable,
