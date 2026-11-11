@@ -24,7 +24,8 @@ The app and driver are ad-hoc signed. That is enough to run on the Mac that buil
 gives macOS an Info.plist to show the microphone prompt for. It is not distributable:
 Gatekeeper rejects it on other Macs.
 
-The binary is built for the host architecture only (the driver is universal).
+The app binary is built for the host architecture only, unless `UNIVERSAL=1` (the default for
+Developer ID builds). The driver is always universal.
 
 ## Developer ID build
 
@@ -45,30 +46,53 @@ With a Developer ID identity the script:
 
 No signing identity is stored in the repository; `SIGN_ID` always comes from your environment.
 
-## Not automated: what a release still needs
+## Releasing
 
-**None of the following is done by any script here.** A Developer ID build that skips them is
-still blocked by Gatekeeper when downloaded.
+### One-time setup
 
-1. Notarize and staple the app:
+1. **Developer ID Application certificate.** Requires the paid Apple Developer Program, and only
+   the team's Account Holder can create one. Xcode → Settings → Accounts → your team → Manage
+   Certificates → **+** → *Developer ID Application*. It then appears in
+   `security find-identity -v -p codesigning`. Back it up (Keychain Access → export as `.p12`):
+   Apple allows only a few per account.
+2. **Notarization credentials** in the keychain, under the profile name `oto`. Make an
+   app-specific password at <https://account.apple.com> (Sign-In and Security → App-Specific
+   Passwords), then:
 
    ```sh
-   ditto -c -k --keepParent target/bundle/Oto.app target/bundle/Oto.zip
-   xcrun notarytool submit target/bundle/Oto.zip --keychain-profile <profile> --wait
-   xcrun stapler staple target/bundle/Oto.app
-   spctl --assess --type execute -vv target/bundle/Oto.app
+   xcrun notarytool store-credentials oto --apple-id <apple-id> --team-id <TEAMID>
+   ```
+3. **Both Rust targets** for the universal binary:
+   `rustup target add aarch64-apple-darwin x86_64-apple-darwin`.
+
+### Each release
+
+1. Bump `version` under `[workspace.package]` in `Cargo.toml` (the app and the driver both take
+   it from there) and commit.
+2. Build:
+
+   ```sh
+   SIGN_ID="Developer ID Application: Your Name (TEAMID)" scripts/macos/release.sh
    ```
 
-   The embedded driver is notarized as part of the app, but a ticket can only be stapled to
-   the app, not to the driver copied out of it.
+   This runs `bundle.sh` with `UNIVERSAL=1`, notarizes and staples `Oto.app`, wraps it in a
+   DMG (the app plus an Applications link), signs, notarizes and staples the DMG, checks both
+   with `spctl`, and writes `target/dist/Oto-<version>.dmg` and its `.sha256`. It refuses a
+   dirty working tree unless `ALLOW_DIRTY=1`. If Apple rejects a submission, the script prints
+   the notarization log.
+3. Before publishing, test the DMG on a Mac (or a fresh user account) that has never run Oto:
+   download it through a browser so it's quarantined, drag Oto to Applications, open it, and go
+   through onboarding (driver install, microphone prompt).
+4. Publish: the script prints the `git tag` and `gh release create` commands. It never runs
+   them itself.
 
-2. Ship it in a container (a notarized `.dmg`, or eventually a notarized `.pkg` signed with a
-   "Developer ID Installer" identity that installs the app and the driver in one step). Neither
-   exists yet.
+The app is notarized on its own as well as inside the DMG, so it carries its own ticket after
+it's dragged out and opens offline the first time. The embedded driver is covered by the app's
+notarization, but a ticket can only be stapled to the app, not to the driver copied out of it.
 
-3. A universal (arm64 + x86_64) app binary, an app icon, and keeping the driver's
-   `CFBundleShortVersionString` (driver/macos/Info.plist) in step with the workspace version
-   are also still to do.
+## Still to do
 
-The Developer ID path above has not been exercised yet: it was written without a Developer ID
-certificate available.
+- An app icon: put artwork at `packaging/macos/AppIcon.icns` and `bundle.sh` picks it up.
+- Release from CI on a tag push (GitHub Actions on a macOS runner, with the certificate as a
+  `.p12` and an App Store Connect API key as repository secrets).
+- A Homebrew cask, and an updater.

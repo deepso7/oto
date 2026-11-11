@@ -32,19 +32,36 @@ else
 SIGN_FLAGS := --timestamp=none
 endif
 
+# The driver carries the workspace version (Cargo.toml), so a driver and the app that ships it
+# always agree. The Info.plist is regenerated on every run and replaced (forcing a re-sign) only
+# when its content differs: make 3.81's one-second timestamps can't be trusted for this.
+VERSION  ?= $(shell awk '/^\[workspace\.package\]/ { p = 1; next } /^\[/ { p = 0 } \
+                p && $$1 == "version" { gsub(/"/, "", $$3); print $$3; exit }' ../../Cargo.toml)
+ifeq ($(strip $(VERSION)),)
+$(error couldn't read the workspace version from ../../Cargo.toml)
+endif
+PLIST    := $(BUNDLE)/Contents/Info.plist
+
 all: sign $(VERIFY)
 
-$(BIN): src/OtoDriver.c Info.plist
+$(PLIST): FORCE
+	@mkdir -p $(BUNDLE)/Contents
+	@cp Info.plist $@.tmp
+	@plutil -replace CFBundleShortVersionString -string '$(VERSION)' $@.tmp
+	@plutil -replace CFBundleVersion -string '$(VERSION)' $@.tmp
+	@if cmp -s $@.tmp $@; then rm -f $@.tmp; else \
+		echo "Info.plist: version $(VERSION)"; mv $@.tmp $@; rm -f $(STAMP); fi
+
+$(BIN): src/OtoDriver.c
 	@mkdir -p $(BUNDLE)/Contents/MacOS
 	@rm -f $(STAMP)
-	cp Info.plist $(BUNDLE)/Contents/Info.plist
 	clang $(CFLAGS) -bundle -fvisibility=hidden -o $@ src/OtoDriver.c \
 		-framework CoreFoundation -framework CoreAudio
 
 # Signs when the binary was rebuilt or the identity/flags differ from the last signing, which
 # $(STAMP) records. No fallback: if SIGN_ID is not in the keychain, codesign fails and so does
 # the build.
-sign: $(BIN)
+sign: $(BIN) $(PLIST)
 	@if [ "$$(id -u)" = 0 ]; then echo "error: do not build the driver as root" >&2; exit 1; fi
 	@cfg='$(SIGN_ID) $(SIGN_FLAGS)'; \
 	if [ -f $(STAMP) ] && [ "$$(cat $(STAMP))" = "$$cfg" ]; then exit 0; fi; \
@@ -70,4 +87,5 @@ release:
 clean:
 	rm -rf $(BUILD)
 
-.PHONY: all sign release clean
+.PHONY: all sign release clean FORCE
+FORCE:

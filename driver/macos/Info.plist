@@ -14,10 +14,11 @@
 	<string>OtoMicrophone</string>
 	<key>CFBundlePackageType</key>
 	<string>BNDL</string>
+	<!-- Both versions are replaced with the workspace version (Cargo.toml) by the Makefile. -->
 	<key>CFBundleShortVersionString</key>
-	<string>0.1.0</string>
+	<string>0.0.0</string>
 	<key>CFBundleVersion</key>
-	<string>1</string>
+	<string>0.0.0</string>
 	<key>CFBundleSupportedPlatforms</key>
 	<array>
 		<string>MacOSX</string>
