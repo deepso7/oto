@@ -427,6 +427,39 @@ fn dfn3_removes_noise_keeps_speech_and_limits_natively() {
     }
 }
 
+/// DPDFNet-2 and FastEnhancer-S on their own: real output (not silence or the dry signal),
+/// strong suppression of noise, and `reset` restoring the exact starting state.
+#[cfg(feature = "onnx")]
+#[test]
+fn onnx_models_denoise_and_reset_to_the_same_output() {
+    let mut models: Vec<Box<dyn Denoiser>> = vec![Box::new(DpdfNet::new().unwrap())];
+    #[cfg(feature = "fastenhancer")]
+    models.push(Box::new(FastEnhancer::new().unwrap()));
+    let run = |m: &mut Box<dyn Denoiser>, x: &[f32]| {
+        let n = m.frame_size();
+        let mut out = vec![0.0; x.len() / n * n];
+        for (i, o) in x.chunks_exact(n).zip(out.chunks_exact_mut(n)) {
+            m.process_frame(i, o);
+        }
+        out
+    };
+    let noise = pink_noise(0.02, SR * 3, 7);
+    let speech = noisy_speech(SR * 3, 3);
+    for (i, m) in models.iter_mut().enumerate() {
+        // The dry signal would be 0 dB; both models do far better on this steady noise.
+        let out = run(m, &noise);
+        let r = -db(rms(&out[SR..]) / rms(&noise[SR..out.len()]));
+        eprintln!("model {i}: pink noise attenuated {r:.1} dB");
+        assert!(r > 6.0, "model {i}: noise attenuated only {r:.1} dB");
+        m.reset();
+        let first = run(m, &speech);
+        assert!(rms(&first[SR..]) > 1e-3, "no output on noisy speech");
+        assert!(first.iter().all(|v| v.is_finite()));
+        m.reset();
+        assert_eq!(first, run(m, &speech), "reset does not restore the start state");
+    }
+}
+
 /// Prints the bake-off numbers. `cargo test -p oto-dsp --release [--features dfn3] -- --ignored --nocapture bench_all`
 #[test]
 #[ignore]

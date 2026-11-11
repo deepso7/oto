@@ -1158,8 +1158,16 @@ mod tests {
         assert!(runtime(s).find("model-row").is_none());
 
         let mut s = installed();
-        s.tiers = vec![Tier::Light, Tier::Standard];
-        assert!(runtime(s).find("model-row").is_some());
+        s.tiers = vec![Tier::Light, Tier::Standard, Tier::Max, Tier::Fast];
+        let mut rt = runtime(s);
+        assert!(rt.find("model-row").is_some());
+        // Options follow TIERS: DeepFilterNet3, DPDFNet-2, FastEnhancer-S, RNNoise.
+        click(&mut rt, "model-picker-trigger");
+        assert_eq!(rt.state.open, Some(Open::Model));
+        click(&mut rt, "option1");
+        assert_eq!(rt.state.prefs.tier, Tier::Max);
+        assert_eq!(rt.state.open, None, "choosing closes the menu");
+        assert_eq!(sent(&rt), [Command::SetTier(Tier::Max)]);
 
         // What this build offers decides the default state.
         assert_eq!(

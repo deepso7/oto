@@ -99,6 +99,10 @@ if [ "$UNIVERSAL" = 1 ]; then
     lipo -create -output "$APP_BIN" "${BINS[@]}"
 else
     echo "==> oto-app $VERSION (release)"
+    if [ "$(uname -m)" = x86_64 ] && [ -z "${OTO_FEATURES:-}" ]; then
+        # No prebuilt ONNX Runtime for Intel Macs (see the universal build above).
+        FEATURE_ARGS=(--no-default-features --features "${OTO_FEATURES_X86_64:-dfn3}")
+    fi
     build_app
     APP_BIN="$TARGET_DIR/release/oto-app"
 fi
