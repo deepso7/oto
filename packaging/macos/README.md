@@ -109,6 +109,11 @@ release-plz workflow calls it after it tags `vX.Y.Z` and creates the release. Th
 
 The build scripts come from the tag, so only tags made after this pipeline existed can be built.
 
+Pull requests that change `scripts/macos/`, `packaging/macos/`, `driver/macos/` or this
+workflow get a build-only run: steps 3–5 and 7 on the PR's code, with the signed, notarized
+DMG kept as a workflow artifact and nothing attached to a release. PRs from forks skip it,
+since they get no secrets.
+
 ### Secrets
 
 Set these under the repository's Settings → Secrets and variables → Actions → Secrets.

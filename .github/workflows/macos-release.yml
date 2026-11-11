@@ -1,6 +1,9 @@
 # Builds the signed, notarized macOS DMG for an existing GitHub release and attaches it.
 # Called by release-plz after it tags vX.Y.Z and creates the release; can also be run by hand
 # (Actions → macOS release → Run workflow) to rebuild or backfill a release.
+# On pull requests that touch the release pipeline it does a build-only run: it signs and
+# notarizes the DMG for the PR's code and keeps it as a workflow artifact, but uploads nothing
+# to a release. Fork PRs are skipped, since they get no secrets.
 # Secrets and setup: packaging/macos/README.md, "Releasing from CI".
 name: macOS release
 
@@ -11,17 +14,24 @@ on:
   workflow_dispatch:
     inputs:
       tag: { type: string, required: true }   # manual re-run / backfill for an existing release
+  pull_request:
+    paths:
+      - .github/workflows/macos-release.yml
+      - scripts/macos/**
+      - packaging/macos/**
+      - driver/macos/**
 
 permissions:
   contents: write
 
 concurrency:
-  group: macos-release-${{ inputs.tag }}
-  cancel-in-progress: false
+  group: macos-release-${{ inputs.tag || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   dmg:
-    name: Build and upload DMG (${{ inputs.tag }})
+    name: Build and upload DMG (${{ inputs.tag || 'build only' }})
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
     runs-on: macos-26
     timeout-minutes: 120
     env:
@@ -29,6 +39,7 @@ jobs:
       GH_TOKEN: ${{ github.token }}
     steps:
       - name: Check the tag and its release
+        if: ${{ inputs.tag != '' }}
         run: |
           if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             echo "::error::tag '$TAG' is not of the form vX.Y.Z"
@@ -41,14 +52,14 @@ jobs:
 
       - uses: actions/checkout@v7
         with:
-          ref: refs/tags/${{ inputs.tag }}
+          ref: ${{ inputs.tag && format('refs/tags/{0}', inputs.tag) || '' }}
           persist-credentials: false
 
       - name: Check the tag matches the workspace version
         run: |
           version="$(awk '/^\[workspace\.package\]/ { p = 1; next } /^\[/ { p = 0 }
               p && $1 == "version" { gsub(/"/, "", $3); print $3; exit }' Cargo.toml)"
-          if [ "v$version" != "$TAG" ]; then
+          if [ -n "$TAG" ] && [ "v$version" != "$TAG" ]; then
             echo "::error file=Cargo.toml::tag $TAG does not match the workspace version in Cargo.toml (${version:-none found}, expected ${TAG#v})"
             exit 1
           fi
@@ -102,6 +113,7 @@ jobs:
           overwrite: true
 
       - name: Attach the DMG to the release
+        if: ${{ inputs.tag != '' }}
         run: |
           dmg="target/dist/Oto-$VERSION.dmg"
           gh release upload "$TAG" "$dmg" "$dmg.sha256" --clobber --repo "$GITHUB_REPOSITORY"
