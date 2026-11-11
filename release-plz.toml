@@ -1,0 +1,35 @@
+# release-plz: https://release-plz.dev/docs/config
+#
+# Oto ships as one product with one version: every crate inherits `[workspace.package]
+# version`, so release-plz bumps them all to the same version (the highest bump any crate
+# needs). `oto-app` stands for the product. Only it gets the `v<version>` tag, the GitHub
+# release and the root CHANGELOG.md, whose entries also take in the other crates' commits.
+#
+# Nothing goes to crates.io (oto-app depends on a git-only crate). `git_only` reads the
+# previous version from the `v<version>` git tags instead of a registry and skips
+# `cargo publish`.
+
+[workspace]
+git_only = true
+# cargo-semver-checks builds rustdoc for library APIs, which an app has no use for (and
+# oto-app doesn't build on Linux).
+semver_check = false
+# Leave Cargo.lock alone in the release PR; dependency bumps are deliberate (Rune is pinned).
+dependencies_update = false
+# Release only when the release PR is merged, not on every push to main.
+release_always = false
+git_tag_name = "v{{ version }}"
+git_release_name = "v{{ version }}"
+pr_name = "chore: release v{{ version }}"
+# Tags, releases and changelog entries come from `oto-app` only (below).
+git_tag_enable = false
+git_release_enable = false
+changelog_update = false
+changelog_path = "./CHANGELOG.md"
+
+[[package]]
+name = "oto-app"
+git_tag_enable = true
+git_release_enable = true
+changelog_update = true
+changelog_include = ["oto-dsp", "oto-engine", "oto-cli"]

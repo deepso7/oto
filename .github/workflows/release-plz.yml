@@ -1,0 +1,89 @@
+# Release automation with release-plz (https://release-plz.dev, config in release-plz.toml).
+#
+# On every push to main:
+# - release-pr opens or updates a PR that bumps the workspace version and CHANGELOG.md.
+# - release does nothing until that PR is merged (`release_always = false`). Then it tags
+#   `v<version>` and creates the GitHub release, and `macos` attaches the notarized DMG.
+#
+# Uses GITHUB_TOKEN. Tags it pushes don't trigger other workflows, which is why the DMG build
+# is called from here instead of running on tag push. The release PR needs Settings →
+# Actions → General → "Allow GitHub Actions to create and approve pull requests".
+name: Release-plz
+
+on:
+  push:
+    branches: [main]
+
+permissions: {}
+
+jobs:
+  release:
+    name: Release
+    runs-on: ubuntu-latest
+    if: ${{ github.repository_owner == 'deepso7' }}
+    permissions:
+      contents: write # push the tag, create the release
+      pull-requests: read # find the release PR the merge commit came from
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install Rust toolchain (rust-toolchain.toml)
+        run: rustup toolchain install
+      - name: Run release-plz
+        id: release-plz
+        uses: release-plz/action@66b324fd6c72d05d2a08568492ecdd62bfb8a62b # v0.5.148
+        with:
+          command: release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # Every crate shares the version, so each appears in `releases` with the same tag; only
+      # oto-app actually gets the tag and GitHub release.
+      - name: Read the release tag
+        id: tag
+        env:
+          RELEASES: ${{ steps.release-plz.outputs.releases }}
+        run: |
+          tag=$(jq -r '[.[]? | select(.package_name == "oto-app") | .tag][0] // empty' <<< "${RELEASES:-[]}")
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "release tag: ${tag:-none}"
+
+  release-pr:
+    name: Release PR
+    runs-on: ubuntu-latest
+    if: ${{ github.repository_owner == 'deepso7' }}
+    permissions:
+      contents: write # push the release branch
+      pull-requests: write # open and update the release PR
+    concurrency:
+      group: release-plz-${{ github.ref }}
+      cancel-in-progress: false
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install Rust toolchain (rust-toolchain.toml)
+        run: rustup toolchain install
+      - name: Run release-plz
+        uses: release-plz/action@66b324fd6c72d05d2a08568492ecdd62bfb8a62b # v0.5.148
+        with:
+          command: release-pr
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  macos:
+    name: macOS DMG
+    needs: release
+    if: ${{ needs.release.outputs.tag != '' }}
+    permissions:
+      contents: write
+    uses: ./.github/workflows/macos-release.yml
+    with:
+      tag: ${{ needs.release.outputs.tag }}
+    secrets: inherit

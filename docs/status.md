@@ -19,7 +19,7 @@ Measured on an M2 Pro running macOS 27.0.1, 11 Nov 2026:
 - **Soak**: 30 minutes of DeepFilterNet3 with a forced client: no underruns, resyncs or starvations; worker max 2.0 ms. A first run that overlapped a full workspace build had one underrun and no late callbacks.
 
 Not done yet:
-- Developer ID signing, notarization and a notarized installer. `packaging/macos/README.md` lists the manual steps.
+- A published release. `scripts/macos/release.sh` builds a universal (arm64 + x86_64), Developer ID signed, notarized and stapled app inside a notarized DMG (0.0.1: 48 MB, accepted by Apple and by `spctl` on 11 Nov 2026), but the DMG hasn't been installed on a Mac that never ran Oto. See `packaging/macos/README.md`.
 - A real install, the admin prompt and the microphone prompt have not been exercised from the bundled app.
 - "Hear the difference" test, and a listening comparison of the two modes with a real TV recording.
 - Which apps are using Oto Microphone (only "in use" is shown).

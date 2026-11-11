@@ -7,7 +7,10 @@
 #   scripts/macos/bundle.sh                                         ad-hoc signed, for this Mac
 #   SIGN_ID="Developer ID Application: Name (TEAMID)" scripts/macos/bundle.sh
 #                                                                   hardened runtime + timestamp
+#   UNIVERSAL=1 scripts/macos/bundle.sh                             arm64 + x86_64 app binary
 #
+# UNIVERSAL defaults to 1 for Developer ID builds and 0 otherwise (host architecture only). It
+# needs both Rust targets: rustup target add aarch64-apple-darwin x86_64-apple-darwin
 # SIGN_ID is a certificate name or SHA-1 hash from `security find-identity -v -p codesigning`.
 # Run as yourself, never as root. Notarization is NOT done here.
 set -euo pipefail
@@ -46,27 +49,59 @@ if [ "$SIGN_ID" != "-" ]; then
     fi
 fi
 
-echo "==> Driver"
-if [ "$RELEASE" -eq 1 ]; then
-    make -C "$ROOT/driver/macos" release SIGN_ID="$SIGN_ID"
+UNIVERSAL="${UNIVERSAL:-$RELEASE}"
+if [ "$UNIVERSAL" = 1 ]; then
+    TARGETS=(aarch64-apple-darwin x86_64-apple-darwin)
+    for t in "${TARGETS[@]}"; do
+        (cd "$ROOT" && rustup target list --installed) | grep -qx "$t" ||
+            die "UNIVERSAL=1 needs the $t Rust target: rustup target add $t"
+    done
 else
-    make -C "$ROOT/driver/macos" SIGN_ID="$SIGN_ID"
+    TARGETS=()
 fi
 
-echo "==> oto-app $VERSION (release)"
-export MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-12.0}"
+echo "==> Driver"
 if [ "$RELEASE" -eq 1 ]; then
-    (cd "$ROOT" && OTO_TEAM_ID="$TEAM_ID" cargo build --release -p oto-app)
+    make -C "$ROOT/driver/macos" release SIGN_ID="$SIGN_ID" VERSION="$VERSION"
 else
-    (cd "$ROOT" && env -u OTO_TEAM_ID cargo build --release -p oto-app)
+    make -C "$ROOT/driver/macos" SIGN_ID="$SIGN_ID" VERSION="$VERSION"
+fi
+
+export MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-12.0}"
+build_app() {
+    if [ "$RELEASE" -eq 1 ]; then
+        (cd "$ROOT" && OTO_TEAM_ID="$TEAM_ID" cargo build --release -p oto-app "$@")
+    else
+        (cd "$ROOT" && env -u OTO_TEAM_ID cargo build --release -p oto-app "$@")
+    fi
+}
+if [ "$UNIVERSAL" = 1 ]; then
+    BINS=()
+    for t in "${TARGETS[@]}"; do
+        echo "==> oto-app $VERSION (release, $t)"
+        build_app --target "$t"
+        BINS+=("$TARGET_DIR/$t/release/oto-app")
+    done
+    APP_BIN="$OUT/oto-app.universal"
+    mkdir -p "$OUT"
+    lipo -create -output "$APP_BIN" "${BINS[@]}"
+else
+    echo "==> oto-app $VERSION (release)"
+    build_app
+    APP_BIN="$TARGET_DIR/release/oto-app"
 fi
 
 echo "==> $APP"
 mkdir -p "$OUT"
 rm -rf "$OUT/Oto.app"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
-cp "$TARGET_DIR/release/oto-app" "$APP/Contents/MacOS/oto-app"
+cp "$APP_BIN" "$APP/Contents/MacOS/oto-app"
 sed "s/@VERSION@/$VERSION/g" "$PKG/Info.plist.in" > "$APP/Contents/Info.plist"
+# The app icon is optional until there is artwork: packaging/macos/AppIcon.icns, if present.
+if [ -f "$PKG/AppIcon.icns" ]; then
+    cp "$PKG/AppIcon.icns" "$APP/Contents/Resources/AppIcon.icns"
+    plutil -insert CFBundleIconFile -string AppIcon "$APP/Contents/Info.plist"
+fi
 plutil -lint -s "$APP/Contents/Info.plist" || die "the generated Info.plist is invalid."
 printf 'APPL????' > "$APP/Contents/PkgInfo"
 cp "$ROOT/LICENSE-MIT" "$ROOT/LICENSE-APACHE" "$ROOT/THIRD_PARTY_NOTICES.md" "$APP/Contents/Resources/"
@@ -94,7 +129,7 @@ codesign --verify --strict "$APP/Contents/Resources/$DRIVER"
 echo
 echo "Built $APP ($(du -sh "$APP" | cut -f1 | tr -d " "), version $VERSION, $(lipo -archs "$APP/Contents/MacOS/oto-app"))"
 if [ "$RELEASE" -eq 1 ]; then
-    echo "Signed with Developer ID, team $TEAM_ID. NOT notarized: see packaging/macos/README.md."
+    echo "Signed with Developer ID, team $TEAM_ID. NOT notarized: scripts/macos/release.sh does that."
 else
     echo "Not a distributable build (no Developer ID signature, not notarized)."
 fi
