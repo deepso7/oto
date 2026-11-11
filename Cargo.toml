@@ -8,6 +8,8 @@ default-members = ["crates/oto-dsp", "crates/oto-engine", "crates/oto-cli"]
 version = "0.0.1"
 edition = "2024"
 license = "MIT OR Apache-2.0"
+# Not on crates.io (oto-app needs git-only crates); releases are GitHub releases (release-plz.toml).
+publish = false
 
 [workspace.dependencies]
 # Without default features, so each crate opts in to `dfn3` itself and forwards it.

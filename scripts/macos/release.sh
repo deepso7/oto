@@ -10,6 +10,8 @@
 #                   `security find-identity -v -p codesigning`). Required.
 #   NOTARY_PROFILE  notarytool keychain profile (default: oto), made once with
 #                   `xcrun notarytool store-credentials oto --apple-id … --team-id …`
+#   NOTARY_KEYCHAIN  keychain file holding that profile, if not the default keychain (CI sets
+#                   this; see scripts/macos/ci-keychain.sh)
 #   ALLOW_DIRTY=1   build from a working tree with uncommitted changes (not for real releases)
 #
 # Writes target/dist/Oto-<version>.dmg and Oto-<version>.dmg.sha256. Publishing is a separate,
@@ -21,6 +23,8 @@ TARGET_DIR="${CARGO_TARGET_DIR:-$ROOT/target}"
 APP="$TARGET_DIR/bundle/Oto.app"
 DIST="$TARGET_DIR/dist"
 NOTARY_PROFILE="${NOTARY_PROFILE:-oto}"
+NOTARY_AUTH=(--keychain-profile "$NOTARY_PROFILE")
+[ -z "${NOTARY_KEYCHAIN:-}" ] || NOTARY_AUTH+=(--keychain "$NOTARY_KEYCHAIN")
 
 die() {
     echo "error: $*" >&2
@@ -31,7 +35,7 @@ die() {
 [ -n "${SIGN_ID:-}" ] || die "set SIGN_ID to your Developer ID Application identity."
 security find-identity -v -p codesigning | grep -F -- "$SIGN_ID" | grep -q "Developer ID Application" ||
     die "SIGN_ID '$SIGN_ID' is not a Developer ID Application identity in the keychain."
-xcrun notarytool history --keychain-profile "$NOTARY_PROFILE" > /dev/null 2>&1 ||
+xcrun notarytool history "${NOTARY_AUTH[@]}" > /dev/null 2>&1 ||
     die "no working notarytool profile '$NOTARY_PROFILE'. Create it with:
     xcrun notarytool store-credentials $NOTARY_PROFILE --apple-id <apple-id> --team-id <TEAMID>"
 
@@ -43,14 +47,14 @@ fi
 notarize() {
     local file="$1" result id status
     echo "Submitting $(basename "$file") for notarization (usually a few minutes)"
-    result="$(xcrun notarytool submit "$file" --keychain-profile "$NOTARY_PROFILE" \
+    result="$(xcrun notarytool submit "$file" "${NOTARY_AUTH[@]}" \
         --wait --output-format json)" || true
     id="$(plutil -extract id raw - <<< "$result" 2>/dev/null || true)"
     status="$(plutil -extract status raw - <<< "$result" 2>/dev/null || true)"
     if [ "$status" != "Accepted" ]; then
         echo "$result" >&2
         if [ -n "$id" ]; then
-            xcrun notarytool log "$id" --keychain-profile "$NOTARY_PROFILE" >&2 || true
+            xcrun notarytool log "$id" "${NOTARY_AUTH[@]}" >&2 || true
         fi
         die "notarization of $(basename "$file") failed (status: ${status:-unknown})."
     fi

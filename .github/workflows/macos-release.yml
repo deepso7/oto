@@ -1,0 +1,115 @@
+# Builds the signed, notarized macOS DMG for an existing GitHub release and attaches it.
+# Called by release-plz after it tags vX.Y.Z and creates the release; can also be run by hand
+# (Actions → macOS release → Run workflow) to rebuild or backfill a release.
+# Secrets and setup: packaging/macos/README.md, "Releasing from CI".
+name: macOS release
+
+on:
+  workflow_call:
+    inputs:
+      tag: { type: string, required: true }   # e.g. v0.1.0; the GitHub release already exists
+  workflow_dispatch:
+    inputs:
+      tag: { type: string, required: true }   # manual re-run / backfill for an existing release
+
+permissions:
+  contents: write
+
+concurrency:
+  group: macos-release-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  dmg:
+    name: Build and upload DMG (${{ inputs.tag }})
+    runs-on: macos-26
+    timeout-minutes: 120
+    env:
+      TAG: ${{ inputs.tag }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Check the tag and its release
+        run: |
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::tag '$TAG' is not of the form vX.Y.Z"
+            exit 1
+          fi
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json tagName,isDraft > /dev/null || {
+            echo "::error::there is no GitHub release for $TAG; create it first"
+            exit 1
+          }
+
+      - uses: actions/checkout@v7
+        with:
+          ref: refs/tags/${{ inputs.tag }}
+          persist-credentials: false
+
+      - name: Check the tag matches the workspace version
+        run: |
+          version="$(awk '/^\[workspace\.package\]/ { p = 1; next } /^\[/ { p = 0 }
+              p && $1 == "version" { gsub(/"/, "", $3); print $3; exit }' Cargo.toml)"
+          if [ "v$version" != "$TAG" ]; then
+            echo "::error file=Cargo.toml::tag $TAG does not match the workspace version in Cargo.toml (${version:-none found}, expected ${TAG#v})"
+            exit 1
+          fi
+          # The build scripts come from the tag, so tags older than this pipeline can't be built.
+          if [ ! -f scripts/macos/ci-keychain.sh ]; then
+            echo "::error::$TAG predates scripts/macos/ci-keychain.sh and can't be built in CI"
+            exit 1
+          fi
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+          echo "Building Oto $version from $(git rev-parse HEAD)"
+
+      - name: Install the Rust toolchain
+        run: |
+          rustup toolchain install   # the one pinned in rust-toolchain.toml
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin
+          rustc --version
+          xcodebuild -version
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: macos-release
+
+      - name: Set up signing and notarization
+        env:
+          MACOS_CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          APPLE_API_KEY_P8_BASE64: ${{ secrets.APPLE_API_KEY_P8_BASE64 }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          # Public identity name, not a secret; override with the MACOS_SIGN_ID variable.
+          SIGN_ID: "${{ vars.MACOS_SIGN_ID || 'Developer ID Application: Deepanshu Singh (T9DPKXJBUS)' }}"
+        run: scripts/macos/ci-keychain.sh setup
+
+      # SIGN_ID, NOTARY_PROFILE and NOTARY_KEYCHAIN come from the previous step.
+      - name: Build, sign and notarize
+        run: scripts/macos/release.sh
+
+      - name: Upload the DMG as a workflow artifact
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: Oto-${{ env.VERSION }}-dmg
+          path: |
+            target/dist/Oto-*.dmg
+            target/dist/Oto-*.dmg.sha256
+          if-no-files-found: ignore
+          retention-days: 7
+          overwrite: true
+
+      - name: Attach the DMG to the release
+        run: |
+          dmg="target/dist/Oto-$VERSION.dmg"
+          gh release upload "$TAG" "$dmg" "$dmg.sha256" --clobber --repo "$GITHUB_REPOSITORY"
+          echo "Attached $(basename "$dmg") to $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/tag/$TAG"
+          cat "$dmg.sha256"
+
+      - name: Remove signing credentials
+        if: ${{ always() }}
+        run: |
+          # Absent if the job failed before checkout, in which case there's nothing to clean.
+          if [ -f scripts/macos/ci-keychain.sh ]; then scripts/macos/ci-keychain.sh cleanup; fi
