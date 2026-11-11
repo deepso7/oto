@@ -351,6 +351,8 @@ pub fn encode_model(m: Option<Model>) -> u8 {
         None => 0,
         Some(Model::RNNoise) => 1,
         Some(Model::DeepFilterNet3) => 2,
+        Some(Model::DpdfNet) => 3,
+        Some(Model::FastEnhancer) => 4,
     }
 }
 
@@ -358,6 +360,8 @@ pub fn decode_model(v: u8) -> Option<Model> {
     match v {
         1 => Some(Model::RNNoise),
         2 => Some(Model::DeepFilterNet3),
+        3 => Some(Model::DpdfNet),
+        4 => Some(Model::FastEnhancer),
         _ => None,
     }
 }
@@ -493,7 +497,7 @@ pub enum Placement {
 pub fn placement_for(model: Model) -> Placement {
     match model {
         Model::RNNoise => Placement::Inline,
-        Model::DeepFilterNet3 => Placement::Worker,
+        Model::DeepFilterNet3 | Model::DpdfNet | Model::FastEnhancer => Placement::Worker,
     }
 }
 

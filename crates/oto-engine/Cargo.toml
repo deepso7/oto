@@ -6,10 +6,14 @@ license.workspace = true
 publish.workspace = true
 
 [features]
-default = ["dfn3"]
+default = ["dfn3", "onnx", "fastenhancer"]
 # Run DeepFilterNet3 for the Standard and Max tiers (see `model_for`). Without it every tier
 # is RNNoise and the build has no tract.
 dfn3 = ["oto-dsp/dfn3"]
+# DPDFNet-2 (Max tier) through ONNX Runtime. Without it Max folds into Standard.
+onnx = ["oto-dsp/onnx"]
+# FastEnhancer-S (Fast tier). Evaluation only: weights licence unstated, left out of releases.
+fastenhancer = ["onnx", "oto-dsp/fastenhancer"]
 
 [dependencies]
 oto-dsp.workspace = true

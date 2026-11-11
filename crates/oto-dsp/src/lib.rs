@@ -7,12 +7,18 @@ mod bench;
 #[cfg(feature = "dfn3")]
 mod dfn3;
 pub mod filters;
+#[cfg(feature = "onnx")]
+mod onnx;
 mod rnnoise;
 pub mod signal;
 
 pub use bench::{BENCH_BLOCK, BenchReport, bench, try_bench};
 #[cfg(feature = "dfn3")]
 pub use dfn3::DeepFilterNet3;
+#[cfg(feature = "onnx")]
+pub use onnx::DpdfNet;
+#[cfg(feature = "fastenhancer")]
+pub use onnx::FastEnhancer;
 pub use rnnoise::RnNoise;
 
 use filters::{Delay, HighPass, Limiter};
@@ -190,16 +196,28 @@ pub enum Model {
     /// DeepFilterNet3 via `libDF` + `tract`. Needs the `dfn3` cargo feature.
     #[cfg_attr(feature = "dfn3", default)]
     DeepFilterNet3,
+    /// DPDFNet-2 (48 kHz) via ONNX Runtime. Needs the `onnx` cargo feature.
+    DpdfNet,
+    /// FastEnhancer-S (48 kHz) via ONNX Runtime. Needs the `fastenhancer` cargo feature. Weights
+    /// licence unstated upstream: for local evaluation, not cleared to ship.
+    FastEnhancer,
 }
 
 impl Model {
-    pub const ALL: [Model; 2] = [Model::RNNoise, Model::DeepFilterNet3];
+    pub const ALL: [Model; 4] = [
+        Model::RNNoise,
+        Model::DeepFilterNet3,
+        Model::DpdfNet,
+        Model::FastEnhancer,
+    ];
 
     /// Whether this build can run the model.
     pub fn available(self) -> bool {
         match self {
             Model::RNNoise => true,
             Model::DeepFilterNet3 => cfg!(feature = "dfn3"),
+            Model::DpdfNet => cfg!(feature = "onnx"),
+            Model::FastEnhancer => cfg!(feature = "fastenhancer"),
         }
     }
 
@@ -207,6 +225,8 @@ impl Model {
         match self {
             Model::RNNoise => "RNNoise",
             Model::DeepFilterNet3 => "DeepFilterNet3",
+            Model::DpdfNet => "DPDFNet-2",
+            Model::FastEnhancer => "FastEnhancer-S",
         }
     }
 
@@ -219,6 +239,18 @@ impl Model {
             Model::DeepFilterNet3 => {
                 Err("DeepFilterNet3 is not in this build (enable the `dfn3` feature)".into())
             }
+            #[cfg(feature = "onnx")]
+            Model::DpdfNet => Ok(Box::new(DpdfNet::new()?)),
+            #[cfg(not(feature = "onnx"))]
+            Model::DpdfNet => {
+                Err("DPDFNet-2 is not in this build (enable the `onnx` feature)".into())
+            }
+            #[cfg(feature = "fastenhancer")]
+            Model::FastEnhancer => Ok(Box::new(FastEnhancer::new()?)),
+            #[cfg(not(feature = "fastenhancer"))]
+            Model::FastEnhancer => Err(
+                "FastEnhancer-S is not in this build (enable the `fastenhancer` feature)".into(),
+            ),
         }
     }
 }

@@ -11,7 +11,7 @@ use rune_kit::{
 
 use crate::meter::{BAR_H, BAR_W};
 use crate::permission::Mic;
-use crate::state::{EngineState, HEAR_TEST, Install, LOW_CPU_ABOUT, Open, Page, STRENGTHS, State};
+use crate::state::{EngineState, HEAR_TEST, Install, Open, Page, STRENGTHS, State};
 
 pub const WIDTH: f32 = 340.0;
 const PAD: f32 = 16.0;
@@ -447,11 +447,32 @@ fn main_page(s: &State, p: &Paint, layer: &mut Vec<El>) -> El {
     .label("Strength")
     .on_pick(|s: &mut State, i: usize, _| s.set_strength(STRENGTHS[i].0))
     .build(&p.k);
-    let controls = card(p, "controls")
+    let mut controls = card(p, "controls")
         .py(12.0)
         .gap(12.0)
         .child(labelled(p, "mic-row", "Microphone", device))
         .child(labelled(p, "strength-row", "Strength", strength));
+    // Only when the choice changes something: with one model in the build there's no picker.
+    if s.offers_tiers() {
+        let options = s.tier_options();
+        let model = Select::new("model-picker", &options)
+            .appearance(SelectAppearance::Field)
+            .width(CARD_INNER)
+            .label("Model")
+            .current(Some(s.tier_label()))
+            .open(s.open == Some(Open::Model))
+            .on_toggle(|s: &mut State| s.toggle_open(Open::Model))
+            .on_close(|s: &mut State| s.open = None)
+            .on_choose(|s: &mut State, v: &str, _| s.choose_tier(v))
+            .placement(Placement::BottomStart)
+            .build(&p.k, layer);
+        if s.open == Some(Open::Model)
+            && let Some(list) = layer.pop()
+        {
+            layer.push(list.w(CARD_INNER));
+        }
+        controls = controls.child(labelled(p, "model-row", "Model", model));
+    }
 
     let metering = on && s.clients_active;
     let mut meter = card(p, "meter")
@@ -660,16 +681,6 @@ fn settings_page(s: &State, p: &Paint) -> El {
             )
             .pb(8.0),
         );
-    // Only when the choice changes something: with one model in the build there's no switch.
-    if s.offers_low_cpu() {
-        let low_cpu = small_switch(p, "low-cpu", "Low CPU mode", s.low_cpu(), true, |s| {
-            s.set_low_cpu(!s.low_cpu())
-        });
-        general = general
-            .child(separator(p, "sep-low-cpu"))
-            .child(field_row(p, "low-cpu-row", "Low CPU mode", low_cpu))
-            .child(caption(p, "low-cpu-about", LOW_CPU_ABOUT).pb(8.0));
-    }
 
     let busy = s.install.busy();
     let install = Button::new(match (&s.install, s.driver_installed || s.driver_on_disk) {
@@ -1141,35 +1152,26 @@ mod tests {
     }
 
     #[test]
-    fn low_cpu_mode_shows_only_with_a_choice_and_switches_tiers() {
+    fn the_model_picker_shows_only_with_a_choice() {
         let mut s = installed();
-        s.page = Page::Settings;
         s.tiers = vec![Tier::Standard];
-        assert!(runtime(s).find("low-cpu-row").is_none());
+        assert!(runtime(s).find("model-row").is_none());
 
         let mut s = installed();
-        s.page = Page::Settings;
-        s.tiers = vec![Tier::Light, Tier::Standard];
+        s.tiers = vec![Tier::Light, Tier::Standard, Tier::Max, Tier::Fast];
         let mut rt = runtime(s);
-        assert!(rt.find("low-cpu-about").is_some());
-        assert!(!rt.state.low_cpu(), "off by default");
-        click(&mut rt, "low-cpu");
-        assert_eq!(rt.state.prefs.tier, Tier::Light);
-        click(&mut rt, "low-cpu");
-        assert_eq!(rt.state.prefs.tier, Tier::Standard);
-        assert_eq!(
-            sent(&rt),
-            [
-                Command::SetTier(Tier::Light),
-                Command::SetTier(Tier::Standard)
-            ]
-        );
+        assert!(rt.find("model-row").is_some());
+        // Options follow TIERS: DeepFilterNet3, DPDFNet-2, FastEnhancer-S, RNNoise.
+        click(&mut rt, "model-picker-trigger");
+        assert_eq!(rt.state.open, Some(Open::Model));
+        click(&mut rt, "option1");
+        assert_eq!(rt.state.prefs.tier, Tier::Max);
+        assert_eq!(rt.state.open, None, "choosing closes the menu");
+        assert_eq!(sent(&rt), [Command::SetTier(Tier::Max)]);
 
         // What this build offers decides the default state.
-        let mut s = installed();
-        s.page = Page::Settings;
         assert_eq!(
-            runtime(s).find("low-cpu-row").is_some(),
+            runtime(installed()).find("model-row").is_some(),
             oto_engine::available_tiers().len() > 1
         );
     }

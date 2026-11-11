@@ -6,10 +6,16 @@ license.workspace = true
 publish.workspace = true
 
 [features]
-default = ["dfn3"]
+default = ["dfn3", "onnx", "fastenhancer"]
 # DeepFilterNet3 via upstream libDF + tract, the default model. Without it the build is
 # RNNoise-only and has no tract.
 dfn3 = ["dep:deep_filter", "dep:ndarray", "dep:tract-core", "dep:tract-onnx", "dep:tract-pulse", "dep:tract-hir"]
+# DPDFNet-2 and FastEnhancer-S through ONNX Runtime (`ort`, statically linked from pyke's
+# prebuilt binaries). tract 0.21.4 runs DPDFNet ~3× slower than ORT and cannot load FastEnhancer.
+onnx = ["dep:ort", "dep:realfft"]
+# FastEnhancer-S on top of `onnx`. Its weights licence is unstated upstream, so release builds
+# (scripts/macos/release.sh) leave this out; it is for local evaluation.
+fastenhancer = ["onnx"]
 
 [dependencies]
 nnnoiseless = { version = "0.5.2", default-features = false }
@@ -21,3 +27,5 @@ tract-core = { version = "=0.21.4", optional = true }
 tract-onnx = { version = "=0.21.4", optional = true }
 tract-pulse = { version = "=0.21.4", optional = true }
 tract-hir = { version = "=0.21.4", optional = true }
+ort = { version = "=2.0.0-rc.15", default-features = false, features = ["std", "download-binaries", "tls-native", "api-22"], optional = true }
+realfft = { version = "3.5", optional = true }

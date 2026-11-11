@@ -25,12 +25,13 @@ USAGE:
         Measure end-to-end latency through the real Oto Microphone path (needs the driver).
         --no-denoise keeps the tier's model and its delay but bypasses its processing, so it
         cannot suppress the test tone. Exits 1 if fewer than 80% of the tone bursts arrive.
-    oto bench [--model rnnoise|dfn3] [--tier TIER] [--seconds N]
+    oto bench [--model rnnoise|dfn3|dpdfnet|fastenhancer] [--tier TIER] [--seconds N]
         Time the DSP chain on synthetic audio.
     oto --version | --help
 
---tier takes standard (DeepFilterNet3, the default) or light (RNNoise, the app's Low CPU
-mode), limited to the tiers this build has a distinct model for (max is not offered).
+--tier takes standard (DeepFilterNet3, the default), light (RNNoise, the app's Low CPU
+mode), max (DPDFNet-2) or fast (FastEnhancer-S), limited to the tiers this build has a
+distinct model for.
 --seconds takes a number above 0, up to 86400.
 
 Development flags (run, latency): --mic-uid UID, --sink-uid UID stand in for Oto's devices;
@@ -133,6 +134,7 @@ fn tier_name(t: Tier) -> &'static str {
         Tier::Light => "light",
         Tier::Standard => "standard",
         Tier::Max => "max",
+        Tier::Fast => "fast",
     }
 }
 
@@ -143,7 +145,8 @@ fn parse_tier(s: &str, available: &[Tier]) -> Result<Tier, String> {
         "light" => Tier::Light,
         "standard" => Tier::Standard,
         "max" => Tier::Max,
-        _ => return Err(format!("unknown tier {s:?} (light, standard or max)")),
+        "fast" => Tier::Fast,
+        _ => return Err(format!("unknown tier {s:?} (light, standard, max or fast)")),
     };
     if available.contains(&tier) {
         return Ok(tier);
@@ -210,6 +213,8 @@ where
                 a.model = Some(match text(&mut p)?.as_str() {
                     "rnnoise" => dsp::Model::RNNoise,
                     "dfn3" => dsp::Model::DeepFilterNet3,
+                    "dpdfnet" => dsp::Model::DpdfNet,
+                    "fastenhancer" => dsp::Model::FastEnhancer,
                     s => return Err(format!("unknown model {s:?}")),
                 });
                 "model"

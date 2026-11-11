@@ -42,10 +42,16 @@ pub enum Strength {
 /// build runs for it and [`available_tiers`] lists the tiers that actually differ.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum Tier {
+    /// RNNoise: the app's Low CPU mode.
     Light,
+    /// DeepFilterNet3.
     #[default]
     Standard,
+    /// DPDFNet-2: stronger, about 3× DeepFilterNet3's CPU and 20 ms more delay.
     Max,
+    /// FastEnhancer-S: the lowest delay of the neural models. Evaluation only (weights
+    /// licence unstated upstream).
+    Fast,
 }
 
 /// Requests from the UI or CLI to the engine.

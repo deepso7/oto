@@ -2,7 +2,18 @@
 
 [← Docs index](README.md)
 
-> **Today the app runs DeepFilterNet3 by default and the original RNNoise (2018 weights) in Low CPU mode** ([plan 0001](plans/0001-deepfilternet3-default.md)). The rest of this page is the research behind the model choices.
+> **Today the app runs DeepFilterNet3 by default, with a Model picker for DPDFNet-2, FastEnhancer-S and RNNoise (2018 weights, the old Low CPU mode)** ([plan 0001](plans/0001-deepfilternet3-default.md)). The rest of this page is the research behind the model choices.
+
+**DPDFNet-2 and FastEnhancer-S (11 Nov 2026).** Both run through ONNX Runtime (`ort` 2.0.0-rc.15, statically linked, CPU only, one thread) on the DSP worker, behind the `onnx` feature. The pinned `tract` 0.21.4 runs DPDFNet-2 at 5.6 ms per 10 ms frame (ORT: 2.0 ms) and cannot load FastEnhancer at all (`Pad` with two inputs, `DFT`). Ports match upstream's ONNX Runtime reference to −59/−60 dB. Measured offline on an M2 Pro through the full chain:
+
+| Model | Chain delay | Time per 10 ms of audio (incl. load) | Quiet-part reduction, Balanced / Strong |
+|---|---|---|---|
+| RNNoise | 20 ms | 0.9 ms | 15 / 18 dB |
+| DeepFilterNet3 | 40 ms | 1.2 ms | 21 / 82 dB |
+| DPDFNet-2 (48 kHz hr) | 60 ms | 2.2 ms | 23 / 91 dB |
+| FastEnhancer-S (48 kHz) | 21 ms | 1.5 ms | 15 / 23 dB |
+
+Apple silicon only: `ort` has no prebuilt x86_64 macOS runtime, so the universal release builds its Intel slice without `onnx` (DeepFilterNet3 and RNNoise). DPDFNet-8 runs at 4.8 ms per frame in ORT, too close to the worker's budget to offer. FastEnhancer's weights licence is unstated and its training data includes export-restricted corpora: it sits behind the `fastenhancer` feature, on for local builds and left out of releases (`OTO_FEATURES=dfn3,onnx` in `scripts/macos/release.sh`) until it is cleared or retrained.
 
 All run on one CPU thread. No GPU: it costs battery and wakes hardware for a job a single core can do.
 
