@@ -2912,7 +2912,7 @@ dependencies = [
 
 [[package]]
 name = "oto-app"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "auto-launch",
  "block2 0.6.2",
@@ -2930,7 +2930,7 @@ dependencies = [
 
 [[package]]
 name = "oto-cli"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "lexopt",
  "oto-engine",
@@ -2938,7 +2938,7 @@ dependencies = [
 
 [[package]]
 name = "oto-dsp"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "deep_filter",
  "ndarray 0.15.6",
@@ -2953,7 +2953,7 @@ dependencies = [
 
 [[package]]
 name = "oto-engine"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "oto-dsp",
  "rtrb",
