@@ -16,6 +16,7 @@ pub struct BenchReport {
     pub block: usize,
     pub p50_us: f64,
     pub p99_us: f64,
+    pub p999_us: f64,
     pub max_us: f64,
     pub mean_us: f64,
     /// Audio time divided by processing time. 10 means ten times faster than realtime.
@@ -24,19 +25,22 @@ pub struct BenchReport {
     pub cpu_percent: f64,
     /// [`Chain::latency`] in milliseconds: the algorithmic delay the chain adds.
     pub latency_ms: f64,
+    /// [`Chain::latency`] in samples at [`SAMPLE_RATE`].
+    pub latency_samples: usize,
 }
 
 impl std::fmt::Display for BenchReport {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{:?}: {} x {}-sample blocks, p50 {:.1} us, p99 {:.1} us, max {:.1} us, \
-             {:.0}x realtime ({:.2}% of a core), latency {:.1} ms",
+            "{:?}: {} x {}-sample blocks, p50 {:.1} us, p99 {:.1} us, p99.9 {:.1} us, \
+             max {:.1} us, {:.0}x realtime ({:.2}% of a core), latency {:.1} ms",
             self.model,
             self.frames,
             self.block,
             self.p50_us,
             self.p99_us,
+            self.p999_us,
             self.max_us,
             self.realtime_factor,
             self.cpu_percent,
@@ -86,10 +90,12 @@ pub fn try_bench(model: Model, seconds: f32) -> Result<BenchReport, String> {
         block: BENCH_BLOCK,
         p50_us: pct(0.50),
         p99_us: pct(0.99),
+        p999_us: pct(0.999),
         max_us: *times.last().unwrap_or(&0.0),
         mean_us: total / blocks as f64,
         realtime_factor: rtf,
         cpu_percent: 100.0 / rtf,
         latency_ms: chain.latency() as f64 * 1000.0 / SAMPLE_RATE as f64,
+        latency_samples: chain.latency(),
     })
 }

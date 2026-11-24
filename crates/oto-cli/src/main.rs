@@ -1,12 +1,17 @@
 //! `oto`: the headless front end. Runs the engine without a window, lists devices, reports
 //! driver status, and hosts the latency and benchmark tools (see docs/roadmap.md).
 
+use std::fmt::Write as _;
 use std::io::Write;
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use lexopt::prelude::*;
-use oto_engine::{Engine, EngineOptions, Event, Settings, Strength, Tier, dsp};
+use oto_engine::offline::{self, ProcessOptions, ProcessReport};
+use oto_engine::{
+    CallbackStats, Engine, EngineOptions, Event, Settings, Stimulus, Strength, Tier, dsp,
+};
 
 const USAGE: &str = "\
 oto: noise-cancelling virtual microphone (headless)
@@ -22,11 +27,23 @@ USAGE:
     oto status
         Driver and device status. Exits 1 when the driver is not installed.
     oto latency [--seconds N] [--device ID] [--strength S] [--tier TIER] [--no-denoise]
+                [--stimulus tone|speech] [--json]
         Measure end-to-end latency through the real Oto Microphone path (needs the driver).
         --no-denoise keeps the tier's model and its delay but bypasses its processing, so it
-        cannot suppress the test tone. Exits 1 if fewer than 80% of the tone bursts arrive.
-    oto bench [--model rnnoise|dfn3|dpdfnet|fastenhancer] [--tier TIER] [--seconds N]
+        cannot suppress the test tone. --stimulus speech injects voiced bursts the models
+        keep, to measure with denoising on. Exits 1 if fewer than 80% of the bursts arrive.
+    oto bench [--model rnnoise|dfn3|dpdfnet|fastenhancer] [--tier TIER] [--seconds N] [--json]
         Time the DSP chain on synthetic audio.
+    oto bench --live [--tier TIER] [--seconds N] [--device ID] [--strength S] [--no-denoise]
+                     [--json]
+        Run the real engine as if an app were recording and report callback timing
+        (p50/p99/p99.9/max against the period, deadline misses), xruns, CPU and latency.
+    oto process INPUT.wav OUTPUT.wav [--model M] [--tier TIER] [--strength S] [--no-denoise]
+                [--chunk-size N] [--no-delay-comp] [--json]
+        Run a WAV file (16/24/32-bit PCM or 32-bit float, any rate and channel count) through
+        the live chain offline. Writes mono at the input's rate, aligned with the input and of
+        the same length unless --no-delay-comp keeps the chain's delay. --chunk-size is the
+        block size fed to the chain at 48 kHz (default 480).
     oto --version | --help
 
 --tier takes standard (DeepFilterNet3, the default), light (RNNoise, the app's Low CPU
@@ -34,7 +51,9 @@ mode), max (DPDFNet-2) or fast (FastEnhancer-S), limited to the tiers this build
 distinct model for.
 --seconds takes a number above 0, up to 86400.
 
-Development flags (run, latency): --mic-uid UID, --sink-uid UID stand in for Oto's devices;
+--json prints one JSON object on stdout instead of text.
+
+Development flags (run, latency, bench --live): --mic-uid UID, --sink-uid UID stand in for Oto's devices;
 --force-clients runs as if an app were recording; --input-raw FILE loops mono f32le samples
 in place of the mic signal (the mic still clocks the stream).
 ";
@@ -43,6 +62,19 @@ in place of the mic signal (the mic still clocks the stream).
 /// the sample counters hold.
 const MAX_SECONDS: f64 = 86_400.0;
 
+/// The largest `--chunk-size` accepted (about 1.4 s at 48 kHz).
+const MAX_CHUNK: usize = 65_536;
+
+/// `oto bench` flags that only mean something with `--live`.
+const LIVE_ONLY: [&str; 6] = [
+    "device",
+    "strength",
+    "no-denoise",
+    "mic-uid",
+    "sink-uid",
+    "input-raw",
+];
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Cmd {
     Run,
@@ -50,6 +82,7 @@ enum Cmd {
     Status,
     Latency,
     Bench,
+    Process,
 }
 
 impl Cmd {
@@ -60,6 +93,7 @@ impl Cmd {
             "status" => Cmd::Status,
             "latency" => Cmd::Latency,
             "bench" => Cmd::Bench,
+            "process" => Cmd::Process,
             _ => return None,
         })
     }
@@ -71,6 +105,7 @@ impl Cmd {
             Cmd::Status => "status",
             Cmd::Latency => "latency",
             Cmd::Bench => "bench",
+            Cmd::Process => "process",
         }
     }
 
@@ -88,21 +123,46 @@ impl Cmd {
             ENGINE[2],
             ENGINE[3],
         ];
-        const LATENCY: [&str; 9] = [
+        const LATENCY: [&str; 11] = [
             "seconds",
             "device",
             "strength",
             "tier",
             "no-denoise",
+            "stimulus",
+            "json",
             ENGINE[0],
             ENGINE[1],
             ENGINE[2],
             ENGINE[3],
         ];
+        const BENCH: [&str; 11] = [
+            "model",
+            "tier",
+            "seconds",
+            "json",
+            "live",
+            LIVE_ONLY[0],
+            LIVE_ONLY[1],
+            LIVE_ONLY[2],
+            LIVE_ONLY[3],
+            LIVE_ONLY[4],
+            LIVE_ONLY[5],
+        ];
+        const PROCESS: [&str; 7] = [
+            "model",
+            "tier",
+            "strength",
+            "no-denoise",
+            "chunk-size",
+            "no-delay-comp",
+            "json",
+        ];
         match self {
             Cmd::Run => &RUN,
             Cmd::Latency => &LATENCY,
-            Cmd::Bench => &["model", "tier", "seconds"],
+            Cmd::Bench => &BENCH,
+            Cmd::Process => &PROCESS,
             Cmd::Devices | Cmd::Status => &[],
         }
     }
@@ -120,6 +180,13 @@ struct Args {
     /// `--input-raw`'s file, read by [`engine_options`].
     input_raw: Option<String>,
     opts: EngineOptions,
+    json: bool,
+    live: bool,
+    stimulus: Stimulus,
+    chunk_size: Option<usize>,
+    no_delay_comp: bool,
+    /// `oto process`'s input and output files.
+    paths: Vec<String>,
 }
 
 /// What the command line asks for.
@@ -158,6 +225,15 @@ fn parse_tier(s: &str, available: &[Tier]) -> Result<Tier, String> {
     ))
 }
 
+fn parse_chunk_size(s: &str) -> Result<usize, String> {
+    match s.parse::<usize>() {
+        Ok(v) if (1..=MAX_CHUNK).contains(&v) => Ok(v),
+        _ => Err(format!(
+            "--chunk-size takes a whole number from 1 to {MAX_CHUNK}, not {s:?}"
+        )),
+    }
+}
+
 fn parse_seconds(s: &str) -> Result<f64, String> {
     match s.parse::<f64>() {
         Ok(v) if v.is_finite() && v > 0.0 && v <= MAX_SECONDS => Ok(v),
@@ -190,6 +266,10 @@ where
             Value(v) if cmd.is_none() => {
                 let v = v.string().map_err(|e| e.to_string())?;
                 cmd = Some(Cmd::parse(&v).ok_or_else(|| format!("unknown command {v:?}"))?);
+                continue;
+            }
+            Value(v) if cmd == Some(Cmd::Process) && a.paths.len() < 2 => {
+                a.paths.push(v.string().map_err(|e| e.to_string())?);
                 continue;
             }
             Long("device") => {
@@ -247,6 +327,30 @@ where
                 a.input_raw = Some(text(&mut p)?);
                 "input-raw"
             }
+            Long("json") => {
+                a.json = true;
+                "json"
+            }
+            Long("live") => {
+                a.live = true;
+                "live"
+            }
+            Long("stimulus") => {
+                a.stimulus = match text(&mut p)?.as_str() {
+                    "tone" => Stimulus::Tone,
+                    "speech" => Stimulus::Speech,
+                    s => return Err(format!("unknown stimulus {s:?} (tone or speech)")),
+                };
+                "stimulus"
+            }
+            Long("chunk-size") => {
+                a.chunk_size = Some(parse_chunk_size(&text(&mut p)?)?);
+                "chunk-size"
+            }
+            Long("no-delay-comp") => {
+                a.no_delay_comp = true;
+                "no-delay-comp"
+            }
             _ => return Err(arg.unexpected().to_string()),
         };
         seen.push(flag);
@@ -259,6 +363,19 @@ where
     };
     if let Some(f) = seen.iter().find(|f| !cmd.flags().contains(f)) {
         return Err(format!("--{f} does not apply to `oto {}`", cmd.name()));
+    }
+    if cmd == Cmd::Bench {
+        if !a.live
+            && let Some(f) = seen.iter().find(|f| LIVE_ONLY.contains(f))
+        {
+            return Err(format!("--{f} needs --live (`oto bench --live`)"));
+        }
+        if a.live && a.model.is_some() {
+            return Err("--model does not apply to `oto bench --live`; it runs a --tier".into());
+        }
+    }
+    if cmd == Cmd::Process && a.paths.len() != 2 {
+        return Err("`oto process` needs an input and an output WAV file".into());
     }
     Ok(Invocation::Run(cmd, Box::new(a)))
 }
@@ -284,7 +401,9 @@ fn main() {
         Cmd::Devices => devices(),
         Cmd::Status => status(),
         Cmd::Latency => latency(args),
+        Cmd::Bench if args.live => bench_live(args),
         Cmd::Bench => bench(args),
+        Cmd::Process => process(args),
     };
     if let Err(e) = result {
         eprintln!("oto: {e}");
@@ -512,12 +631,193 @@ fn status() -> Result<(), String> {
     Ok(())
 }
 
-fn latency(a: Args) -> Result<(), String> {
-    let seconds = a.seconds.unwrap_or(10.0);
-    let opts = engine_options(&a)?;
-    println!(
-        "measuring for {seconds} s (tier {}, {} {}): tone bursts injected at the engine input, \
-         recorded from Oto Microphone",
+/// A JSON object written by hand: the output is flat numbers and strings, not worth a serde
+/// dependency. Non-finite numbers become `null`.
+#[derive(Default)]
+struct Json(String);
+
+impl Json {
+    fn key(&mut self, k: &str) -> &mut String {
+        self.0.push(if self.0.is_empty() { '{' } else { ',' });
+        let _ = write!(self.0, "{}:", json_str(k));
+        &mut self.0
+    }
+
+    fn num(mut self, k: &str, v: f64) -> Self {
+        let out = self.key(k);
+        if v.is_finite() {
+            let _ = write!(out, "{v}");
+        } else {
+            out.push_str("null");
+        }
+        self
+    }
+
+    /// An `f32` in its shortest form (`0.1`, not `0.10000000149011612`).
+    fn num32(mut self, k: &str, v: f32) -> Self {
+        let out = self.key(k);
+        if v.is_finite() {
+            let _ = write!(out, "{v}");
+        } else {
+            out.push_str("null");
+        }
+        self
+    }
+
+    fn opt(self, k: &str, v: Option<f64>) -> Self {
+        self.num(k, v.unwrap_or(f64::NAN))
+    }
+
+    fn int(mut self, k: &str, v: u64) -> Self {
+        let _ = write!(self.key(k), "{v}");
+        self
+    }
+
+    fn sint(mut self, k: &str, v: i64) -> Self {
+        let _ = write!(self.key(k), "{v}");
+        self
+    }
+
+    fn bool(mut self, k: &str, v: bool) -> Self {
+        let _ = write!(self.key(k), "{v}");
+        self
+    }
+
+    fn str(mut self, k: &str, v: &str) -> Self {
+        let v = json_str(v);
+        self.key(k).push_str(&v);
+        self
+    }
+
+    fn obj(mut self, k: &str, v: Json) -> Self {
+        let v = v.finish();
+        self.key(k).push_str(&v);
+        self
+    }
+
+    fn strs(mut self, k: &str, v: &[String]) -> Self {
+        let items: Vec<_> = v.iter().map(|s| json_str(s)).collect();
+        let _ = write!(self.key(k), "[{}]", items.join(","));
+        self
+    }
+
+    fn nums(mut self, k: &str, v: &[f64]) -> Self {
+        let items: Vec<_> = v
+            .iter()
+            .map(|x| {
+                if x.is_finite() {
+                    x.to_string()
+                } else {
+                    "null".into()
+                }
+            })
+            .collect();
+        let _ = write!(self.key(k), "[{}]", items.join(","));
+        self
+    }
+
+    fn finish(mut self) -> String {
+        if self.0.is_empty() {
+            self.0.push('{');
+        }
+        self.0.push('}');
+        self.0
+    }
+}
+
+fn json_str(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => {
+                let _ = write!(out, "\\u{:04x}", c as u32);
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+fn callback_json(c: &CallbackStats) -> Json {
+    Json::default()
+        .int("callbacks", c.callbacks)
+        .num32("period_us", c.period_us)
+        .num32("p50_us", c.p50_us)
+        .num32("p99_us", c.p99_us)
+        .num32("p999_us", c.p999_us)
+        .num32("max_us", c.max_us)
+        .num32("first_us", c.first_us)
+        .int("deadline_misses", c.deadline_misses)
+}
+
+fn stats_json(s: &oto_engine::Stats) -> Json {
+    Json::default()
+        .bool("running", s.running)
+        .str("model", s.model.map_or("", |m| m.name()))
+        .int("input_rate", s.input_rate as u64)
+        .int("output_rate", s.output_rate as u64)
+        .num32("estimated_latency_ms", s.estimated_latency_ms)
+        .num32("ring_fill_ms", s.ring_fill_ms)
+        .num32("ring_target_ms", s.ring_target_ms)
+        .num32("worker_reserve_ms", s.worker_reserve_ms)
+        .bool("worker_realtime", s.worker_realtime)
+        .bool("worker_workgroup", s.worker_workgroup)
+        .sint("drift_ppm", s.drift_ppm as i64)
+        .int("underruns", s.underruns)
+        .int("resyncs", s.resyncs)
+        .int("overflows", s.overflows)
+        .int("starvations", s.starvations)
+        .int("worker_overflows", s.worker_overflows)
+        .obj("capture", callback_json(&s.capture))
+        .obj("output", callback_json(&s.output))
+        .obj("worker", callback_json(&s.worker))
+}
+
+/// Engine errors and model fallbacks seen while a measurement ran.
+#[derive(Default)]
+struct Incidents {
+    errors: Vec<String>,
+    notices: Vec<String>,
+    loads: Vec<f32>,
+}
+
+impl Incidents {
+    fn note(&mut self, e: Event) {
+        match e {
+            Event::Error(e) => self.errors.push(e),
+            Event::ModelFallback {
+                requested,
+                effective,
+                reason,
+            } => self.notices.push(format!(
+                "{} \u{2192} {}: {reason}",
+                requested.name(),
+                effective.name()
+            )),
+            Event::Load(l) => self.loads.push(l),
+            _ => {}
+        }
+    }
+
+    /// Mean share of one core over the run, percent.
+    fn cpu_percent(&self) -> Option<f64> {
+        (!self.loads.is_empty()).then(|| {
+            self.loads.iter().map(|&l| l as f64).sum::<f64>() * 100.0 / self.loads.len() as f64
+        })
+    }
+}
+
+/// The tier and what it runs, for progress lines.
+fn describe_run(a: &Args) -> String {
+    format!(
+        "tier {}, {} {}",
         tier_name(a.tier),
         oto_engine::model_for(a.tier).name(),
         if a.no_denoise {
@@ -525,29 +825,75 @@ fn latency(a: Args) -> Result<(), String> {
         } else {
             "denoising"
         },
+    )
+}
+
+fn latency(a: Args) -> Result<(), String> {
+    let seconds = a.seconds.unwrap_or(10.0);
+    let opts = engine_options(&a)?;
+    let intro = format!(
+        "measuring for {seconds} s ({}): {} bursts injected at the engine input, recorded \
+         from Oto Microphone",
+        describe_run(&a),
+        a.stimulus.name(),
     );
-    let r = oto_engine::latency::measure(settings(&a), opts, seconds).map_err(start_error)?;
+    // Keep stdout pure JSON with --json.
+    if a.json {
+        eprintln!("{intro}");
+    } else {
+        println!("{intro}");
+    }
+    let r = oto_engine::latency::measure_with_stimulus(settings(&a), opts, seconds, a.stimulus)
+        .map_err(start_error)?;
+    let s = r.stats;
+    if a.json {
+        let summary = r.summary();
+        let json = Json::default()
+            .str("platform", std::env::consts::OS)
+            .str("stimulus", r.stimulus.name())
+            .str("tier", tier_name(a.tier))
+            .bool("denoise", !a.no_denoise)
+            .num("seconds", seconds)
+            .int("injections", r.injections)
+            .int("expected", r.expected())
+            .int("detected", r.measurements_ms.len() as u64)
+            .int("missed", r.missed())
+            .num("miss_rate", r.miss_rate())
+            .opt("min_ms", summary.map(|s| s.0))
+            .opt("median_ms", summary.map(|s| s.1))
+            .opt("p95_ms", r.p95_ms())
+            .opt("max_ms", summary.map(|s| s.2))
+            .nums("measurements_ms", &r.measurements_ms)
+            .bool("ok", r.check().is_ok())
+            .strs("errors", &r.errors)
+            .strs("notices", &r.notices)
+            .obj("stats", stats_json(&s));
+        println!("{}", json.finish());
+        return r.check();
+    }
     for e in &r.errors {
         println!("engine error: {e}");
     }
     for n in &r.notices {
         println!("notice: model fallback, {n}");
     }
-    if let Some(m) = r.stats.model {
+    if let Some(m) = s.model {
         println!("running model: {}", m.name());
     }
     match r.summary() {
         Some((min, med, max)) => {
             println!(
                 "end-to-end (mic IO buffer → chain → ring → sink → driver → recorder): \
-                 median {med:.1} ms, min {min:.1}, max {max:.1} ({} of {} bursts)",
+                 median {med:.1} ms, p95 {:.1}, min {min:.1}, max {max:.1} ({} of {} bursts, \
+                 {} missed)",
+                r.p95_ms().unwrap_or(f64::NAN),
                 r.measurements_ms.len(),
-                r.expected()
+                r.expected(),
+                r.missed(),
             );
         }
         None => println!("no bursts detected ({} expected)", r.expected()),
     }
-    let s = r.stats;
     println!(
         "ring {:.1}/{:.1} ms, drift {:+} ppm, underruns {}, resyncs {}, estimate {:.1} ms \
          (includes device-reported mic latency)",
@@ -558,15 +904,186 @@ fn latency(a: Args) -> Result<(), String> {
         s.resyncs,
         s.estimated_latency_ms
     );
+    if s.worker.callbacks > 0 {
+        println!(
+            "worker {}, starved {}",
+            callback_detail(&s.worker),
+            s.starvations
+        );
+    }
     r.check()
 }
 
 fn bench(a: Args) -> Result<(), String> {
     let seconds = a.seconds.unwrap_or(10.0);
     let model = a.model.unwrap_or_else(|| oto_engine::model_for(a.tier));
-    let report = dsp::try_bench(model, seconds as f32)?;
-    println!("{report}");
+    let r = dsp::try_bench(model, seconds as f32)?;
+    if a.json {
+        let json = Json::default()
+            .str("model", r.model.name())
+            .int("frames", r.frames as u64)
+            .int("block", r.block as u64)
+            .num("p50_us", r.p50_us)
+            .num("p99_us", r.p99_us)
+            .num("p999_us", r.p999_us)
+            .num("max_us", r.max_us)
+            .num("mean_us", r.mean_us)
+            .num("realtime_factor", r.realtime_factor)
+            .num("cpu_percent", r.cpu_percent)
+            .num("latency_ms", r.latency_ms)
+            .int("latency_samples", r.latency_samples as u64);
+        println!("{}", json.finish());
+    } else {
+        println!("{r}");
+    }
     Ok(())
+}
+
+/// `oto bench --live`: the real engine, forced active, for `--seconds`.
+fn bench_live(a: Args) -> Result<(), String> {
+    let seconds = a.seconds.unwrap_or(10.0);
+    let mut opts = engine_options(&a)?;
+    opts.force_clients_active = true;
+    let intro = format!("live bench for {seconds} s ({})", describe_run(&a));
+    if a.json {
+        eprintln!("{intro}");
+    } else {
+        println!("{intro}");
+    }
+    install_signal_handlers();
+    let engine = Engine::start_with(settings(&a), opts).map_err(start_error)?;
+    let mut seen = Incidents::default();
+    let end = Instant::now() + Duration::from_secs_f64(seconds);
+    while Instant::now() < end && !STOP.load(Ordering::Relaxed) {
+        std::thread::sleep(Duration::from_millis(50));
+        engine.try_events().into_iter().for_each(|e| seen.note(e));
+    }
+    let s = engine.stats();
+    engine.try_events().into_iter().for_each(|e| seen.note(e));
+    drop(engine);
+    let cpu = seen.cpu_percent();
+    if a.json {
+        let json = Json::default()
+            .str("platform", std::env::consts::OS)
+            .str("tier", tier_name(a.tier))
+            .bool("denoise", !a.no_denoise)
+            .num("seconds", seconds)
+            .opt("cpu_percent", cpu)
+            .strs("errors", &seen.errors)
+            .strs("notices", &seen.notices)
+            .obj("stats", stats_json(&s));
+        println!("{}", json.finish());
+    } else {
+        for e in &seen.errors {
+            println!("engine error: {e}");
+        }
+        for n in &seen.notices {
+            println!("notice: model fallback, {n}");
+        }
+        println!(
+            "model {}, est. latency {:.1} ms, cpu {}",
+            s.model.map_or("none", |m| m.name()),
+            s.estimated_latency_ms,
+            cpu.map_or("n/a".into(), |c| format!("{c:.1}%")),
+        );
+        println!("capture {}", callback_detail(&s.capture));
+        println!("output  {}", callback_detail(&s.output));
+        if s.worker.callbacks > 0 {
+            println!("worker  {}", callback_detail(&s.worker));
+        }
+        println!(
+            "starvations {}, worker overflows {}, underruns {}, resyncs {}",
+            s.starvations, s.worker_overflows, s.underruns, s.resyncs
+        );
+    }
+    if s.capture.callbacks == 0 {
+        return Err(
+            "no audio callbacks ran; is the Oto driver installed and a mic present?".into(),
+        );
+    }
+    Ok(())
+}
+
+/// One stream's callback timing in full, e.g.
+/// `p50 120 / p99 310 / p99.9 600 / max 900 of 5333 µs, 1875 callbacks, 0 deadline misses`.
+fn callback_detail(c: &CallbackStats) -> String {
+    format!(
+        "p50 {:.0} / p99 {:.0} / p99.9 {:.0} / max {:.0} of {:.0} µs, {} callbacks, {} deadline \
+         misses",
+        c.p50_us, c.p99_us, c.p999_us, c.max_us, c.period_us, c.callbacks, c.deadline_misses
+    )
+}
+
+/// The offline options `oto process` asks for.
+fn process_options(a: &Args) -> ProcessOptions {
+    ProcessOptions {
+        model: a.model.unwrap_or_else(|| oto_engine::model_for(a.tier)),
+        enabled: !a.no_denoise,
+        max_attenuation_db: a.strength.max_attenuation_db(),
+        chunk_size: a.chunk_size.unwrap_or(offline::DEFAULT_CHUNK),
+        delay_compensate: !a.no_delay_comp,
+    }
+}
+
+fn process(a: Args) -> Result<(), String> {
+    let (input, output) = (Path::new(&a.paths[0]), Path::new(&a.paths[1]));
+    let r = offline::process_file(input, output, &process_options(&a), None)?;
+    if a.json {
+        println!("{}", process_json(&r, &a.paths[0], &a.paths[1]).finish());
+    } else {
+        println!(
+            "{} -> {}: {} ({}, max attenuation {} dB), {} Hz, {} samples, chain latency {} \
+             samples at 48 kHz ({}), {:.0} ms ({:.1}x realtime), rms {:.1} -> {:.1} dBFS, \
+             peak {:.1} dBFS",
+            a.paths[0],
+            a.paths[1],
+            r.model.name(),
+            if r.enabled { "denoising" } else { "bypassed" },
+            r.max_attenuation_db,
+            r.sample_rate,
+            r.output_samples,
+            r.chain_latency_samples,
+            if r.delay_compensated {
+                "compensated".to_string()
+            } else {
+                format!("{} samples kept in front", r.total_delay_samples)
+            },
+            r.elapsed_ms,
+            r.realtime_factor,
+            r.input_rms_dbfs,
+            r.output_rms_dbfs,
+            r.peak_dbfs,
+        );
+    }
+    if r.non_finite_outputs > 0 {
+        return Err(format!(
+            "{} non-finite output samples",
+            r.non_finite_outputs
+        ));
+    }
+    Ok(())
+}
+
+fn process_json(r: &ProcessReport, input: &str, output: &str) -> Json {
+    Json::default()
+        .str("input", input)
+        .str("output", output)
+        .str("model", r.model.name())
+        .bool("denoise", r.enabled)
+        .num32("max_attenuation_db", r.max_attenuation_db)
+        .int("chunk_size", r.chunk_size as u64)
+        .int("sample_rate", r.sample_rate as u64)
+        .int("input_samples", r.input_samples as u64)
+        .int("output_samples", r.output_samples as u64)
+        .int("chain_latency_samples", r.chain_latency_samples as u64)
+        .int("total_delay_samples", r.total_delay_samples as u64)
+        .bool("delay_compensated", r.delay_compensated)
+        .num("elapsed_ms", r.elapsed_ms)
+        .num("realtime_factor", r.realtime_factor)
+        .num32("input_rms_dbfs", r.input_rms_dbfs)
+        .num32("output_rms_dbfs", r.output_rms_dbfs)
+        .num32("peak_dbfs", r.peak_dbfs)
+        .int("non_finite_outputs", r.non_finite_outputs as u64)
 }
 
 #[cfg(test)]
@@ -667,13 +1184,147 @@ mod tests {
         );
         assert_eq!(
             error("bench --device x"),
-            "--device does not apply to `oto bench`"
+            "--device needs --live (`oto bench --live`)"
+        );
+        assert_eq!(
+            error("process a.wav b.wav --device x"),
+            "--device does not apply to `oto process`"
+        );
+        assert_eq!(
+            error("run --stimulus speech"),
+            "--stimulus does not apply to `oto run`"
+        );
+        assert_eq!(error("run --json"), "--json does not apply to `oto run`");
+        assert_eq!(
+            error("bench --live --mic-uid x --force-clients"),
+            "--force-clients does not apply to `oto bench`"
+        );
+        assert_eq!(
+            error("latency --chunk-size 256"),
+            "--chunk-size does not apply to `oto latency`"
         );
         assert_eq!(
             error("bench --force-clients"),
             "--force-clients does not apply to `oto bench`"
         );
         assert_eq!(error("--no-denoise"), "--no-denoise needs a command");
+    }
+
+    #[test]
+    fn bench_live_and_json() {
+        let (cmd, a) = args("bench --json").unwrap();
+        assert_eq!(cmd, Cmd::Bench);
+        assert!(a.json && !a.live);
+        let (_, a) = args(
+            "bench --live --seconds 3 --device usb --strength light --no-denoise --mic-uid m \
+             --sink-uid s --input-raw x.raw --json",
+        )
+        .unwrap();
+        assert!(a.live && a.json && a.no_denoise);
+        assert_eq!(a.device.as_deref(), Some("usb"));
+        assert_eq!(a.strength, Strength::Light);
+        assert_eq!(a.opts.sink_uid.as_deref(), Some("s"));
+        for f in [
+            "--strength strong",
+            "--no-denoise",
+            "--mic-uid m",
+            "--input-raw f",
+        ] {
+            let e = error(&format!("bench {f}"));
+            assert!(e.contains("needs --live"), "{f}: {e}");
+        }
+        assert!(error("bench --live --model rnnoise").contains("--tier"));
+        // `--model` stays fine offline.
+        assert!(args("bench --model rnnoise --json").is_ok());
+    }
+
+    #[test]
+    fn latency_stimulus() {
+        let (_, a) = args("latency").unwrap();
+        assert_eq!(a.stimulus, Stimulus::Tone);
+        let (_, a) = args("latency --stimulus speech --json").unwrap();
+        assert_eq!(a.stimulus, Stimulus::Speech);
+        assert!(a.json);
+        assert!(error("latency --stimulus noise").contains("unknown stimulus"));
+    }
+
+    #[test]
+    fn process_takes_two_files_and_its_flags() {
+        let (cmd, a) = args(
+            "process in.wav out.wav --model rnnoise --strength strong --no-denoise \
+             --chunk-size 256 --no-delay-comp --json",
+        )
+        .unwrap();
+        assert_eq!(cmd, Cmd::Process);
+        assert_eq!(a.paths, ["in.wav", "out.wav"]);
+        let o = process_options(&a);
+        assert_eq!(o.model, dsp::Model::RNNoise);
+        assert!(!o.enabled && !o.delay_compensate);
+        assert_eq!(o.chunk_size, 256);
+        assert_eq!(o.max_attenuation_db, f32::INFINITY);
+        assert!(a.json);
+        // Defaults: the tier's model, 480-sample blocks, aligned output.
+        let (_, a) = args("process --tier standard in.wav out.wav").unwrap();
+        let o = process_options(&a);
+        assert_eq!(o.model, oto_engine::model_for(Tier::Standard));
+        assert!(o.enabled && o.delay_compensate);
+        assert_eq!(o.chunk_size, 480);
+        assert_eq!(o.max_attenuation_db, 24.0);
+
+        let need = "`oto process` needs an input and an output WAV file";
+        assert_eq!(error("process"), need);
+        assert_eq!(error("process in.wav"), need);
+        assert!(error("process a b c").contains("c"));
+        // Only `process` takes file arguments.
+        assert!(error("bench in.wav").contains("in.wav"));
+        for bad in ["0", "-1", "65537", "abc", "1.5"] {
+            let e = error(&format!("process a b --chunk-size {bad}"));
+            assert!(e.contains("--chunk-size"), "{bad}: {e}");
+        }
+        assert_eq!(parse_chunk_size("65536"), Ok(65_536));
+    }
+
+    #[test]
+    fn json_is_well_formed() {
+        assert_eq!(Json::default().finish(), "{}");
+        let j = Json::default()
+            .str("s", "a\"b\\c\n\u{1}")
+            .num("x", 1.5)
+            .num("nan", f64::NAN)
+            .num32("f", 0.1)
+            .int("n", 7)
+            .sint("d", -3)
+            .bool("b", true)
+            .opt("none", None)
+            .strs("l", &["x".into(), "y".into()])
+            .nums("v", &[1.0, f64::INFINITY])
+            .obj("o", Json::default().int("k", 1))
+            .finish();
+        assert_eq!(
+            j,
+            r#"{"s":"a\"b\\c\n\u0001","x":1.5,"nan":null,"f":0.1,"n":7,"d":-3,"b":true,"none":null,"l":["x","y"],"v":[1,null],"o":{"k":1}}"#
+        );
+    }
+
+    #[test]
+    fn process_writes_an_aligned_file() {
+        let dir = std::env::temp_dir().join(format!("oto-cli-process-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (inp, outp) = (dir.join("in.wav"), dir.join("out.wav"));
+        let x = dsp::signal::noisy_speech(4_800, 1);
+        offline::Wav::mono(48_000, offline::SampleFormat::Float32, x)
+            .write(&inp)
+            .unwrap();
+        let line = format!(
+            "process {} {} --model rnnoise --chunk-size 256 --json",
+            inp.display(),
+            outp.display()
+        );
+        let (_, a) = args(&line).unwrap();
+        process(a).unwrap();
+        let out = offline::Wav::read(&outp).unwrap();
+        assert_eq!((out.frames(), out.sample_rate), (4_800, 48_000));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

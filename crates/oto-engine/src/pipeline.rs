@@ -150,6 +150,8 @@ pub struct CallbackTimes {
     first_ns: AtomicU64,
     /// Callbacks recorded since the last reset, including the first.
     calls: AtomicU64,
+    /// Callbacks past the first that took longer than `period_ns` (when it is set).
+    deadline_misses: AtomicU64,
     /// The device IO buffer duration, ns, set by the backend when the stream starts.
     pub period_ns: AtomicU64,
 }
@@ -171,6 +173,7 @@ impl CallbackTimes {
             max_ns: AtomicU64::new(0),
             first_ns: AtomicU64::new(0),
             calls: AtomicU64::new(0),
+            deadline_misses: AtomicU64::new(0),
             period_ns: AtomicU64::new(0),
         }
     }
@@ -210,6 +213,10 @@ impl CallbackTimes {
         }
         self.buckets[Self::bucket(ns)].fetch_add(1, Relaxed);
         self.max_ns.fetch_max(ns, Relaxed);
+        let p = self.period_ns.load(Relaxed);
+        if p > 0 && ns > p {
+            self.deadline_misses.fetch_add(1, Relaxed);
+        }
     }
 
     /// Forget everything recorded so far. Call while the stream's callback is not running.
@@ -220,6 +227,7 @@ impl CallbackTimes {
         self.max_ns.store(0, Relaxed);
         self.first_ns.store(0, Relaxed);
         self.calls.store(0, Relaxed);
+        self.deadline_misses.store(0, Relaxed);
     }
 
     /// The `q`-quantile (0.0..=1.0) of the recorded durations, ns: the upper edge of the bucket
@@ -254,6 +262,12 @@ impl CallbackTimes {
 
     pub fn calls(&self) -> u64 {
         self.calls.load(Relaxed)
+    }
+
+    /// Callbacks past the first that overran `period_ns`, the time they had. Counted only
+    /// while `period_ns` is set.
+    pub fn deadline_misses(&self) -> u64 {
+        self.deadline_misses.load(Relaxed)
     }
 }
 
@@ -366,23 +380,138 @@ pub fn decode_model(v: u8) -> Option<Model> {
     }
 }
 
-/// Test hook for `oto latency`: replaces the mic signal with a tone-burst train and records when
-/// each burst was captured, in host-clock nanoseconds.
+/// The test signal a [`Probe`] injects.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Stimulus {
+    /// A 10 ms 1 kHz cosine burst every 0.5 s. Denoisers may suppress it; measure with
+    /// denoising bypassed.
+    #[default]
+    Tone,
+    /// A 120 ms voiced, formant-shaped burst (a sustained vowel at ~140 Hz pitch) with a 2 ms
+    /// onset, every 0.8 s. Speech is what the denoisers are built to keep, so this measures the
+    /// path with the model active.
+    Speech,
+}
+
+impl Stimulus {
+    /// Seconds between burst onsets.
+    pub fn period_s(self) -> f64 {
+        match self {
+            Stimulus::Tone => Probe::PERIOD_S,
+            Stimulus::Speech => 0.8,
+        }
+    }
+
+    /// Burst length, seconds.
+    pub fn burst_s(self) -> f64 {
+        match self {
+            Stimulus::Tone => Probe::BURST_S,
+            Stimulus::Speech => 0.120,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Stimulus::Tone => "tone",
+            Stimulus::Speech => "speech",
+        }
+    }
+
+    /// One burst at `rate` Hz, peak [`Probe::AMPLITUDE`]. Allocates; not for the realtime path.
+    pub fn burst(self, rate: f64) -> Vec<f32> {
+        let n = ((self.burst_s() * rate) as usize).max(1);
+        match self {
+            Stimulus::Tone => {
+                let w = std::f64::consts::TAU * Probe::FREQ_HZ / rate;
+                (0..n)
+                    .map(|i| Probe::AMPLITUDE * (w * i as f64).cos() as f32)
+                    .collect()
+            }
+            Stimulus::Speech => speech_burst(n, rate),
+        }
+    }
+}
+
+/// A vowel-like burst of `n` samples at `rate`: glottal harmonics (cosines, so each pitch
+/// period starts with a pulse) under a −6 dB/octave tilt and three moving formants, pitch gliding
+/// 150 → 125 Hz with subtle jitter and breath (so aggressive neural models like DPDFNet-2 do not
+/// classify the synthetic pulse train as stationary hum), a 2 ms linear attack ending on the
+/// first pulse and a 20 ms raised-cosine release, peak [`Probe::AMPLITUDE`].
+fn speech_burst(n: usize, rate: f64) -> Vec<f32> {
+    let mut rng = oto_dsp::signal::Rng::new(0x070B_0057);
+    let attack = (0.002 * rate).max(1.0);
+    let release = (0.020 * rate).max(1.0);
+    let top = (rate * 0.45).min(5_400.0);
+    // Start so the first glottal pulse lands as the attack completes: a voiced onset at 2 ms.
+    let mut phase = 1.0 - (attack / rate * 150.0).fract();
+    let mut out: Vec<f32> = (0..n)
+        .map(|i| {
+            let t = i as f64 / n as f64;
+            let jitter = 1.0 + 0.015 * rng.uniform() as f64;
+            let vibrato = 1.0 + 0.01 * (std::f64::consts::TAU * 5.5 * i as f64 / rate).sin();
+            let f0 = (150.0 - 25.0 * t) * jitter * vibrato;
+            let formants = [
+                (700.0 - 200.0 * t, 100.0),
+                (1220.0 + 580.0 * t, 100.0),
+                (2600.0 - 150.0 * t, 150.0),
+            ];
+            let mut s = 0.0;
+            let mut h = 1;
+            while h as f64 * f0 < top {
+                let fh = h as f64 * f0;
+                let mut g = 0.02;
+                for (fc, bw) in formants {
+                    g += 1.0 / (1.0 + ((fh - fc) / bw).powi(2));
+                }
+                s += (g / h as f64) * (std::f64::consts::TAU * phase * h as f64).cos();
+                h += 1;
+            }
+            let breath = 0.05 * rng.uniform() as f64;
+            phase = (phase + f0 / rate).fract();
+            let left = (n - 1 - i) as f64;
+            let env = (i as f64 / attack).min(1.0)
+                * if left < release {
+                    0.5 - 0.5 * (std::f64::consts::PI * left / release).cos()
+                } else {
+                    1.0
+                };
+            ((s + breath) * env) as f32
+        })
+        .collect();
+    let peak = out.iter().fold(0.0f32, |m, x| m.max(x.abs())).max(1e-9);
+    out.iter_mut().for_each(|x| *x *= Probe::AMPLITUDE / peak);
+    out
+}
+
+/// Test hook for `oto latency`: replaces the mic signal with a train of [`Stimulus`] bursts and
+/// records when each burst's onset was captured, in host-clock nanoseconds.
 pub struct Probe {
+    pub stimulus: Stimulus,
+    /// Capture time of the latest burst's onset: its first sample above
+    /// [`Probe::THRESHOLD`], where a recorder detects it.
     pub last_inject_ns: AtomicU64,
     pub injections: AtomicU64,
 }
 
 impl Probe {
-    /// Seconds between bursts.
+    /// Seconds between tone bursts ([`Stimulus::Tone`]).
     pub const PERIOD_S: f64 = 0.5;
-    /// Burst length, seconds. A 1 kHz cosine at 0.5 FS, so the onset sample is at full amplitude.
+    /// Tone burst length, seconds. A 1 kHz cosine at 0.5 FS, so the onset sample is at full
+    /// amplitude.
     pub const BURST_S: f64 = 0.010;
     pub const FREQ_HZ: f64 = 1000.0;
     pub const AMPLITUDE: f32 = 0.5;
+    /// Detection threshold: a burst's onset is its first sample above this magnitude.
+    pub const THRESHOLD: f32 = 0.1;
 
+    /// A tone-burst probe.
     pub fn new() -> Self {
+        Self::with_stimulus(Stimulus::Tone)
+    }
+
+    pub fn with_stimulus(stimulus: Stimulus) -> Self {
         Self {
+            stimulus,
             last_inject_ns: AtomicU64::new(0),
             injections: AtomicU64::new(0),
         }
@@ -395,28 +524,47 @@ impl Default for Probe {
     }
 }
 
-struct ProbeGen {
+/// Plays a [`Probe`]'s bursts on the capture path. The burst is rendered at construction, so
+/// [`ProbeGen::fill`] only copies and never allocates.
+pub struct ProbeGen {
     probe: Arc<Probe>,
     rate: f64,
+    burst: Box<[f32]>,
+    /// Index into `burst` of the onset (first sample above [`Probe::THRESHOLD`]).
+    onset: usize,
     period: usize,
-    burst: usize,
     pos: usize,
 }
 
 impl ProbeGen {
-    fn fill(&mut self, buf: &mut [f32], first_ns: u64) {
-        let w = 2.0 * std::f64::consts::PI * Probe::FREQ_HZ / self.rate;
+    /// Allocates; call off the realtime thread.
+    pub fn new(probe: Arc<Probe>, rate: f64) -> Self {
+        let burst = probe.stimulus.burst(rate);
+        let onset = burst
+            .iter()
+            .position(|x| x.abs() > Probe::THRESHOLD)
+            .unwrap_or(0);
+        let period = ((probe.stimulus.period_s() * rate) as usize).max(burst.len() + 1);
+        Self {
+            probe,
+            rate,
+            burst: burst.into(),
+            onset,
+            period,
+            pos: 0,
+        }
+    }
+
+    /// Overwrite `buf` with the next samples of the burst train. `first_ns` is the capture time
+    /// of `buf[0]`, or 0 if unknown (then no onset is stamped).
+    pub fn fill(&mut self, buf: &mut [f32], first_ns: u64) {
         for (i, s) in buf.iter_mut().enumerate() {
-            if self.pos == 0 && first_ns != 0 {
+            if self.pos == self.onset && first_ns != 0 {
                 let t = first_ns + (i as f64 * 1e9 / self.rate) as u64;
-                self.probe.last_inject_ns.store(t, Relaxed);
-                self.probe.injections.fetch_add(1, Relaxed);
+                self.probe.last_inject_ns.store(t, Release);
+                self.probe.injections.fetch_add(1, Release);
             }
-            *s = if self.pos < self.burst {
-                Probe::AMPLITUDE * (w * self.pos as f64).cos() as f32
-            } else {
-                0.0
-            };
+            *s = self.burst.get(self.pos).copied().unwrap_or(0.0);
             self.pos = (self.pos + 1) % self.period;
         }
     }
@@ -937,13 +1085,7 @@ impl CaptureStage {
         let max_out = (MAX_BLOCK as f64 * RATE / rate).ceil() as usize
             + resampler.as_ref().map_or(0, |r| r.output_frames_max())
             + 16;
-        let probe = shared.probe.clone().map(|probe| ProbeGen {
-            probe,
-            rate,
-            period: (Probe::PERIOD_S * rate) as usize,
-            burst: (Probe::BURST_S * rate) as usize,
-            pos: 0,
-        });
+        let probe = shared.probe.clone().map(|probe| ProbeGen::new(probe, rate));
         let source = shared
             .source
             .clone()
@@ -1464,6 +1606,87 @@ mod tests {
         t.record(7);
         assert_eq!(t.first_ns(), 7);
         assert_eq!(t.quantile_ns(0.5), None);
+    }
+
+    #[test]
+    fn deadline_misses_count_overruns_of_the_period() {
+        let t = CallbackTimes::new();
+        // No period yet: nothing can miss.
+        t.record(1);
+        t.record(9_000_000);
+        assert_eq!(t.deadline_misses(), 0);
+        t.period_ns.store(5_000_000, Relaxed);
+        t.reset();
+        // The first (priming) callback never counts, however long.
+        t.record(50_000_000);
+        t.record(5_000_000); // exactly on time
+        t.record(5_000_001);
+        t.record(100_000);
+        t.record(20_000_000);
+        assert_eq!(t.deadline_misses(), 2);
+        // p99.9 sits between p99 and the maximum.
+        let (p99, p999) = (t.quantile_ns(0.99).unwrap(), t.quantile_ns(0.999).unwrap());
+        assert!(p99 <= p999 && p999 <= t.max_ns());
+        t.reset();
+        assert_eq!(t.deadline_misses(), 0);
+        // `reset` keeps the period.
+        assert_eq!(t.period_ns.load(Relaxed), 5_000_000);
+    }
+
+    #[test]
+    fn tone_probe_matches_the_original_burst_train() {
+        let probe = Arc::new(Probe::new());
+        assert_eq!(probe.stimulus, Stimulus::Tone);
+        let mut g = ProbeGen::new(probe.clone(), 48_000.0);
+        let mut buf = vec![9.0f32; 48_000];
+        g.fill(&mut buf, 1_000_000_000);
+        // Onset at the first sample, at full amplitude; 480 samples of 1 kHz, then silence.
+        assert_eq!(buf[0], Probe::AMPLITUDE);
+        assert!(
+            (buf[48] - Probe::AMPLITUDE).abs() < 1e-4,
+            "one 1 kHz period later"
+        );
+        assert!(buf[480..24_000].iter().all(|&x| x == 0.0));
+        assert_eq!(buf[24_000], Probe::AMPLITUDE);
+        assert_eq!(probe.injections.load(Relaxed), 2);
+        assert_eq!(probe.last_inject_ns.load(Relaxed), 1_500_000_000);
+    }
+
+    #[test]
+    fn speech_probe_is_a_voiced_burst_stamped_at_its_onset() {
+        for rate in [16_000.0, 44_100.0, 48_000.0] {
+            let probe = Arc::new(Probe::with_stimulus(Stimulus::Speech));
+            let mut g = ProbeGen::new(probe.clone(), rate);
+            let n = (rate * 1.6) as usize;
+            let mut buf = vec![9.0f32; n];
+            g.fill(&mut buf, 1_000_000_000);
+            let period = (0.8 * rate) as usize;
+            let burst = (0.12 * rate) as usize;
+            let peak = buf.iter().fold(0.0f32, |m, x| m.max(x.abs()));
+            assert!(
+                (peak - Probe::AMPLITUDE).abs() < 1e-4,
+                "{rate}: peak {peak}"
+            );
+            // Silence between bursts, the same burst again one period later.
+            assert!(buf[burst..period].iter().all(|&x| x == 0.0), "{rate}");
+            assert_eq!(buf[..burst], buf[period..period + burst], "{rate}");
+            // Stamped at the first sample a recorder would detect, within the 2 ms attack.
+            let onset = buf.iter().position(|x| x.abs() > Probe::THRESHOLD).unwrap();
+            assert!(onset as f64 <= 0.003 * rate, "{rate}: onset at {onset}");
+            assert_eq!(probe.injections.load(Relaxed), 2);
+            let want = 1_000_000_000 + ((period + onset) as f64 * 1e9 / rate) as u64;
+            assert_eq!(probe.last_inject_ns.load(Relaxed), want, "{rate}");
+            // Speech-like voiced burst (with mild breath): far more zero crossings than a slow
+            // ramp, far fewer than white noise (~0.5 crossings/sample).
+            let zc = buf[..burst]
+                .windows(2)
+                .filter(|w| (w[0] >= 0.0) != (w[1] >= 0.0))
+                .count();
+            assert!(
+                zc > 20 && zc < burst / 4,
+                "{rate}: {zc} zero crossings (burst {burst})"
+            );
+        }
     }
 
     #[test]

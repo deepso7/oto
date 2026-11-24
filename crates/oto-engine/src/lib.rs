@@ -10,6 +10,7 @@ pub use oto_dsp as dsp;
 
 mod control;
 pub mod latency;
+pub mod offline;
 /// The realtime path. Public only for the integration tests in `tests/` (allocation counting
 /// needs its own test binary); not a stable API.
 #[doc(hidden)]
@@ -18,7 +19,7 @@ mod platform;
 mod state;
 
 pub use control::{available_tiers, model_for};
-pub use pipeline::Probe;
+pub use pipeline::{Probe, Stimulus};
 
 use std::path::PathBuf;
 use std::sync::atomic::Ordering::Relaxed;
@@ -382,7 +383,10 @@ pub struct CallbackStats {
     pub period_us: f32,
     pub p50_us: f32,
     pub p99_us: f32,
+    pub p999_us: f32,
     pub max_us: f32,
+    /// Callbacks past the first that took longer than `period_us`.
+    pub deadline_misses: u64,
     /// The first callback, which primes the model on the audio thread. Not included in the
     /// percentiles or the maximum.
     pub first_us: f32,
@@ -396,7 +400,9 @@ impl CallbackStats {
             period_us: us(t.period_ns.load(Relaxed)),
             p50_us: t.quantile_ns(0.5).map_or(0.0, us),
             p99_us: t.quantile_ns(0.99).map_or(0.0, us),
+            p999_us: t.quantile_ns(0.999).map_or(0.0, us),
             max_us: us(t.max_ns()),
+            deadline_misses: t.deadline_misses(),
             first_us: us(t.first_ns()),
         }
     }

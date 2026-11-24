@@ -5,6 +5,9 @@ notice that license asks to be reproduced. Where a component is offered under a 
 licenses, Oto uses it under the MIT license; the Apache License 2.0 text is in `LICENSE-APACHE`
 next to this file.
 
+A machine-readable list of the models, with pinned versions, SHA-256 hashes and whether each
+may ship in a release, is in `MODELS.toml` at the root of the source repository.
+
 ## DeepFilterNet (libDF code and DeepFilterNet3 model weights)
 
 - Source: https://github.com/Rikorose/DeepFilterNet, commit

@@ -1,0 +1,171 @@
+# Evaluation gates for Oto (docs/plans/0002-e2e-roadmap.md).
+#
+# Gate keys are `min_<metric>` or `max_<metric>`; eval.py compares them with the metric of the
+# same name. A gate whose metric was not measured is reported as "missing", which fails only
+# with `--strict`. Gates are never loosened to let a candidate through in the same change.
+
+[meta]
+schema_version = 1
+plan = "docs/plans/0002-e2e-roadmap.md"
+provisional_latency = true
+note = """
+Latency ceilings are component-derived (plan 0002). macOS figures for RNNoise and
+DeepFilterNet3 are measured; Linux, DPDFNet-2 end-to-end and Nearfield figures are
+provisional. Replace them with values measured in Phase 1 (Linux, `oto latency` speech
+onsets) and Phase 2 (Nearfield) before freezing this file. The CI bars below were set for the
+synthetic fixtures in fixtures.py and are sanity bars, not quality scores. First calibrated
+against `oto process` (debug build, Apple silicon) on 2026-11-25: every shipped model passes
+with margin; freeze them once a release build and Linux have been run too."""
+provisional_ci_bars = true
+strengths = ["light", "balanced", "strong"]
+# Engine attenuation caps per strength (oto-engine `Strength`): Light 12 dB, Balanced 24 dB,
+# Strong unlimited. The CI bars check these semantics from above as well as from below.
+#
+# `*_attenuation_db` is what the listener hears (input vs output). `*_model_attenuation_db`
+# and the SI-SDR figures compare against the same input through the bypassed chain
+# (--no-denoise keeps the 80 Hz high-pass and limiter), so they measure the model alone; the
+# strength caps are checked on those.
+
+# ---------------------------------------------------------------------------------------------
+# Shared CI bars, applied to every model before its own table overrides them.
+[ci]
+max_nan_count = 0
+max_clip_count = 0
+max_peak_dbfs = -0.5                   # the chain's limiter holds −1 dBFS
+max_delay_error_samples = 2            # impulse delay in bypass vs MODELS.toml chain latency
+max_envelope_delay_error_ms = 20.0     # coarse delay on noisy speech, denoising on
+min_length_ratio = 0.99                # output frames / input frames
+max_length_ratio = 1.10
+max_silence_output_dbfs = -80.0        # silence in, silence out: no hallucinated noise
+min_clean_speech_level_change_db = -10.0   # synthetic voice, clean: not destroyed
+max_clean_speech_level_change_db = 1.0
+min_noisy_speech_level_change_db = -12.0
+min_noisy_5db_si_sdr_delta_db = 3.0     # measured 4.7–7.3 dB
+
+# Floors sit about 5 dB under the slowest shipped model measured on 2026-11-25 (in brackets).
+[ci.light]
+min_noise_only_attenuation_db = 8.0          # [14.0]
+max_noise_only_model_attenuation_db = 12.5   # cap 12 dB; measured 11.7–12.0
+min_noisy_15db_attenuation_db = 8.0          # [13.0]
+min_noisy_5db_attenuation_db = 8.0           # [13.0]
+min_hfp_attenuation_db = 8.0                 # [14.6]
+
+[ci.balanced]
+min_noise_only_attenuation_db = 18.0         # [24.7]
+max_noise_only_model_attenuation_db = 24.5   # cap 24 dB; measured 22.4–24.0
+min_noisy_15db_attenuation_db = 15.0         # [20.7]
+min_noisy_5db_attenuation_db = 15.0          # [20.4]
+min_hfp_attenuation_db = 15.0                # [23.5]
+
+[ci.strong]
+min_noise_only_attenuation_db = 40.0         # [56.5]; RNNoise overrides below
+min_noisy_15db_attenuation_db = 30.0         # [36.7]
+min_noisy_5db_attenuation_db = 30.0          # [38.4]
+min_hfp_attenuation_db = 30.0                # [39.2]
+
+# ---------------------------------------------------------------------------------------------
+# Per-model gates. `chain_latency_ms` documents MODELS.toml's frame + latency (test_eval.py keeps
+# them in step); the CI suite measures the delay itself.
+# Bench gates read `oto bench --json` (bench.rs field names: p50_us, p99_us, p999_us, max_us,
+# realtime_factor, cpu_percent) on 480-sample (10 ms) blocks.
+
+[models.rnnoise]
+chain_latency_ms = 20.0
+max_macos_e2e_latency_ms = 40.0        # measured 34–35 ms
+max_linux_e2e_latency_ms = 35.0        # provisional
+max_bench_cpu_percent = 2.0            # measured 0.44%
+min_bench_realtime_factor = 50.0
+max_bench_p999_us = 2000.0
+max_live_deadline_misses = 0
+max_live_starvations = 0
+
+[models.rnnoise.ci.strong]
+# RNNoise is the weak model: no learned limit at Strong, so it stops well short of the others.
+min_noise_only_attenuation_db = 25.0         # [36.0]
+min_noisy_15db_attenuation_db = 18.0         # [24.6]
+min_noisy_5db_attenuation_db = 18.0          # [23.9]
+min_hfp_attenuation_db = 22.0                # [29.6]
+
+[models.dfn3]
+chain_latency_ms = 40.0
+max_macos_e2e_latency_ms = 65.0        # measured 61–63 ms
+max_linux_e2e_latency_ms = 62.0        # provisional
+max_bench_cpu_percent = 10.0           # measured 6.7%
+min_bench_realtime_factor = 10.0
+max_bench_p999_us = 5000.0
+max_live_deadline_misses = 0
+max_live_starvations = 0
+
+[models.dpdfnet2_48khz_hr]
+chain_latency_ms = 60.0
+max_macos_e2e_latency_ms = 85.0        # ~81–83 ms, component-derived
+max_linux_e2e_latency_ms = 82.0        # provisional
+max_bench_cpu_percent = 30.0           # 2.0–2.2 ms per 10 ms frame in ORT
+min_bench_realtime_factor = 3.3
+max_bench_p999_us = 7000.0
+max_live_deadline_misses = 0
+max_live_starvations = 0
+
+[models.fastenhancer_s_48khz]
+# Evaluation only (MODELS.toml ship_in_release = false). 512-sample frames.
+chain_latency_ms = 21.33
+max_macos_e2e_latency_ms = 50.0        # provisional
+max_linux_e2e_latency_ms = 45.0        # provisional
+max_bench_cpu_percent = 25.0
+min_bench_realtime_factor = 4.0
+max_bench_p999_us = 7000.0
+
+[models.nearfield_v2_3_fast]
+# Phase 2 candidate. 48 ms model + 8 ms adapter + ~2–3 ms resamplers.
+chain_latency_ms = 59.0
+max_macos_e2e_latency_ms = 82.0        # provisional; ~87–90 ms behind the Phase 3 10 ms clock + 6 ms FIFO
+max_linux_e2e_latency_ms = 81.0        # provisional; ~83–89 ms behind the 10 ms clock
+max_macos_e2e_latency_ms_phase3 = 90.0
+max_linux_e2e_latency_ms_phase3 = 89.0
+max_bench_cpu_percent = 25.0
+max_live_deadline_misses = 0
+max_live_starvations = 0
+
+# ---------------------------------------------------------------------------------------------
+# Voice Isolation (Phase 2). Fault injection and healthy-inference quality are separate gates.
+
+[voice_isolation.fault_injection]
+# Hard bar: zero raw-mic leak on every injected fault, at every strength. Metric: leaked
+# samples above −60 dBFS that correlate with the raw input (counted by the engine's fault
+# tests and reported as JSON to `eval.py --fault-report`).
+leak_threshold_dbfs = -60.0
+cases = [
+  "startup",
+  "starvation",
+  "overflow_flush",
+  "inference_error",
+  "load_failure",
+  "mode_switch_preload",
+]
+strengths = ["light", "balanced", "strong"]
+max_leaked_samples = 0
+max_leaked_frames = 0
+# A load failure must raise Event::Degraded and stay muted, never fall back to RNNoise.
+max_fallback_to_other_model = 0
+
+[voice_isolation.opt_in]
+# Healthy inference, to ship Voice Isolation as an opt-in mode. Same-ASR head-to-head on the
+# permissive holdout and Krisp VI (local only). Frozen before Phase 2 is declared done.
+max_background_leaked_words_per_min = 2.0
+max_overlap_leakage_db = -15.0         # interferer energy kept, relative to the input
+max_first_word_deletion_rate = 0.05
+max_wrong_speaker_rate = 0.02
+max_target_wer_delta = 0.05            # absolute WER increase vs the unprocessed input
+max_speech_onset_miss_rate = 0.02
+max_noise_only_hallucinated_words_per_min = 1.0
+
+[voice_isolation.default_promotion]
+# To replace DeepFilterNet3 as the default. Stricter on every axis.
+max_background_leaked_words_per_min = 0.5
+max_overlap_leakage_db = -25.0
+max_first_word_deletion_rate = 0.01
+max_wrong_speaker_rate = 0.005
+max_target_wer_delta = 0.01
+max_speech_onset_miss_rate = 0.005
+max_noise_only_hallucinated_words_per_min = 0.25
+max_macos_e2e_latency_ms = 65.0        # no worse than DeepFilterNet3's latency class
