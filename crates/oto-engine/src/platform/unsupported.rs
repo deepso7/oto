@@ -72,3 +72,39 @@ impl Recorder {
         Err(UNSUPPORTED.into())
     }
 }
+
+pub fn resolve_physical_input(
+    _uids: &Uids,
+    _preferred: Option<&str>,
+    _last: Option<&str>,
+) -> Option<String> {
+    None
+}
+pub fn is_bluetooth(_uid: &str) -> bool {
+    false
+}
+pub fn nominal_rate(_uid: &str) -> Option<f64> {
+    None
+}
+pub struct MonoRecorder;
+
+impl MonoRecorder {
+    pub fn start(
+        _uid: &str,
+        _cancel: &std::sync::atomic::AtomicBool,
+        _f: Box<dyn FnMut(&[f32]) + Send>,
+    ) -> Result<Self, String> {
+        Err(UNSUPPORTED.into())
+    }
+}
+
+pub struct Player;
+
+impl Player {
+    pub fn start<B>(_build: B) -> Result<Self, String>
+    where
+        B: FnOnce(f64) -> Result<Box<dyn FnMut(&mut [f32]) + Send>, String>,
+    {
+        Err(UNSUPPORTED.into())
+    }
+}

@@ -997,7 +997,8 @@ def run_bench(binary: str, models: list[ModelSpec], gates: dict, seconds: float,
 def evaluate_fault_report(report: dict, gates: dict) -> dict:
     """Checks an engine fault-injection report against [voice_isolation.fault_injection].
     Format: {"model": ..., "cases": [{"case", "strength", "leaked_samples", "leaked_frames",
-    "fallback_to_other_model"}]}. Every case × strength must be present: the bar is hard."""
+    "fallback_to_other_model", "isolator"}]}. Every case × strength must be present: the bar is
+    hard. `real_model_cases` must have run the real model, not the "silencer" stand-in."""
     g = gates.get("voice_isolation", {}).get("fault_injection", {})
     seen = {(c.get("case"), c.get("strength")): c for c in report.get("cases", [])}
     checks = []
@@ -1007,6 +1008,13 @@ def evaluate_fault_report(report: dict, gates: dict) -> dict:
             if c is None:
                 checks.append({"gate": f"{case}/{strength}", "metric": "present", "op": "min", "threshold": 1, "value": 0, "status": "fail"})
                 continue
+            if case in g.get("real_model_cases", []):
+                iso = c.get("isolator")
+                want = g.get("real_model_isolator", "nearfield")
+                checks.append({"gate": f"{case}/{strength}/real_model", "metric": "isolator", "op": "eq", "threshold": want, "value": iso, "status": "pass" if iso == want else "fail"})
+            checked = c.get("checked_samples")
+            ok_checked = isinstance(checked, int) and not isinstance(checked, bool) and checked > 0
+            checks.append({"gate": f"{case}/{strength}/checked_samples", "metric": "checked_samples", "op": "min", "threshold": 1, "value": checked, "status": "pass" if ok_checked else "fail"})
             for metric in ("leaked_samples", "leaked_frames", "fallback_to_other_model"):
                 limit = g.get(f"max_{metric}")
                 if limit is None:

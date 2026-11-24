@@ -30,6 +30,13 @@ pub(crate) fn default_dir() -> Option<PathBuf> {
     }
 }
 
+/// The physical default input an engine will put back once Oto Microphone stops being the
+/// default, i.e. the mic it captures from while Oto Microphone is the default. `None` when
+/// there is nothing to restore.
+pub(crate) fn remembered_input(dir: &Path) -> Option<String> {
+    read(&dir.join(RESTORE_FILE))
+}
+
 /// Held for the lifetime of an [`crate::Engine`]: an exclusive advisory lock on a file in the
 /// state directory. The OS releases it when the file closes, including when the process dies,
 /// so a crash never leaves a stale lock.

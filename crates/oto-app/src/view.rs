@@ -11,7 +11,9 @@ use rune_kit::{
 
 use crate::meter::{BAR_H, BAR_W};
 use crate::permission::Mic;
-use crate::state::{EngineState, HEAR_TEST, Install, Open, Page, STRENGTHS, State};
+use crate::state::{
+    EngineState, HEAR_TEST, HearTest, Install, MODES, Open, Page, STRENGTHS, State,
+};
 
 pub const WIDTH: f32 = 340.0;
 const PAD: f32 = 16.0;
@@ -68,7 +70,7 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
     } else {
         match s.page {
             Page::Main => main_page(s, &p, &mut layer),
-            Page::Settings => settings_page(s, &p),
+            Page::Settings => settings_page(s, &p, &mut layer),
         }
     };
     let mut window = col()
@@ -187,15 +189,8 @@ fn switch(
 }
 
 /// The main on/off: bigger than a settings toggle.
-fn big_switch(p: &Paint, on: bool) -> El {
-    switch(
-        p,
-        "switch",
-        "Noise cancellation",
-        on,
-        (46.0, 28.0),
-        Some(|s| s.toggle()),
-    )
+fn big_switch(p: &Paint, label: &str, on: bool) -> El {
+    switch(p, "switch", label, on, (46.0, 28.0), Some(|s| s.toggle()))
 }
 
 /// A settings-sized switch; `enabled` false shows it dimmed and inert.
@@ -339,6 +334,148 @@ fn mic_notice(s: &State, p: &Paint) -> Option<El> {
     }
 }
 
+/// Voice Isolation can't run, so Oto Microphone is muted: what happened, and the way out.
+fn degraded_banner(p: &Paint, title: &str, msg: &str) -> El {
+    let c = &p.k.c.warning;
+    col()
+        .key("degraded")
+        .role("alert")
+        .w_full()
+        .px(12.0)
+        .py(10.0)
+        .gap(8.0)
+        .radius(8.0)
+        .fill(c.bg)
+        .border(p.hair, c.border)
+        .child(
+            text(title.to_owned())
+                .key("degraded-title")
+                .font(LABEL)
+                .color(c.fg)
+                .wrap()
+                .w_full(),
+        )
+        .child(
+            text(msg.to_owned())
+                .key("degraded-message")
+                .font(CAPTION)
+                .color(c.fg)
+                .wrap()
+                .w_full(),
+        )
+        .child(
+            row().w_full().child(
+                Button::new("Switch to Noise Cancellation")
+                    .control_size(ControlSize::Small)
+                    .on_press(|s: &mut State| s.switch_to_noise_cancellation())
+                    .build(&p.k)
+                    .key("degraded-action"),
+            ),
+        )
+}
+
+/// "Hear the Difference": a button, then the recording, then raw-or-cleaned playback.
+fn hear_card(s: &State, p: &Paint) -> El {
+    let title = text("Hear the Difference")
+        .key("hear-title")
+        .font(LABEL)
+        .color(p.t.text_secondary)
+        .a11y_hidden();
+    let mut c = card(p, "hear").py(12.0).gap(8.0).child(title);
+    match &s.hear {
+        HearTest::Idle | HearTest::Failed(_) => {
+            let blocked = s.hear_blocked();
+            let retry = matches!(s.hear, HearTest::Failed(_));
+            if let HearTest::Failed(msg) = &s.hear {
+                c = c.child(
+                    text(msg.clone())
+                        .key("hear-error")
+                        .font(CAPTION)
+                        .color(p.k.c.danger.fg)
+                        .wrap()
+                        .w_full(),
+                );
+            }
+            c = c.child(caption(
+                p,
+                "hear-about",
+                blocked.unwrap_or(
+                    "Record 5 seconds of your voice, then compare the original with Oto\u{2019}s version.",
+                ),
+            ));
+            c.child(
+                row().w_full().child(
+                    Button::new(if retry { "Try Again" } else { "Record 5 s" })
+                        .variant(ButtonVariant::Outline)
+                        .disabled(blocked.is_some())
+                        .on_press(|s: &mut State| s.start_hear_test())
+                        .build(&p.k)
+                        .key("hear-start"),
+                ),
+            )
+        }
+        HearTest::Recording { processing } => c
+            .child(caption(
+                p,
+                "hear-progress",
+                if *processing {
+                    "Processing\u{2026}"
+                } else {
+                    "Recording 5 s\u{2026} Speak normally, with your usual background."
+                },
+            ))
+            .child(
+                row().w_full().child(
+                    Button::new(if *processing { "Cancel" } else { "Stop" })
+                        .variant(ButtonVariant::Outline)
+                        .on_press(|s: &mut State| s.stop_hear_test())
+                        .build(&p.k)
+                        .key("hear-stop"),
+                ),
+            ),
+        HearTest::Ready {
+            cleaned,
+            is_bluetooth_hfp,
+        } => {
+            let ab = SegmentedControl::new(&["Original", "Cleaned"], Some(usize::from(*cleaned)))
+                .width(Some(CARD_INNER))
+                .label("Playback")
+                .on_pick(|s: &mut State, i: usize, _| s.set_hear_cleaned(i == 1))
+                .build(&p.k);
+            c = c.child(el().key("hear-ab").w_full().child(ab));
+            if *is_bluetooth_hfp {
+                c = c.child(caption(
+                    p,
+                    "hear-hfp",
+                    "Recorded in Bluetooth hands-free mode, so this take sounds narrower than your headset does for music.",
+                ));
+            }
+            c.child(
+                row()
+                    .key("hear-actions")
+                    .w_full()
+                    .gap(8.0)
+                    .justify_between()
+                    .child(
+                        Button::new("Record Again")
+                            .variant(ButtonVariant::Ghost)
+                            .disabled(s.hear_blocked().is_some())
+                            .on_press(|s: &mut State| s.start_hear_test())
+                            .build(&p.k)
+                            .key("hear-again"),
+                    )
+                    .child(
+                        Button::new("Done")
+                            .variant(ButtonVariant::Outline)
+                            .on_press(|s: &mut State| s.stop_hear_test())
+                            .build(&p.k)
+                            .key("hear-done"),
+                    ),
+            )
+        }
+    }
+}
+
 /// Stands in for the controls while there's no engine for them to control.
 fn engine_card(p: &Paint, msg: &str) -> El {
     card(p, "engine")
@@ -367,10 +504,7 @@ fn main_page(s: &State, p: &Paint, layer: &mut Vec<El>) -> El {
     let gear = IconButton::new(&SLIDERS)
         .variant(IconButtonVariant::GhostMuted)
         .label("Settings")
-        .on_press(|s: &mut State| {
-            s.open = None;
-            s.page = Page::Settings;
-        })
+        .on_press(State::open_settings)
         .build(&p.k)
         .key("settings");
 
@@ -387,6 +521,12 @@ fn main_page(s: &State, p: &Paint, layer: &mut Vec<El>) -> El {
         return page.child(status_line(s, p));
     }
 
+    let isolating = s.isolating();
+    let hero_title = if isolating {
+        "Voice Isolation"
+    } else {
+        "Noise cancellation"
+    };
     let hero = card(p, "hero").py(14.0).child(
         row()
             .w_full()
@@ -398,7 +538,7 @@ fn main_page(s: &State, p: &Paint, layer: &mut Vec<El>) -> El {
                     .shrink()
                     .gap(3.0)
                     .child(
-                        text("Noise cancellation")
+                        text(hero_title)
                             .key("hero-title")
                             .font(TITLE)
                             .color(p.t.text),
@@ -406,6 +546,10 @@ fn main_page(s: &State, p: &Paint, layer: &mut Vec<El>) -> El {
                     .child(
                         text(if !on {
                             "Turn on to remove background noise"
+                        } else if s.degraded.is_some() {
+                            "Muted until it can run again"
+                        } else if s.clients_active && isolating {
+                            "Keeping only your voice"
                         } else if s.clients_active {
                             "Cleaning your voice"
                         } else {
@@ -416,7 +560,7 @@ fn main_page(s: &State, p: &Paint, layer: &mut Vec<El>) -> El {
                         .color(p.t.text_secondary),
                     ),
             )
-            .child(big_switch(p, on)),
+            .child(big_switch(p, hero_title, on)),
     );
 
     let options: Vec<String> = s.device_options().into_iter().map(|(_, l)| l).collect();
@@ -447,32 +591,31 @@ fn main_page(s: &State, p: &Paint, layer: &mut Vec<El>) -> El {
     .label("Strength")
     .on_pick(|s: &mut State, i: usize, _| s.set_strength(STRENGTHS[i].0))
     .build(&p.k);
-    let mut controls = card(p, "controls")
-        .py(12.0)
-        .gap(12.0)
-        .child(labelled(p, "mic-row", "Microphone", device))
-        .child(labelled(p, "strength-row", "Strength", strength));
-    // Only when the choice changes something: with one model in the build there's no picker.
-    if s.offers_tiers() {
-        let options = s.tier_options();
-        let model = Select::new("model-picker", &options)
-            .appearance(SelectAppearance::Field)
-            .width(CARD_INNER)
-            .label("Model")
-            .current(Some(s.tier_label()))
-            .open(s.open == Some(Open::Model))
-            .on_toggle(|s: &mut State| s.toggle_open(Open::Model))
-            .on_close(|s: &mut State| s.open = None)
-            .on_choose(|s: &mut State, v: &str, _| s.choose_tier(v))
-            .placement(Placement::BottomStart)
-            .build(&p.k, layer);
-        if s.open == Some(Open::Model)
-            && let Some(list) = layer.pop()
-        {
-            layer.push(list.w(CARD_INNER));
+    let mut controls =
+        card(p, "controls")
+            .py(12.0)
+            .gap(12.0)
+            .child(labelled(p, "mic-row", "Microphone", device));
+    // Two modes only when this build has Voice Isolation. The Noise Cancellation model is a
+    // setting.
+    if s.offers_isolation() {
+        let labels: Vec<&str> = MODES.iter().map(|(_, l)| *l).collect();
+        let mode = SegmentedControl::new(&labels, MODES.iter().position(|(m, _)| *m == s.mode()))
+            .width(Some(CARD_INNER))
+            .label("Mode")
+            .on_pick(|s: &mut State, i: usize, _| s.set_mode(MODES[i].0))
+            .build(&p.k);
+        let mut row = labelled(p, "mode-row", "Mode", mode);
+        if isolating {
+            row = row.child(caption(
+                p,
+                "mode-about",
+                "Removes background noise and nearby voices. If it can\u{2019}t run, your microphone goes silent instead of passing them through.",
+            ));
         }
-        controls = controls.child(labelled(p, "model-row", "Model", model));
+        controls = controls.child(row);
     }
+    controls = controls.child(labelled(p, "strength-row", "Strength", strength));
 
     let metering = on && s.clients_active;
     let mut meter = card(p, "meter")
@@ -511,6 +654,26 @@ fn main_page(s: &State, p: &Paint, layer: &mut Vec<El>) -> El {
     } else if let Some(n) = mic_notice(s, p) {
         page = page.child(n);
     }
+    if on && let Some(msg) = &s.degraded {
+        page = page.child(degraded_banner(
+            p,
+            "Voice Isolation is muting your microphone",
+            msg,
+        ));
+    } else if s.isolating() && !s.offers_isolation() {
+        let (title, msg) = if on {
+            (
+                "Voice Isolation is muting your microphone",
+                "Voice Isolation isn\u{2019}t included in this copy of Oto, so Oto Microphone stays muted until you switch modes.",
+            )
+        } else {
+            (
+                "Voice Isolation is unavailable",
+                "Voice Isolation isn\u{2019}t included in this copy of Oto. Processing is off (bypass); turning it on will mute Oto Microphone until you switch modes.",
+            )
+        };
+        page = page.child(degraded_banner(p, title, msg));
+    }
     if let Some(msg) = &s.model_notice {
         page = page.child(notice(
             p,
@@ -536,15 +699,7 @@ fn main_page(s: &State, p: &Paint, layer: &mut Vec<El>) -> El {
         ));
     }
     if HEAR_TEST {
-        // TODO(engine): record 5 s from the real mic, then play it back raw and cleaned. Needs an
-        // engine API for a test capture; hidden behind HEAR_TEST until then.
-        page = page.child(
-            Button::new("Hear the Difference")
-                .variant(ButtonVariant::Outline)
-                .on_press(|_: &mut State| {})
-                .build(&p.k)
-                .key("hear"),
-        );
+        page = page.child(hear_card(s, p));
     }
     page.child(status_line(s, p))
 }
@@ -583,7 +738,10 @@ fn meter_row(p: &Paint, key: &str, label: &str, live: &rune::Live<[f32; 4]>, col
 fn status_line(s: &State, p: &Paint) -> El {
     let dot = if !matches!(s.engine, EngineState::Running) || !s.driver_known {
         p.t.text_secondary.alpha(0.5)
-    } else if !s.driver_installed || s.mic.blocked() {
+    } else if !s.driver_installed
+        || s.mic.blocked()
+        || (s.prefs.enabled && (s.degraded.is_some() || (s.isolating() && !s.offers_isolation())))
+    {
         p.amber
     } else if s.prefs.enabled && s.clients_active {
         p.green
@@ -631,7 +789,46 @@ fn status_line(s: &State, p: &Paint) -> El {
     r
 }
 
-fn settings_page(s: &State, p: &Paint) -> El {
+/// The Noise Cancellation model picker, when this build has more than one.
+fn models_card(s: &State, p: &Paint, layer: &mut Vec<El>) -> Option<El> {
+    if !s.offers_tiers() {
+        return None;
+    }
+    let options = s.tier_options();
+    let model = Select::new("model-picker", &options)
+        .appearance(SelectAppearance::Field)
+        .width(CARD_INNER)
+        .label("Noise Cancellation model")
+        .current(Some(s.tier_label()))
+        .open(s.open == Some(Open::Model))
+        .on_toggle(|s: &mut State| s.toggle_open(Open::Model))
+        .on_close(|s: &mut State| s.open = None)
+        .on_choose(|s: &mut State, v: &str, _| s.choose_tier(v))
+        .placement(Placement::BottomStart)
+        .build(&p.k, layer);
+    if s.open == Some(Open::Model)
+        && let Some(list) = layer.pop()
+    {
+        layer.push(list.w(CARD_INNER));
+    }
+    Some(
+        card(p, "models")
+            .py(12.0)
+            .gap(8.0)
+            .child(labelled(p, "model-row", "Noise Cancellation model", model))
+            .child(caption(
+                p,
+                "model-about",
+                if s.isolating() {
+                    "Used when you switch back to Noise Cancellation."
+                } else {
+                    "DeepFilterNet3 suits most calls. RNNoise uses the least CPU."
+                },
+            )),
+    )
+}
+
+fn settings_page(s: &State, p: &Paint, layer: &mut Vec<El>) -> El {
     let back = IconButton::new(&CHEVRON_LEFT)
         .variant(IconButtonVariant::GhostMuted)
         .label("Back")
@@ -750,6 +947,7 @@ fn settings_page(s: &State, p: &Paint) -> El {
         .w_full()
         .gap(12.0)
         .child(header(p, "Settings", Some(back), None))
+        .children(models_card(s, p, layer))
         .child(general)
         .child(driver);
     if let Some(e) = &s.error {
@@ -1030,7 +1228,7 @@ mod tests {
     #[test]
     fn strength_segments_send_strength() {
         let mut rt = runtime(installed());
-        click(&mut rt, "segment2");
+        click(&mut rt, "strength-row/segment2");
         assert_eq!(rt.state.prefs.strength, Strength::Strong);
         assert_eq!(sent(&rt), [Command::SetStrength(Strength::Strong)]);
     }
@@ -1151,13 +1349,26 @@ mod tests {
         assert_eq!(OPENED.load(Ordering::Relaxed), 1);
     }
 
-    #[test]
-    fn the_model_picker_shows_only_with_a_choice() {
+    fn settings() -> State {
         let mut s = installed();
-        s.tiers = vec![Tier::Standard];
+        s.page = Page::Settings;
+        s
+    }
+
+    #[test]
+    fn the_model_picker_is_in_settings_only_with_a_choice() {
+        let mut s = settings();
+        s.tiers = vec![Tier::Standard, Tier::Isolate];
         assert!(runtime(s).find("model-row").is_none());
 
         let mut s = installed();
+        s.tiers = vec![Tier::Light, Tier::Standard, Tier::Max, Tier::Fast];
+        assert!(
+            runtime(s).find("model-row").is_none(),
+            "not on the main page"
+        );
+
+        let mut s = settings();
         s.tiers = vec![Tier::Light, Tier::Standard, Tier::Max, Tier::Fast];
         let mut rt = runtime(s);
         assert!(rt.find("model-row").is_some());
@@ -1171,9 +1382,106 @@ mod tests {
 
         // What this build offers decides the default state.
         assert_eq!(
-            runtime(installed()).find("model-row").is_some(),
-            oto_engine::available_tiers().len() > 1
+            runtime(settings()).find("model-row").is_some(),
+            oto_engine::available_tiers()
+                .iter()
+                .filter(|t| **t != Tier::Isolate)
+                .count()
+                > 1
         );
+    }
+
+    #[test]
+    fn two_modes_show_only_with_voice_isolation() {
+        let mut s = installed();
+        s.tiers = vec![Tier::Light, Tier::Standard, Tier::Max];
+        assert!(runtime(s).find("mode-row").is_none());
+
+        let mut s = installed();
+        s.tiers = vec![Tier::Light, Tier::Standard, Tier::Max, Tier::Isolate];
+        s.set_tier(Tier::Max);
+        let mut rt = runtime(s);
+        click(&mut rt, "mode-row/segment1");
+        assert_eq!(rt.state.prefs.tier, Tier::Isolate);
+        assert!(rt.find("mode-about").is_some());
+        click(&mut rt, "mode-row/segment0");
+        assert_eq!(rt.state.prefs.tier, Tier::Max, "back to the chosen model");
+        assert_eq!(
+            sent(&rt),
+            [
+                Command::SetTier(Tier::Max),
+                Command::SetTier(Tier::Isolate),
+                Command::SetTier(Tier::Max)
+            ]
+        );
+    }
+
+    #[test]
+    fn the_degraded_banner_switches_to_noise_cancellation() {
+        use oto_engine::Event;
+        let mut s = installed();
+        s.tiers = vec![Tier::Light, Tier::Standard, Tier::Isolate];
+        s.set_tier(Tier::Light);
+        s.set_tier(Tier::Isolate);
+        s.on_event(Event::Degraded("muted".into()));
+        let mut rt = runtime(s);
+        assert!(rt.find("degraded").is_some());
+        assert!(rt.find("error").is_none(), "not an error banner");
+        click(&mut rt, "degraded-action");
+        assert_eq!(rt.state.prefs.tier, Tier::Light);
+        assert_eq!(rt.state.degraded, None);
+        assert!(rt.find("degraded").is_none());
+    }
+
+    #[test]
+    fn hear_the_difference_records_compares_and_stops() {
+        use crate::state::HearTest;
+        use oto_engine::test_capture::TestRecording;
+        static STARTS: AtomicUsize = AtomicUsize::new(0);
+        static STOPS: AtomicUsize = AtomicUsize::new(0);
+        static CLEANED: AtomicUsize = AtomicUsize::new(0);
+        let mut s = installed();
+        s.hooks.start_hear_test = |_| {
+            STARTS.fetch_add(1, Ordering::Relaxed);
+        };
+        s.hooks.stop_hear_test = || {
+            STOPS.fetch_add(1, Ordering::Relaxed);
+        };
+        s.hooks.set_hear_cleaned = |on| {
+            CLEANED.fetch_add(usize::from(on), Ordering::Relaxed);
+        };
+        let mut rt = runtime(s);
+        click(&mut rt, "hear-start");
+        assert_eq!(STARTS.load(Ordering::Relaxed), 1);
+        assert!(rt.find("hear-stop").is_some());
+        let rec = TestRecording {
+            sample_rate: 16_000,
+            raw: vec![0.0; 16_000].into(),
+            cleaned: vec![0.0; 16_000].into(),
+            is_bluetooth_hfp: true,
+        };
+        rt.update(move |s, _| {
+            let job = s.hear_job_for_test();
+            s.hear_recorded(&job, Ok(rec));
+        });
+        rt.frame(1.0 / 60.0);
+        assert!(rt.find("hear-hfp").is_some());
+        click(&mut rt, "hear-ab/segment1");
+        assert_eq!(CLEANED.load(Ordering::Relaxed), 1);
+        click(&mut rt, "hear-done");
+        assert_eq!(STOPS.load(Ordering::Relaxed), 1);
+        assert_eq!(rt.state.hear, HearTest::Idle);
+    }
+
+    #[test]
+    fn hear_the_difference_waits_for_the_call_to_end() {
+        let mut s = installed();
+        s.on_event(oto_engine::Event::ClientsActive(true));
+        s.hooks.start_hear_test = |_| panic!("a disabled button must not start the test");
+        let mut rt = runtime(s);
+        click(&mut rt, "hear-start");
+        assert!(rt.find("hear-about").is_some());
+        assert_eq!(rt.state.hear_blocked(), Some(crate::state::HEAR_IN_CALL));
     }
 
     #[test]

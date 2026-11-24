@@ -158,6 +158,9 @@ impl Path {
             25 => s.max_atten_bits.store(12f32.to_bits(), Relaxed),
             30 => s.max_atten_bits.store(f32::INFINITY.to_bits(), Relaxed),
             35 => s.max_atten_bits.store(24f32.to_bits(), Relaxed),
+            // Voice Isolation's preload mute, on and off.
+            40 => s.mute_output.store(true, Relaxed),
+            45 => s.mute_output.store(false, Relaxed),
             _ => {}
         }
         let n = self.block;
@@ -290,6 +293,17 @@ fn rnnoise_on_the_worker_keeps_the_callback_allocation_free() {
 fn dfn3_runs_on_the_worker_and_the_callback_stays_allocation_free() {
     assert_eq!(placement_for(Model::DeepFilterNet3), Placement::Worker);
     worker_callback_side_never_allocates(Chain::with_model(Model::DeepFilterNet3).unwrap());
+}
+
+/// Nearfield (Voice Isolation) on the worker, fail-closed: its starvations play silence instead
+/// of the dry signal, still without touching the heap in the callback.
+#[cfg(feature = "nearfield")]
+#[test]
+fn nearfield_runs_on_the_worker_and_the_callback_stays_allocation_free() {
+    assert_eq!(placement_for(Model::Nearfield), Placement::Worker);
+    let chain = Chain::with_model(Model::Nearfield).unwrap();
+    assert!(chain.is_fail_closed());
+    worker_callback_side_never_allocates(chain);
 }
 
 #[test]

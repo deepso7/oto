@@ -533,3 +533,175 @@ fn full_chain_recovers_after_nan_and_inf() {
         );
     }
 }
+
+/// A "perfect" isolating model: its output is exact silence. Anything audible coming out of a
+/// fail-closed chain around it can only be the raw input leaking.
+struct Silencer {
+    frame: usize,
+    latency: usize,
+}
+
+impl Denoiser for Silencer {
+    fn frame_size(&self) -> usize {
+        self.frame
+    }
+    fn latency(&self) -> usize {
+        self.latency
+    }
+    fn process_frame(&mut self, _input: &[f32], output: &mut [f32]) {
+        output.fill(0.0);
+    }
+}
+
+fn silencer_chain(model: Model) -> Chain {
+    Chain::with_denoiser(
+        model,
+        Box::new(Silencer {
+            frame: 384,
+            latency: 2014,
+        }),
+    )
+}
+
+/// Voice Isolation fails closed in the chain: no strength floor, no dry signal during warm-up
+/// or the enable ramp. Only an explicit bypass plays the input.
+#[test]
+fn isolating_chain_never_mixes_in_the_dry_signal_while_enabled() {
+    assert!(Model::Nearfield.is_isolating());
+    assert!(Model::ALL.iter().filter(|m| m.is_isolating()).count() == 1);
+    let loud: Vec<f32> = speech_like(SR * 3, 11).iter().map(|s| s * 0.5).collect();
+    for db in [12.0, 24.0, f32::INFINITY] {
+        let mut chain = silencer_chain(Model::Nearfield);
+        assert!(chain.is_fail_closed());
+        chain.set_max_attenuation_db(db);
+        // Fresh start, then bypass → enable (warm-up) twice, at odd block sizes.
+        let mut out = run_chain(&mut chain, &loud[..SR], 333);
+        assert!(out.iter().all(|&s| s == 0.0), "{db} dB: leak at start-up");
+        chain.set_enabled(false);
+        let bypassed = run_chain(&mut chain, &loud[SR..2 * SR], 333);
+        assert!(rms(&bypassed[SR / 2..]) > 0.01, "bypass plays the input");
+        chain.set_enabled(true);
+        out = run_chain(&mut chain, &loud[2 * SR..], 333);
+        assert!(
+            out.iter().all(|&s| s == 0.0),
+            "{db} dB: dry signal in the enable ramp or warm-up"
+        );
+    }
+    // The same model reported as non-isolating leaks at Light (its 12 dB dry floor): the check
+    // above would catch a regression.
+    let mut chain = silencer_chain(Model::DeepFilterNet3);
+    assert!(!chain.is_fail_closed());
+    chain.set_max_attenuation_db(12.0);
+    let out = run_chain(&mut chain, &loud, 480);
+    assert!(rms(&out[SR..]) > 0.01);
+}
+
+/// Real Nearfield in the chain: an injected inference error is exact silence downstream too.
+#[cfg(feature = "nearfield")]
+#[test]
+fn nearfield_chain_fails_closed_on_inference_errors() {
+    let mut chain = Chain::with_model(Model::Nearfield).unwrap();
+    assert!(chain.is_fail_closed());
+    assert_eq!(chain.latency(), 384 + Nearfield::LATENCY);
+    let x: Vec<f32> = speech_like(SR * 3, 4).iter().map(|s| s * 0.5).collect();
+    let mut y = x.clone();
+    let lat = chain.latency();
+    for (k, b) in y.chunks_mut(384).enumerate() {
+        if k == 120 {
+            assert!(chain.inject_inference_error(20));
+        }
+        chain.process(b);
+    }
+    assert!(
+        rms(&y[lat + SR..]) > 1e-3,
+        "Nearfield passes the lone voice"
+    );
+    // Frames 120..140 failed; the adapter emits each frame's output during the next block.
+    let (from, to) = (121 * 384, 141 * 384);
+    assert!(
+        y[from..to].iter().all(|&s| s == 0.0),
+        "audio during failed inference"
+    );
+}
+
+/// DPDFNet-2 matches Ceva's streaming reference where it can be checked without their code:
+/// the delay is exactly `HOP * 5` (upstream `ATTN_LIMIT_NOISY_FRAME_OFFSET`), `reset` restores
+/// bit-identical output, and moving the strength mid-stream ramps without clicks.
+#[cfg(feature = "onnx")]
+#[test]
+fn dpdfnet_delay_reset_and_strength_ramps() {
+    let mut m = DpdfNet::new().unwrap();
+    assert_eq!(m.latency(), 2400);
+    // Delay by cross-correlation on speech-like audio (the model keeps it).
+    let x = speech_like(SR * 2, 21);
+    let mut y = vec![0.0; x.len()];
+    for (i, o) in x
+        .as_chunks::<480>()
+        .0
+        .iter()
+        .zip(y.as_chunks_mut::<480>().0.iter_mut())
+    {
+        m.process_frame(i, o);
+    }
+    let d = measured_delay(&x, &y, 4000);
+    assert!(d.abs_diff(2400) <= 2, "DPDFNet-2 delay {d}");
+    m.reset();
+    let mut again = vec![0.0; x.len()];
+    for (i, o) in x
+        .as_chunks::<480>()
+        .0
+        .iter()
+        .zip(again.as_chunks_mut::<480>().0.iter_mut())
+    {
+        m.process_frame(i, o);
+    }
+    assert_eq!(y, again, "reset does not restore the start state");
+
+    // Light → Balanced → Strong, a second each, on noise alone: once settled, each stricter
+    // strength is several dB quieter (a chain that ignored strength changes would not be).
+    let set = |c: &mut Chain, k: usize| match k {
+        0 => c.set_max_attenuation_db(12.0),
+        100 => c.set_max_attenuation_db(24.0),
+        200 => c.set_max_attenuation_db(f32::INFINITY),
+        _ => {}
+    };
+    let noise = pink_noise(0.05, SR * 3, 5);
+    let mut chain = Chain::with_model(Model::DpdfNet).unwrap();
+    let mut out = noise.clone();
+    for (k, b) in out.chunks_mut(480).enumerate() {
+        set(&mut chain, k);
+        chain.process(b);
+    }
+    // The last half of each second (past the chain's 50 ms delay and the ramp).
+    let settled = |sec: usize| db(rms(&out[sec * SR + SR / 2..(sec + 1) * SR]));
+    let (light, balanced, strong) = (settled(0), settled(1), settled(2));
+    assert!(
+        balanced < light - 4.0 && strong < balanced - 4.0,
+        "noise level by strength: light {light:.1}, balanced {balanced:.1}, strong {strong:.1} dB"
+    );
+
+    // The same switches on a steady tone plus noise: around each one, the largest sample step
+    // stays at what the signal itself does at a fixed strength.
+    let tone = sine(300.0, 0.2, SR * 3);
+    let noise = pink_noise(0.01, SR * 3, 3);
+    let x: Vec<f32> = tone.iter().zip(&noise).map(|(a, b)| a + b).collect();
+    let mut reference = Chain::with_model(Model::DpdfNet).unwrap();
+    let want = run_chain(&mut reference, &x, 480);
+    let mut chain = Chain::with_model(Model::DpdfNet).unwrap();
+    let mut out = x.clone();
+    for (k, b) in out.chunks_mut(480).enumerate() {
+        set(&mut chain, k);
+        chain.process(b);
+    }
+    let step = |v: &[f32]| v.windows(2).fold(0.0f32, |m, w| m.max((w[1] - w[0]).abs()));
+    let lat = chain.latency();
+    for k in [100usize, 200] {
+        // From the switch's block until well after it reaches the output.
+        let w = k * 480..(k * 480 + lat + 3 * 480).min(x.len());
+        let (got, base) = (step(&out[w.clone()]), step(&want[w]));
+        assert!(
+            got < base * 1.5 + 0.005,
+            "strength switch at block {k} clicks: {got} vs {base}"
+        );
+    }
+}

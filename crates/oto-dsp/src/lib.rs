@@ -7,6 +7,8 @@ mod bench;
 #[cfg(feature = "dfn3")]
 mod dfn3;
 pub mod filters;
+#[cfg(feature = "nearfield")]
+mod nearfield;
 #[cfg(feature = "onnx")]
 mod onnx;
 mod rnnoise;
@@ -15,6 +17,8 @@ pub mod signal;
 pub use bench::{BENCH_BLOCK, BenchReport, bench, try_bench};
 #[cfg(feature = "dfn3")]
 pub use dfn3::DeepFilterNet3;
+#[cfg(feature = "nearfield")]
+pub use nearfield::Nearfield;
 #[cfg(feature = "onnx")]
 pub use onnx::DpdfNet;
 #[cfg(feature = "fastenhancer")]
@@ -65,6 +69,17 @@ pub trait Denoiser: Send {
     fn set_max_attenuation_db(&mut self, _db: f32) -> bool {
         false
     }
+    /// Fault injection for tests and `oto fault-check`: make the next `frames` inferences fail
+    /// the way a real runtime error would. Returns `false` if the model has no such hook.
+    #[doc(hidden)]
+    fn inject_fault(&mut self, _frames: u32) -> bool {
+        false
+    }
+    /// Whether the most recent `process_frame` hit an inference error (cleared on the next
+    /// successful frame or `reset`).
+    fn last_frame_failed(&self) -> bool {
+        false
+    }
 }
 
 impl<D: Denoiser + ?Sized> Denoiser for Box<D> {
@@ -82,6 +97,12 @@ impl<D: Denoiser + ?Sized> Denoiser for Box<D> {
     }
     fn set_max_attenuation_db(&mut self, db: f32) -> bool {
         (**self).set_max_attenuation_db(db)
+    }
+    fn inject_fault(&mut self, frames: u32) -> bool {
+        (**self).inject_fault(frames)
+    }
+    fn last_frame_failed(&self) -> bool {
+        (**self).last_frame_failed()
     }
 }
 
@@ -178,6 +199,11 @@ impl<D: Denoiser> FrameAdapter<D> {
         self.pos = 0;
         self.denoiser.reset();
     }
+
+    /// Silence the rest of the frame already computed and not yet played.
+    fn drop_pending_output(&mut self) {
+        self.outbuf[self.pos..].fill(0.0);
+    }
 }
 
 /// Which denoising model a [`Chain`] runs.
@@ -201,15 +227,29 @@ pub enum Model {
     /// FastEnhancer-S (48 kHz) via ONNX Runtime. Needs the `fastenhancer` cargo feature. Weights
     /// licence unstated upstream: for local evaluation, not cleared to ship.
     FastEnhancer,
+    /// Nearfield v2.3 `fast` (16 kHz, resampled) via ONNX Runtime: Voice Isolation, which also
+    /// removes background voices. Needs the `nearfield` cargo feature (not in releases until
+    /// its Phase 2 gates and provenance clear). Fails closed (see [`Model::is_isolating`]).
+    Nearfield,
 }
 
 impl Model {
-    pub const ALL: [Model; 4] = [
+    pub const ALL: [Model; 5] = [
         Model::RNNoise,
         Model::DeepFilterNet3,
         Model::DpdfNet,
         Model::FastEnhancer,
+        Model::Nearfield,
     ];
+
+    /// Whether the model removes background *voices* (Voice Isolation), not just noise.
+    ///
+    /// Such a chain fails closed: while denoising is on, the raw mic never reaches the output,
+    /// not as a strength floor, not during warm-up and (in the engine) not when the worker
+    /// starves or restarts. Silence is output instead. Explicit bypass still passes the mic.
+    pub fn is_isolating(self) -> bool {
+        matches!(self, Model::Nearfield)
+    }
 
     /// Whether this build can run the model.
     pub fn available(self) -> bool {
@@ -218,6 +258,7 @@ impl Model {
             Model::DeepFilterNet3 => cfg!(feature = "dfn3"),
             Model::DpdfNet => cfg!(feature = "onnx"),
             Model::FastEnhancer => cfg!(feature = "fastenhancer"),
+            Model::Nearfield => cfg!(feature = "nearfield"),
         }
     }
 
@@ -227,6 +268,7 @@ impl Model {
             Model::DeepFilterNet3 => "DeepFilterNet3",
             Model::DpdfNet => "DPDFNet-2",
             Model::FastEnhancer => "FastEnhancer-S",
+            Model::Nearfield => "Nearfield",
         }
     }
 
@@ -251,6 +293,12 @@ impl Model {
             Model::FastEnhancer => Err(
                 "FastEnhancer-S is not in this build (enable the `fastenhancer` feature)".into(),
             ),
+            #[cfg(feature = "nearfield")]
+            Model::Nearfield => Ok(Box::new(Nearfield::new()?)),
+            #[cfg(not(feature = "nearfield"))]
+            Model::Nearfield => {
+                Err("Nearfield is not in this build (enable the `nearfield` feature)".into())
+            }
         }
     }
 }
@@ -260,8 +308,13 @@ impl Model {
 ///
 /// A delay line keeps a dry copy aligned with the model's output, so latency is the same
 /// whether the model runs or not, and the dry signal is available for the strength floor.
+///
+/// A fail-closed stage ([`Model::is_isolating`]) never lets that dry copy into the output while
+/// it is enabled: no strength floor, and warm-up and enable ramps start from silence. Only an
+/// explicit bypass (`enabled == false`) plays the dry signal.
 struct Stage {
     model: Box<dyn Denoiser>,
+    fail_closed: bool,
     dry: Delay,
     dry_buf: Box<[f32]>,
     wet_buf: Box<[f32]>,
@@ -286,7 +339,7 @@ struct Stage {
 }
 
 impl Stage {
-    fn new(model: Box<dyn Denoiser>) -> Self {
+    fn new(model: Box<dyn Denoiser>, fail_closed: bool) -> Self {
         let n = model.frame_size();
         let lat = model.latency();
         let settle = lat.div_ceil(n) + 1;
@@ -306,6 +359,7 @@ impl Stage {
             inferences: 0,
             fresh: true,
             model,
+            fail_closed,
         }
     }
 
@@ -327,7 +381,8 @@ impl Stage {
             db.max(0.0)
         };
         self.native_limit = self.model.set_max_attenuation_db(db);
-        self.floor = if self.native_limit || db.is_infinite() {
+        // Fail closed: the floor is dry signal, which carries the voices being removed.
+        self.floor = if self.fail_closed || self.native_limit || db.is_infinite() {
             0.0
         } else {
             10f32.powf(-db / 20.0)
@@ -383,11 +438,20 @@ impl Denoiser for Stage {
         let g_step = (target - self.wet_gain) * step;
         let f_step = (self.floor - self.floor_now) * step;
         let (mut g, mut f) = (self.wet_gain, self.floor_now);
-        for ((y, &d), &w) in output.iter_mut().zip(&*self.dry_buf).zip(&*self.wet_buf) {
-            g += g_step;
-            f += f_step;
-            let wet = w + (d - w) * f;
-            *y = d + (wet - d) * g;
+        if self.fail_closed && self.enabled {
+            // Fail closed: the model's output against silence, never against the dry signal
+            // (warm-up holds silence, enabling ramps up from it). The floor is always 0 here.
+            for (y, &w) in output.iter_mut().zip(&*self.wet_buf) {
+                g += g_step;
+                *y = w * g;
+            }
+        } else {
+            for ((y, &d), &w) in output.iter_mut().zip(&*self.dry_buf).zip(&*self.wet_buf) {
+                g += g_step;
+                f += f_step;
+                let wet = w + (d - w) * f;
+                *y = d + (wet - d) * g;
+            }
         }
         self.wet_gain = target;
         self.floor_now = self.floor;
@@ -443,7 +507,7 @@ impl Chain {
         let mut chain = Self {
             model,
             hp: HighPass::new(sr as f64, HIGH_PASS_HZ as f64),
-            denoise: FrameAdapter::new(Stage::new(model.build()?)),
+            denoise: FrameAdapter::new(Stage::new(model.build()?, model.is_isolating())),
             limiter: Limiter::new(sr, LIMITER_CEILING_DB, 50.0),
             enabled: true,
             max_attenuation_db: 24.0,
@@ -452,13 +516,55 @@ impl Chain {
         Ok(chain)
     }
 
+    /// A chain around any [`Denoiser`], reported as `model` (whose [`Model::is_isolating`]
+    /// decides whether it fails closed). For fault-injection tests and mocks; not a stable API.
+    #[doc(hidden)]
+    pub fn with_denoiser(model: Model, denoiser: Box<dyn Denoiser>) -> Self {
+        let sr = SAMPLE_RATE as f32;
+        let mut chain = Self {
+            model,
+            hp: HighPass::new(sr as f64, HIGH_PASS_HZ as f64),
+            denoise: FrameAdapter::new(Stage::new(denoiser, model.is_isolating())),
+            limiter: Limiter::new(sr, LIMITER_CEILING_DB, 50.0),
+            enabled: true,
+            max_attenuation_db: 24.0,
+        };
+        chain.set_max_attenuation_db(chain.max_attenuation_db);
+        chain
+    }
+
     /// The model this chain runs.
     pub fn model(&self) -> Model {
         self.model
     }
 
+    /// Whether this chain fails closed ([`Model::is_isolating`]): while enabled, the raw input
+    /// never reaches the output. Callers that buffer around the chain (the engine's DSP
+    /// worker) must then fill gaps with silence, not with the dry signal.
+    pub fn is_fail_closed(&self) -> bool {
+        self.denoise.denoiser().fail_closed
+    }
+
+    /// Whether the model's most recent inference failed (cleared on the next successful frame
+    /// or `reset`).
+    pub fn last_inference_failed(&self) -> bool {
+        self.denoise.denoiser().model.last_frame_failed()
+    }
+
+    /// Fault injection: make the model's next `frames` inferences fail like a runtime error.
+    /// Returns `false` if the model has no such hook. Not a stable API.
+    #[doc(hidden)]
+    pub fn inject_inference_error(&mut self, frames: u32) -> bool {
+        self.denoise.denoiser_mut().model.inject_fault(frames)
+    }
+
     /// When `false`, denoising is bypassed (high-pass and limiter still run) and no inference runs.
     pub fn set_enabled(&mut self, enabled: bool) {
+        if enabled && !self.enabled && self.is_fail_closed() {
+            // Up to one frame of bypassed (dry) output is still buffered: drop it, so the raw
+            // input stops the moment isolation is switched on.
+            self.denoise.drop_pending_output();
+        }
         self.enabled = enabled;
         self.denoise.denoiser_mut().set_enabled(enabled);
     }

@@ -6,13 +6,16 @@ license.workspace = true
 publish.workspace = true
 
 [features]
-default = ["dfn3", "onnx", "fastenhancer"]
+default = ["dfn3", "onnx", "fastenhancer", "nearfield"]
 # DeepFilterNet3 as the default model. `--no-default-features` builds an RNNoise-only app.
 dfn3 = ["oto-engine/dfn3"]
 # DPDFNet-2 through ONNX Runtime, as the Max tier.
 onnx = ["oto-engine/onnx"]
 # FastEnhancer-S as the Fast tier. Evaluation only; release builds leave it out.
 fastenhancer = ["onnx", "oto-engine/fastenhancer"]
+# Nearfield as the Isolate tier: the Voice Isolation mode. Not cleared to ship yet; release
+# builds leave it out (scripts/macos/release.sh passes OTO_FEATURES=dfn3,onnx).
+nearfield = ["onnx", "oto-engine/nearfield"]
 
 [dependencies]
 oto-engine.workspace = true

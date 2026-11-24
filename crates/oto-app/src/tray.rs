@@ -119,6 +119,8 @@ pub fn popover_origin(
 
 pub fn toggle_window(s: &mut State, h: &AppHandle<State>) {
     if h.is_visible() {
+        // A hidden popover must not keep the mic or the speakers.
+        s.stop_hear_test();
         h.hide();
     } else if !hid_recently(s.hidden_at) {
         show_window(s, h);
