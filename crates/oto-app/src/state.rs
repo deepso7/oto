@@ -390,6 +390,7 @@ impl State {
     pub fn set_strength(&mut self, s: Strength) {
         if self.prefs.strength != s {
             self.prefs.strength = s;
+            self.stop_hear_test();
             self.command(Command::SetStrength(s));
             self.save();
         }
@@ -412,6 +413,7 @@ impl State {
             self.prefs.tier = t;
             // The engine forgets a failed load on a tier change and tries again; so does this.
             self.model_notice = None;
+            self.stop_hear_test();
             self.command(Command::SetTier(t));
             changed = true;
         }
@@ -601,6 +603,7 @@ impl State {
             .and_then(|id| self.devices.iter().find(|d| &d.id == id))
             .map(|d| d.name.clone());
         self.prefs.input_device = id.clone();
+        self.stop_hear_test();
         self.command(Command::SetInputDevice(id));
         self.save();
     }

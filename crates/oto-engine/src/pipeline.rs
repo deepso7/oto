@@ -306,6 +306,8 @@ pub struct Shared {
     /// A fail-closed (Voice Isolation) worker is currently starved or restarting, so its output
     /// is silence. Set by the capture callback, cleared once a whole block of wet audio plays.
     pub degraded: AtomicBool,
+    /// A fail-closed model's most recent inference failed, so its output is silence.
+    pub inference_degraded: AtomicBool,
     /// Set by the control thread: the output callback fades to silence and holds it, without
     /// stopping (while Voice Isolation preloads, so the previous, non-isolating stream stops
     /// leaking background voices at once). Cleared when the next streams start.
@@ -354,6 +356,7 @@ impl Shared {
             worker_workgroup: AtomicBool::new(false),
             starvations: AtomicU64::new(0),
             degraded: AtomicBool::new(false),
+            inference_degraded: AtomicBool::new(false),
             mute_output: AtomicBool::new(false),
             mute_silent: AtomicBool::new(false),
             worker_overflows: AtomicU64::new(0),
@@ -1042,6 +1045,11 @@ fn worker_main(
         let t = Instant::now();
         chain.process(&mut buf[..n]);
         let dt = t.elapsed().as_nanos() as u64;
+        if chain.is_fail_closed() {
+            shared
+                .inference_degraded
+                .store(chain.last_inference_failed(), Relaxed);
+        }
         shared.worker_times.record(dt);
         shared.busy_ns.fetch_add(dt, Relaxed);
         if output.push_entire_slice(&buf[..n]).is_err() {

@@ -86,9 +86,6 @@ pub fn is_bluetooth(_uid: &str) -> bool {
 pub fn nominal_rate(_uid: &str) -> Option<f64> {
     None
 }
-pub fn default_output_rate() -> Result<f64, String> {
-    Err(UNSUPPORTED.into())
-}
 pub struct MonoRecorder;
 
 impl MonoRecorder {
@@ -104,7 +101,10 @@ impl MonoRecorder {
 pub struct Player;
 
 impl Player {
-    pub fn start(_f: Box<dyn FnMut(&mut [f32]) + Send>) -> Result<Self, String> {
+    pub fn start<B>(_build: B) -> Result<Self, String>
+    where
+        B: FnOnce(f64) -> Result<Box<dyn FnMut(&mut [f32]) + Send>, String>,
+    {
         Err(UNSUPPORTED.into())
     }
 }

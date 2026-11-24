@@ -75,6 +75,11 @@ pub trait Denoiser: Send {
     fn inject_fault(&mut self, _frames: u32) -> bool {
         false
     }
+    /// Whether the most recent `process_frame` hit an inference error (cleared on the next
+    /// successful frame or `reset`).
+    fn last_frame_failed(&self) -> bool {
+        false
+    }
 }
 
 impl<D: Denoiser + ?Sized> Denoiser for Box<D> {
@@ -95,6 +100,9 @@ impl<D: Denoiser + ?Sized> Denoiser for Box<D> {
     }
     fn inject_fault(&mut self, frames: u32) -> bool {
         (**self).inject_fault(frames)
+    }
+    fn last_frame_failed(&self) -> bool {
+        (**self).last_frame_failed()
     }
 }
 
@@ -535,6 +543,12 @@ impl Chain {
     /// worker) must then fill gaps with silence, not with the dry signal.
     pub fn is_fail_closed(&self) -> bool {
         self.denoise.denoiser().fail_closed
+    }
+
+    /// Whether the model's most recent inference failed (cleared on the next successful frame
+    /// or `reset`).
+    pub fn last_inference_failed(&self) -> bool {
+        self.denoise.denoiser().model.last_frame_failed()
     }
 
     /// Fault injection: make the model's next `frames` inferences fail like a runtime error.

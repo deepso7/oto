@@ -281,6 +281,7 @@ pub struct Nearfield {
     faults: u32,
     /// Frames that failed (inference error or non-finite output), for diagnostics.
     pub errors: u64,
+    last_failed: bool,
     /// Tests: skip the network and pass the delayed input spectrum through (no post stage),
     /// which leaves exactly the STFT, lookahead and resampler delay.
     #[cfg(test)]
@@ -355,6 +356,7 @@ impl Nearfield {
             out16: vec![0.0; Self::HOP],
             faults: 0,
             errors: 0,
+            last_failed: false,
             #[cfg(test)]
             identity: false,
         })
@@ -477,14 +479,20 @@ impl Denoiser for Nearfield {
     fn process_frame(&mut self, input: &[f32], output: &mut [f32]) {
         self.dec.process(input, &mut self.in16);
         if self.hop() {
+            self.last_failed = false;
             self.interp.process(&self.out16, output);
         } else {
             // Fail closed: silence for this frame, and the interpolator starts the next one
             // from silence too rather than from the samples before the failure.
             self.errors += 1;
+            self.last_failed = true;
             self.interp.process(&self.out16, output);
             output.fill(0.0);
         }
+    }
+
+    fn last_frame_failed(&self) -> bool {
+        self.last_failed
     }
 
     fn reset(&mut self) {
@@ -497,6 +505,7 @@ impl Denoiser for Nearfield {
         self.post.reset();
         self.dec.reset();
         self.interp.reset();
+        self.last_failed = false;
         self.faults = 0;
     }
 

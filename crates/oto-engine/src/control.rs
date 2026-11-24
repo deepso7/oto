@@ -335,11 +335,19 @@ impl<P: Platform> Control<P> {
             .as_ref()
             .is_some_and(|k| k.model.is_isolating())
         {
-            // Fail-closed starvation is silence, not a leak, but the user should know.
+            // Fail-closed starvation or inference error is silence, not a leak, so tell the user.
             let seen = self.starved_count();
             let starved = self.shared.degraded.load(Relaxed) || seen != self.starved_seen;
+            let inf_failed = self.shared.inference_degraded.load(Relaxed);
             self.starved_seen = seen;
-            if starved {
+            if inf_failed {
+                self.degrade(
+                    Degraded::Starved,
+                    "Voice Isolation hit an inference error; Oto Microphone is silent until it \
+                     recovers (the raw mic is never passed through)"
+                        .into(),
+                );
+            } else if starved {
                 self.degrade(
                     Degraded::Starved,
                     "Voice Isolation fell behind; Oto Microphone is silent until it catches up \
@@ -367,6 +375,7 @@ impl<P: Platform> Control<P> {
             self.shared.running.store(false, Relaxed);
             self.shared.model.store(encode_model(None), Relaxed);
             self.shared.degraded.store(false, Relaxed);
+            self.shared.inference_degraded.store(false, Relaxed);
         }
         if self.degraded == Some(Degraded::Starved) {
             self.undegrade();

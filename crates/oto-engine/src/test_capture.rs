@@ -250,17 +250,21 @@ pub struct TestPlayer {
 }
 
 impl TestPlayer {
-    /// Starts looping, raw or cleaned. Resamples to the output device's rate first.
+    /// Starts looping, raw or cleaned. Resolves the output device and resamples to its rate
+    /// atomically so device selection and rate cannot race.
     pub fn start(recording: &TestRecording, play_cleaned: bool) -> Result<Self, String> {
-        let rate = platform::sys::default_output_rate()?;
-        let to = rate.round() as u32;
         let from = recording.sample_rate;
-        let raw: Arc<[f32]> = resample(&recording.raw, from, to)?.into();
-        let cleaned: Arc<[f32]> = resample(&recording.cleaned, from, to)?.into();
         let want = Arc::new(AtomicBool::new(play_cleaned));
-        let mut looper = Looper::new(raw, cleaned, rate, want.clone());
-        let player =
-            platform::sys::Player::start(Box::new(move |out: &mut [f32]| looper.render(out)))?;
+        let want2 = want.clone();
+        let raw_in = recording.raw.clone();
+        let cleaned_in = recording.cleaned.clone();
+        let player = platform::sys::Player::start(move |rate| {
+            let to = rate.round() as u32;
+            let raw: Arc<[f32]> = resample(&raw_in, from, to)?.into();
+            let cleaned: Arc<[f32]> = resample(&cleaned_in, from, to)?.into();
+            let mut looper = Looper::new(raw, cleaned, rate, want2);
+            Ok(Box::new(move |out: &mut [f32]| looper.render(out)))
+        })?;
         Ok(Self {
             cleaned: want,
             _player: player,

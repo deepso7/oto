@@ -1120,22 +1120,24 @@ fn default_output() -> Result<AudioObjectID, String> {
     .ok_or_else(|| "no default output device".into())
 }
 
-/// The system default output device's sample rate.
-pub fn default_output_rate() -> Result<f64, String> {
-    let r = rate_of(default_output()?);
-    if r.is_finite() && r > 0.0 {
-        Ok(r)
-    } else {
-        Err("cannot read the output device's sample rate".into())
-    }
-}
-
 /// Fills a mono block at the output device's rate. Runs on the device's IO thread.
 type PlayFn = Box<dyn FnMut(&mut [f32]) + Send>;
 
 struct PlayCtx {
     f: PlayFn,
     mono: Box<[f32]>,
+    rate_changed: Arc<std::sync::atomic::AtomicBool>,
+}
+
+unsafe extern "C" fn on_player_rate_change(
+    _obj: AudioObjectID,
+    _n: u32,
+    _addrs: *const AudioObjectPropertyAddress,
+    data: *mut c_void,
+) -> OSStatus {
+    let flag = unsafe { &*(data as *const std::sync::atomic::AtomicBool) };
+    flag.store(true, Relaxed);
+    0
 }
 
 unsafe extern "C" fn play_proc(
@@ -1158,11 +1160,16 @@ unsafe extern "C" fn play_proc(
         .map(|b| b.mDataByteSize as usize / 4 / b.mNumberChannels as usize)
         .min()
         .unwrap_or(0);
+    let stopped = ctx.rate_changed.load(Relaxed);
     let mut at = 0;
     while at < frames {
         let n = (frames - at).min(MAX_BLOCK);
         let mono = &mut ctx.mono[..n];
-        (ctx.f)(mono);
+        if stopped {
+            mono.fill(0.0);
+        } else {
+            (ctx.f)(mono);
+        }
         for b in bufs.iter_mut() {
             let ch = b.mNumberChannels as usize;
             if b.mData.is_null() || ch == 0 {
@@ -1181,22 +1188,91 @@ unsafe extern "C" fn play_proc(
     0
 }
 
-/// Plays a mono callback on the system default output device until dropped.
+/// Plays a mono callback on the system default output device until dropped. Resolves the device
+/// and its rate together, and silences output if the device's sample rate changes mid-loop.
 pub struct Player {
     _io: IoProc<PlayCtx>,
+    dev: AudioObjectID,
+    rate_addr: AudioObjectPropertyAddress,
+    rate_flag_ptr: *const std::sync::atomic::AtomicBool,
+}
+
+unsafe impl Send for Player {}
+
+impl Drop for Player {
+    fn drop(&mut self) {
+        if !self.rate_flag_ptr.is_null() {
+            unsafe {
+                AudioObjectRemovePropertyListener(
+                    self.dev,
+                    &self.rate_addr,
+                    on_player_rate_change,
+                    self.rate_flag_ptr as *mut c_void,
+                );
+            }
+        }
+    }
 }
 
 impl Player {
-    pub fn start(f: PlayFn) -> Result<Self, String> {
+    pub fn start<B>(build: B) -> Result<Self, String>
+    where
+        B: FnOnce(f64) -> Result<PlayFn, String>,
+    {
+        use_hal_notification_thread();
         let dev = default_output()?;
         check_float(dev, kAudioObjectPropertyScopeOutput, "output device")?;
+        let rate = rate_of(dev);
+        if !(rate.is_finite() && rate > 0.0) {
+            return Err("cannot read the output device's sample rate".into());
+        }
+        let f = build(rate)?;
+        // Verify the device's rate didn't shift while resampling.
+        let now_rate = rate_of(dev);
+        if (now_rate - rate).abs() > 1.0 {
+            return Err("the output device's sample rate changed; try again".into());
+        }
+        let rate_changed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let rate_addr = addr(
+            kAudioDevicePropertyNominalSampleRate,
+            kAudioObjectPropertyScopeGlobal,
+        );
+        // Leaked atomic flag (same pattern as Listener) so a racing HAL notification never touches freed memory.
+        let leaked = Box::leak(Box::new(Arc::clone(&rate_changed)));
+        let flag_ptr = Arc::as_ptr(leaked);
+        let registered = unsafe {
+            AudioObjectAddPropertyListener(
+                dev,
+                &rate_addr,
+                on_player_rate_change,
+                flag_ptr as *mut c_void,
+            )
+        } == 0;
         let ctx = PlayCtx {
             f,
             mono: vec![0.0; MAX_BLOCK].into(),
+            rate_changed,
         };
         let mut io = IoProc::new(dev, play_proc, ctx, "output device")?;
-        io.start("output device")?;
-        Ok(Self { _io: io })
+        if let Err(e) = io.start("output device") {
+            if registered {
+                unsafe {
+                    AudioObjectRemovePropertyListener(
+                        dev,
+                        &rate_addr,
+                        on_player_rate_change,
+                        flag_ptr as *mut c_void,
+                    );
+                }
+            }
+            return Err(e);
+        }
+        Ok(Self {
+            _io: io,
+            dev,
+            rate_addr,
+            rate_flag_ptr: if registered { flag_ptr } else { ptr::null() },
+        })
     }
 }
 

@@ -355,13 +355,13 @@ fn start_hear_test(job: HearJob) {
     let Some(h) = HANDLE.get().cloned() else {
         return;
     };
-    let (h2, cancel) = (h.clone(), job.cancel.clone());
-    std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_secs_f32(HEAR_SECONDS));
-        if !cancel.load(Ordering::Acquire) {
-            h2.update(move |s, _| s.hear_processing(&cancel));
-        }
-    });
+    let (h_rec, h_err, cancel_err, h_timer, cancel_timer) = (
+        h.clone(),
+        h.clone(),
+        job.cancel.clone(),
+        h,
+        job.cancel.clone(),
+    );
     let spawned = std::thread::Builder::new()
         .name("oto-hear-test".into())
         .spawn(move || {
@@ -372,11 +372,21 @@ fn start_hear_test(job: HearJob) {
                 HEAR_SECONDS,
                 &job.cancel,
             );
-            h.update(move |s, _| s.hear_recorded(&job.cancel, r));
+            h_rec.update(move |s, _| s.hear_recorded(&job.cancel, r));
         });
     if let Err(e) = spawned {
-        eprintln!("oto: can't start the mic test: {e}");
+        let msg = format!("Couldn\u{2019}t start the mic test: {e}");
+        h_err.update(move |s, _| s.hear_recorded(&cancel_err, Err(msg)));
+        return;
     }
+    let _ = std::thread::Builder::new()
+        .name("oto-hear-timer".into())
+        .spawn(move || {
+            std::thread::sleep(Duration::from_secs_f32(HEAR_SECONDS));
+            if !cancel_timer.load(Ordering::Acquire) {
+                h_timer.update(move |s, _| s.hear_processing(&cancel_timer));
+            }
+        });
 }
 
 fn play_hear_test(r: &TestRecording) -> Result<(), String> {
