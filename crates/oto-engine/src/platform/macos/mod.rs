@@ -1233,12 +1233,18 @@ impl Player {
             return Err("the output device's sample rate changed; try again".into());
         }
         let rate_changed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ctx = PlayCtx {
+            f,
+            mono: vec![0.0; MAX_BLOCK].into(),
+            rate_changed: Arc::clone(&rate_changed),
+        };
+        let io = IoProc::new(dev, play_proc, ctx, "output device")?;
         let rate_addr = addr(
             kAudioDevicePropertyNominalSampleRate,
             kAudioObjectPropertyScopeGlobal,
         );
         // Leaked atomic flag (same pattern as Listener) so a racing HAL notification never touches freed memory.
-        let leaked = Box::leak(Box::new(Arc::clone(&rate_changed)));
+        let leaked = Box::leak(Box::new(rate_changed));
         let flag_ptr = Arc::as_ptr(leaked);
         let registered = unsafe {
             AudioObjectAddPropertyListener(
@@ -1248,31 +1254,15 @@ impl Player {
                 flag_ptr as *mut c_void,
             )
         } == 0;
-        let ctx = PlayCtx {
-            f,
-            mono: vec![0.0; MAX_BLOCK].into(),
-            rate_changed,
-        };
-        let mut io = IoProc::new(dev, play_proc, ctx, "output device")?;
-        if let Err(e) = io.start("output device") {
-            if registered {
-                unsafe {
-                    AudioObjectRemovePropertyListener(
-                        dev,
-                        &rate_addr,
-                        on_player_rate_change,
-                        flag_ptr as *mut c_void,
-                    );
-                }
-            }
-            return Err(e);
-        }
-        Ok(Self {
+        let mut player = Self {
             _io: io,
             dev,
             rate_addr,
             rate_flag_ptr: if registered { flag_ptr } else { ptr::null() },
-        })
+        };
+        // Construct `Player` before `start` so Drop always removes the listener if starting fails.
+        player._io.start("output device")?;
+        Ok(player)
     }
 }
 
