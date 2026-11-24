@@ -334,6 +334,8 @@ impl EngineOptions {
 pub struct Stats {
     /// Streams are open (an app is recording and the driver is present).
     pub running: bool,
+    /// Times streams have been started since the engine launched (> 1 indicates a restart).
+    pub stream_starts: u64,
     pub input_rate: u32,
     pub output_rate: u32,
     /// Current ring fill and its target, ms at 48 kHz.
@@ -413,6 +415,7 @@ impl Stats {
         let ms = |frames: u32| frames as f32 * 1000.0 / dsp::SAMPLE_RATE as f32;
         Self {
             running: s.running.load(Relaxed),
+            stream_starts: s.stream_starts.load(Relaxed),
             input_rate: s.in_rate.load(Relaxed),
             output_rate: s.out_rate.load(Relaxed),
             ring_fill_ms: ms(s.fill_frames.load(Relaxed)),

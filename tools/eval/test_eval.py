@@ -424,14 +424,22 @@ class BenchParseTests(unittest.TestCase):
 
     def test_live_bench_json(self):
         cb = lambda p99, misses: {"callbacks": 100, "period_us": 5333, "p50_us": 100, "p99_us": p99, "p999_us": p99 + 50, "max_us": p99 + 100, "first_us": 900, "deadline_misses": misses}
-        obj = {"tier": "standard", "denoise": True, "seconds": 5, "cpu_percent": 3.1, "errors": [], "notices": [], "stats": {"running": True, "model": "DeepFilterNet3", "estimated_latency_ms": 61.0, "underruns": 0, "resyncs": 0, "overflows": 0, "starvations": 0, "worker_overflows": 0, "capture": cb(200, 0), "output": cb(150, 1), "worker": cb(1300, 0)}}
+        obj = {"tier": "standard", "strength": "balanced", "denoise": True, "seconds": 5, "cpu_percent": 3.1, "errors": [], "notices": [], "stats": {"running": True, "stream_starts": 1, "model": "DeepFilterNet3", "estimated_latency_ms": 61.0, "underruns": 0, "resyncs": 0, "overflows": 0, "starvations": 0, "worker_overflows": 0, "capture": cb(200, 0), "output": cb(150, 1), "worker": cb(1300, 0)}}
         m = harness.parse_bench_json(json.dumps(obj))
-        self.assertEqual((m["live_deadline_misses"], m["live_worker_p999_us"], m["bench_cpu_percent"], m["live_starvations"]), (1, 1350, 3.1, 0))
+        self.assertEqual((m["live_deadline_misses"], m["live_worker_p999_us"], m["bench_cpu_percent"], m["live_starvations"], m["live_restarts"]), (1, 1350, 3.1, 0, 0))
         m.pop("raw")
         spec = harness.load_models(REPO / "MODELS.toml")["dfn3"]
         gates = harness.load_toml(HERE / "gates.toml")
         failed = {c["gate"] for c in harness.bench_checks(m, spec, gates, live=True) if c["status"] == "fail"}
         self.assertEqual(failed, {"max_live_deadline_misses"})
+
+        # Stream restart during live bench fails max_live_restarts even if final counters are 0.
+        restarted = json.loads(json.dumps(obj))
+        restarted["stats"]["output"] = cb(150, 0)
+        restarted["stats"]["stream_starts"] = 2
+        rm = harness.parse_bench_json(json.dumps(restarted))
+        rm.pop("raw")
+        self.assertIn("max_live_restarts", {c["gate"] for c in harness.bench_checks(rm, spec, gates, live=True) if c["status"] == "fail"})
 
         # Empty object, wrong model, or capture-ring overflows must fail even without --strict.
         empty = harness.parse_bench_json("{}")
@@ -467,6 +475,7 @@ class BenchParseTests(unittest.TestCase):
             "platform": "macos",
             "stimulus": "speech",
             "tier": "standard",
+            "strength": "balanced",
             "denoise": True,
             "seconds": 6,
             "injections": 8,
@@ -481,14 +490,19 @@ class BenchParseTests(unittest.TestCase):
             "ok": True,
             "errors": [],
             "notices": [],
-            "stats": {"running": True, "model": "DeepFilterNet3", "underruns": 0, "resyncs": 0, "overflows": 0, "starvations": 0, "worker_overflows": 0, "capture": cb(), "output": cb(), "worker": cb()},
+            "stats": {"running": True, "stream_starts": 1, "model": "DeepFilterNet3", "underruns": 0, "resyncs": 0, "overflows": 0, "starvations": 0, "worker_overflows": 0, "capture": cb(), "output": cb(), "worker": cb()},
         }
         models = harness.load_models(REPO / "MODELS.toml")
         gates = harness.load_toml(HERE / "gates.toml")
         row = harness.evaluate_latency_report(obj, models, gates, profile="voice_isolation.opt_in")
-        self.assertEqual(row["model"], "dfn3")
+        self.assertEqual((row["model"], row["strength"]), ("dfn3", "balanced"))
         self.assertIn("macos_e2e_latency_ms", row["metrics"])
         self.assertTrue(all(c["status"] == "pass" for c in row["checks"]), row["checks"])
+
+        # Missing/invalid strength fails latency_strength.
+        no_str = json.loads(json.dumps(obj))
+        del no_str["strength"]
+        self.assertIn("latency_strength", {c["gate"] for c in harness.evaluate_latency_report(no_str, models, gates)["checks"] if c["status"] == "fail"})
 
         # S2: removing stats.worker from a worker-placed model (dfn3) must fail.
         no_worker = json.loads(json.dumps(obj))
@@ -543,11 +557,61 @@ class BenchParseTests(unittest.TestCase):
             r_missing = harness.run_manifest(entries, models, ["balanced"], harness.OracleProcessor(), gates, p / "o1", profile="voice_isolation.opt_in", log=quiet_log)
             gates_missing = {c["gate"]: c["status"] for c in r_missing[0]["checks"]}
             self.assertEqual(gates_missing.get("max_speech_onset_miss_rate"), "missing")
-            # A Linux-only latency report removes max_speech_onset_miss_rate, NOT max_macos_e2e_latency_ms.
-            r_linux_only = harness.run_manifest(entries, models, ["balanced"], harness.OracleProcessor(), gates, p / "o2", profile="voice_isolation.default_promotion", log=quiet_log, latency_gates_by_model={"dfn3": {"max_speech_onset_miss_rate", "max_linux_e2e_latency_ms"}})
+            # A passing Light latency report must NOT clear Strong's latency gates.
+            r_wrong_strength = harness.run_manifest(entries, models, ["strong"], harness.OracleProcessor(), gates, p / "o2", profile="voice_isolation.opt_in", log=quiet_log, latency_gates_by_key={("dfn3", "light"): {"max_speech_onset_miss_rate"}})
+            gates_strong = {c["gate"]: c["status"] for c in r_wrong_strength[0]["checks"]}
+            self.assertEqual(gates_strong.get("max_speech_onset_miss_rate"), "missing")
+            # A Linux-only balanced report removes max_speech_onset_miss_rate for balanced, NOT max_macos_e2e_latency_ms.
+            r_linux_only = harness.run_manifest(entries, models, ["balanced"], harness.OracleProcessor(), gates, p / "o3", profile="voice_isolation.default_promotion", log=quiet_log, latency_gates_by_key={("dfn3", "balanced"): {"max_speech_onset_miss_rate", "max_linux_e2e_latency_ms"}})
             gates_linux = {c["gate"]: c["status"] for c in r_linux_only[0]["checks"]}
             self.assertNotIn("max_speech_onset_miss_rate", gates_linux)
             self.assertEqual(gates_linux.get("max_macos_e2e_latency_ms"), "missing")
+            # Baseline safety gates (max_nan_count, max_clip_count, max_delay_error_samples) always run in manifest mode.
+            self.assertTrue({"max_nan_count", "max_clip_count", "max_delay_error_samples"} <= set(gates_linux))
+
+    def test_greptile_regressions(self):
+        # 1. Phase-invariant overlap leakage: a 90-degree phase-shifted 140 Hz interferer + 440 Hz target stays near 0 dB, not -40 dB.
+        rate = 16000
+        n = rate // 2
+        target = [0.4 * math.sin(2 * math.pi * 440 * i / rate) for i in range(n)]
+        itf = [0.4 * math.sin(2 * math.pi * 140 * i / rate) for i in range(n)]
+        itf_shifted = [0.4 * math.cos(2 * math.pi * 140 * i / rate) for i in range(n)]
+        inp = [a + b for a, b in zip(target, itf)]
+        out_hpf_like = [a + b for a, b in zip(target, itf_shifted)]
+        leak_same = mx.overlap_leakage_db(inp, out_hpf_like, itf, rate)
+        self.assertIsNotNone(leak_same)
+        self.assertGreater(leak_same, -1.0)
+        out_attenuated = [a + 0.1 * b for a, b in zip(target, itf_shifted)]
+        leak_20 = mx.overlap_leakage_db(inp, out_attenuated, itf, rate)
+        self.assertAlmostEqual(leak_20, -20.0, delta=0.5)
+
+        # 5. envelope_delay raises ValueError (not ZeroDivisionError) on empty/too-short signals.
+        with self.assertRaises(ValueError):
+            mx.envelope_delay([0.0] * 1000, 16000, [], 16000)
+
+        # 6. first_word_deleted does not flag leading fillers before a preserved first word.
+        self.assertFalse(asr.first_word_deleted("hello there", "well um hello there"))
+        self.assertTrue(asr.first_word_deleted("hello there", "there"))
+        self.assertTrue(asr.first_word_deleted("hello there", "yellow there"))
+
+        # 7. All-silent calibration output fails impulse_delays / step_delay instead of returning delay 0.
+        silence = [0.0] * 48000
+        self.assertEqual(mx.impulse_delays(silence, [12000, 24000], 4000), [])
+        self.assertIsNone(mx.step_delay(silence, 30000, 4000))
+
+        # 9. Bad WAV headers (4-bit ADPCM, truncated fmt, rate=0) raise ValueError, not ZeroDivisionError/struct.error.
+        with tempfile.TemporaryDirectory() as d:
+            adpcm = Path(d) / "adpcm.wav"
+            fmt = struct.pack("<HHIIHH", 2, 1, 16000, 8000, 1, 4)
+            body = b"WAVEfmt " + struct.pack("<I", len(fmt)) + fmt + b"data" + struct.pack("<I", 4) + b"\x00\x00\x00\x00"
+            adpcm.write_bytes(b"RIFF" + struct.pack("<I", len(body)) + body)
+            with self.assertRaises(ValueError):
+                read_wav(adpcm)
+            short_fmt = Path(d) / "short.wav"
+            body2 = b"WAVEfmt " + struct.pack("<I", 4) + b"\x01\x00\x01\x00" + b"data" + struct.pack("<I", 0)
+            short_fmt.write_bytes(b"RIFF" + struct.pack("<I", len(body2)) + body2)
+            with self.assertRaises(ValueError):
+                read_wav(short_fmt)
 
     def test_bench_command_uses_tier_when_live(self):
         spec = harness.load_models(REPO / "MODELS.toml")["dpdfnet2_48khz_hr"]

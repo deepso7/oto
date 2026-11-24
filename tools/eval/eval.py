@@ -290,8 +290,8 @@ def calibrate_delay(proc: Processor, model: ModelSpec, work: Path, align_fixture
     delays = mx.impulse_delays(y, align_fixture["impulses"], search)
     measured = mx.median(delays)
     step = mx.step_delay(y, align_fixture["step"], search)
-    if measured is None:
-        return {"expected_samples": expected, "measured_samples": None, "delay_error_samples": math.inf, "compensated": False}
+    if measured is None or step is None or abs(step - measured) > tol:
+        return {"expected_samples": expected, "measured_samples": measured, "impulse_delays": delays, "step_delay_samples": step, "delay_error_samples": math.inf, "compensated": False}
     compensated = abs(measured) <= tol < expected
     err = abs(measured) if compensated else abs(measured - expected)
     if max_error < err <= tol:
@@ -504,6 +504,28 @@ def pesq_score(ref, ref_rate: int, deg, deg_rate: int):
         return None
 
 
+def _resample_16k_antialiased(x, rate: int):
+    """Anti-aliased resampling to 16 kHz for perceptual models (PESQ, DNSMOS)."""
+    import numpy as np
+
+    arr = np.asarray(x, dtype=np.float32)
+    if rate == 16000 or not len(arr):
+        return arr
+    try:
+        from scipy.signal import resample_poly
+
+        g = math.gcd(rate, 16000)
+        return resample_poly(arr, 16000 // g, rate // g).astype(np.float32)
+    except ImportError:
+        # Frequency-domain anti-aliased resample (brick-wall at min Nyquist) using numpy rfft.
+        n_out = max(1, round(len(arr) * 16000 / rate))
+        spec = np.fft.rfft(arr)
+        out_spec = np.zeros(n_out // 2 + 1, dtype=spec.dtype)
+        keep = min(len(spec), len(out_spec))
+        out_spec[:keep] = spec[:keep]
+        return (np.fft.irfft(out_spec, n=n_out) * (n_out / len(arr))).astype(np.float32)
+
+
 class Dnsmos:
     """DNSMOS P.835 with the `sig_bak_ovr.onnx` model from microsoft/DNS-Challenge, supplied
     locally (it is not redistributed here). Non-personalised polynomial mapping."""
@@ -521,7 +543,7 @@ class Dnsmos:
 
     def __call__(self, x, rate: int) -> dict:  # pragma: no cover - needs the model file
         np = self.np
-        a = np.asarray(mx.resample_linear(x, rate, 16000), dtype=np.float32)
+        a = _resample_16k_antialiased(x, rate)
         if not len(a):
             a = np.zeros(self.LEN, np.float32)
         while len(a) < self.LEN:
@@ -530,7 +552,7 @@ class Dnsmos:
         return {f"dnsmos_{k}": float(np.polyval(self.POLY[k], raw[i])) for i, k in enumerate(("sig", "bak", "ovr"))}
 
 
-def run_manifest(entries: list[dict], models: list[ModelSpec], strengths: list[str], proc: Processor, gates: dict, out_dir: Path, profile: str | None = None, transcriber=None, dnsmos=None, log=print, latency_gates_by_model: dict[str, set[str]] | None = None) -> list[dict]:
+def run_manifest(entries: list[dict], models: list[ModelSpec], strengths: list[str], proc: Processor, gates: dict, out_dir: Path, profile: str | None = None, transcriber=None, dnsmos=None, log=print, latency_gates_by_key: dict[tuple[str, str], set[str]] | None = None) -> list[dict]:
     work = out_dir / "processed"
     work.mkdir(parents=True, exist_ok=True)
     fixtures_dir = out_dir / "fixtures"
@@ -567,11 +589,14 @@ def run_manifest(entries: list[dict], models: list[ModelSpec], strengths: list[s
                 except (ProcessError, ValueError, OSError) as err:
                     errors.append(f"{e['id']}: {err}")
             agg = aggregate_manifest(clips)
-            # Latency/onset gates are evaluated once by matching --latency-report rows; only drop
-            # the exact gate keys actually checked by a latency report for this model.
-            row_gates = dict(profile_gates)
-            if latency_gates_by_model and model.key in latency_gates_by_model:
-                for k in latency_gates_by_model[model.key]:
+            agg["delay_error_samples"] = calib.get("delay_error_samples")
+            # Always enforce baseline output & calibration safety checks alongside any quality profile.
+            ci_safety = {k: v for k, v in gates.get("ci", {}).items() if k in ("max_nan_count", "max_clip_count", "max_delay_error_samples")}
+            row_gates = dict(ci_safety)
+            row_gates.update(profile_gates)
+            # Latency/onset gates are evaluated once by matching (model, strength) --latency-report rows.
+            if latency_gates_by_key and (model.key, strength) in latency_gates_by_key:
+                for k in latency_gates_by_key[(model.key, strength)]:
                     row_gates.pop(k, None)
             checks = evaluate_gates(agg, row_gates)
             if errors:
@@ -590,8 +615,10 @@ def clip_metrics(e: dict, inp: Audio, out: Audio, delay48: int, out_path: Path, 
     nw = e.get("noise_windows") or ([(min(fx.WARMUP, duration / 2), duration)] if e["kind"] in ("noise_only", "background_only") else None)
     if nw:
         c["attenuation_db"] = mx.attenuation_db(inp.mono, inp.rate, y, out.rate, nw, delay)
+    clean_ref = None
     if e.get("clean"):
         ref = read_wav(e["clean"])
+        clean_ref = ref
         if ref.rate == out.rate == inp.rate:
             aligned = mx.shift(y, delay, ref.frames)
             c["si_sdr_in_db"] = mx.si_sdr(ref.mono, inp.mono)
@@ -604,10 +631,10 @@ def clip_metrics(e: dict, inp: Audio, out: Audio, delay48: int, out_path: Path, 
     if e.get("interferer"):
         itf = read_wav(e["interferer"])
         if itf.rate == out.rate == inp.rate:
-            g_in = projection_gain(inp.mono, itf.mono)
-            g_out = projection_gain(mx.shift(y, delay, itf.frames), itf.mono)
-            if g_in:
-                c["overlap_leakage_db"] = mx.to_db((g_out / g_in) ** 2)
+            clean_mono = clean_ref.mono if (clean_ref is not None and clean_ref.rate == itf.rate) else None
+            leak = mx.overlap_leakage_db(inp.mono, mx.shift(y, delay, itf.frames), itf.mono, itf.rate, clean=clean_mono)
+            if leak is not None:
+                c["overlap_leakage_db"] = leak
     if dnsmos is not None:
         c.update(dnsmos(y, out.rate))
     if transcriber is not None:
@@ -736,6 +763,8 @@ def parse_bench_json(text: str) -> dict:
         for k in ("starvations", "worker_overflows", "underruns", "resyncs", "overflows"):
             if _num(stats.get(k)):
                 out[f"live_{k}"] = stats[k]
+        if _num(stats.get("stream_starts")) and stats["stream_starts"] > 0:
+            out["live_restarts"] = max(0, int(stats["stream_starts"]) - 1)
         if _num(stats.get("estimated_latency_ms")):
             out["live_estimated_latency_ms"] = stats["estimated_latency_ms"]
         out["live_model"] = stats.get("model")
@@ -752,8 +781,8 @@ def parse_bench_json(text: str) -> dict:
     return out
 
 
-# Hard bars for every live run: a run with an engine error, capture-ring overflow, or silent
-# model fallback measures the wrong thing (plan 0001).
+# Hard bars for every live run: a run with an engine error, capture-ring overflow, stream
+# restart, or silent model fallback measures the wrong thing (plan 0001).
 LIVE_HARD_GATES = {
     "max_live_errors": 0,
     "max_live_fallbacks": 0,
@@ -761,6 +790,7 @@ LIVE_HARD_GATES = {
     "max_live_resyncs": 0,
     "max_live_overflows": 0,
     "max_live_worker_overflows": 0,
+    "max_live_restarts": 0,
 }
 
 LIVE_REQUIRED_COUNTERS = (
@@ -770,6 +800,7 @@ LIVE_REQUIRED_COUNTERS = (
     "live_underruns",
     "live_resyncs",
     "live_worker_overflows",
+    "live_restarts",
     "live_errors",
     "live_fallbacks",
 )
@@ -838,6 +869,7 @@ def evaluate_latency_report(obj: dict, all_models: dict[str, ModelSpec], gates: 
         raise ValueError("latency report JSON must be an object")
     reported_platform = obj.get("platform")
     lat_metric = _latency_metric_for_platform(reported_platform)
+    reported_strength = obj.get("strength")
 
     stats = obj.get("stats") if isinstance(obj.get("stats"), dict) else {}
     model_name = stats.get("model")
@@ -847,6 +879,7 @@ def evaluate_latency_report(obj: dict, all_models: dict[str, ModelSpec], gates: 
     metrics: dict = {
         "platform": reported_platform,
         "stimulus": obj.get("stimulus"),
+        "strength": reported_strength,
         "denoise": obj.get("denoise"),
         "expected": obj.get("expected"),
         "detected": obj.get("detected"),
@@ -882,6 +915,8 @@ def evaluate_latency_report(obj: dict, all_models: dict[str, ModelSpec], gates: 
     if stats:
         if active_streams > 0 and misses_complete:
             metrics["live_deadline_misses"] = misses
+        if _num(stats.get("stream_starts")) and stats["stream_starts"] > 0:
+            metrics["live_restarts"] = max(0, int(stats["stream_starts"]) - 1)
         for k in ("starvations", "worker_overflows", "underruns", "resyncs", "overflows"):
             if _num(stats.get(k)):
                 metrics[f"live_{k}"] = stats[k]
@@ -891,6 +926,8 @@ def evaluate_latency_report(obj: dict, all_models: dict[str, ModelSpec], gates: 
         checks.append({"gate": "latency_platform", "metric": "platform", "op": "eq", "threshold": "macos|linux", "value": reported_platform, "status": "fail"})
     if obj.get("stimulus") != "speech":
         checks.append({"gate": "latency_stimulus", "metric": "stimulus", "op": "eq", "threshold": "speech", "value": obj.get("stimulus"), "status": "fail"})
+    if reported_strength not in STRENGTHS:
+        checks.append({"gate": "latency_strength", "metric": "strength", "op": "eq", "threshold": "|".join(STRENGTHS), "value": reported_strength, "status": "fail"})
     if obj.get("denoise") is not True:
         checks.append({"gate": "latency_denoise", "metric": "denoise", "op": "eq", "threshold": True, "value": obj.get("denoise"), "status": "fail"})
     if spec is None:
@@ -932,7 +969,7 @@ def evaluate_latency_report(obj: dict, all_models: dict[str, ModelSpec], gates: 
         if c["status"] == "missing" and c["metric"] in required:
             c["status"] = "fail"
     checks.extend(gate_checks)
-    return {"suite": "latency", "model": model_key, "strength": "speech", "metrics": metrics, "checks": checks}
+    return {"suite": "latency", "model": model_key, "strength": reported_strength or "", "metrics": metrics, "checks": checks}
 
 
 def run_bench(binary: str, models: list[ModelSpec], gates: dict, seconds: float, live: bool, log=print) -> list[dict]:
@@ -1152,12 +1189,13 @@ def run(args, log=print) -> int:
     args.out.mkdir(parents=True, exist_ok=True)
 
     latency_rows: list[dict] = []
-    latency_gates_by_model: dict[str, set[str]] = {}
+    latency_gates_by_key: dict[tuple[str, str], set[str]] = {}
     if args.latency_report:
         for path in args.latency_report:
             row = evaluate_latency_report(json.loads(path.read_text()), all_models, gates, args.gates_profile)
             latency_rows.append(row)
-            latency_gates_by_model.setdefault(row["model"], set()).update(c["gate"] for c in row["checks"])
+            if row["strength"] in STRENGTHS:
+                latency_gates_by_key.setdefault((row["model"], row["strength"]), set()).update(c["gate"] for c in row["checks"])
 
     if args.suite:
         proc = make_processor(args)
@@ -1184,7 +1222,7 @@ def run(args, log=print) -> int:
                     dnsmos = Dnsmos(args.dnsmos_model)
                 except ImportError as e:
                     raise HarnessError("DNSMOS needs the `perceptual` extra (onnxruntime, numpy)") from e
-            results += run_manifest(entries, models, strengths, proc, gates, args.out, args.gates_profile, transcriber, dnsmos, log, latency_gates_by_model=latency_gates_by_model)
+            results += run_manifest(entries, models, strengths, proc, gates, args.out, args.gates_profile, transcriber, dnsmos, log, latency_gates_by_key=latency_gates_by_key)
 
     if args.bench:
         binary = find_oto(args.oto)

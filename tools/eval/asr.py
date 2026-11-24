@@ -30,6 +30,8 @@ class Alignment:
     ref_len: int
     # For each reference word: True if it was deleted.
     deleted: list[bool]
+    # For each reference word: True if it aligned as an exact match.
+    matched: list[bool]
 
     @property
     def errors(self) -> int:
@@ -58,9 +60,13 @@ def align(ref: list[str], hyp: list[str]) -> Alignment:
     i, j = n, m
     s = de = ins = 0
     deleted = [False] * n
+    matched = [False] * n
     while i > 0 or j > 0:
         if i > 0 and j > 0 and d[i][j] == d[i - 1][j - 1] + (0 if ref[i - 1] == hyp[j - 1] else 1):
-            s += ref[i - 1] != hyp[j - 1]
+            if ref[i - 1] == hyp[j - 1]:
+                matched[i - 1] = True
+            else:
+                s += 1
             i, j = i - 1, j - 1
         elif i > 0 and d[i][j] == d[i - 1][j] + 1:
             de += 1
@@ -69,7 +75,7 @@ def align(ref: list[str], hyp: list[str]) -> Alignment:
         else:
             ins += 1
             j -= 1
-    return Alignment(s, de, ins, n, deleted)
+    return Alignment(s, de, ins, n, deleted, matched)
 
 
 def wer(ref: str, hyp: str) -> float:
@@ -77,15 +83,12 @@ def wer(ref: str, hyp: str) -> float:
 
 
 def first_word_deleted(ref: str, hyp: str) -> bool:
-    """True when the reference's first word is missing from the hypothesis (deleted or
-    replaced): the clipped-onset failure a denoiser's gate causes."""
+    """True when the reference's first word was deleted or substituted in alignment (leading
+    filler words before a preserved first word count as WER insertions, not missing speech)."""
     r, h = normalize(ref), normalize(hyp)
     if not r:
         return False
-    a = align(r, h)
-    if a.deleted[0]:
-        return True
-    return r[0] not in h[:2]
+    return not align(r, h).matched[0]
 
 
 def words_per_minute(text: str, seconds: float) -> float:

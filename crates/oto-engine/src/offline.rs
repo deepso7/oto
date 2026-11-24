@@ -627,15 +627,17 @@ mod tests {
             assert_eq!(r.chunk_size, chunk);
             assert_eq!(a, b, "chunk {chunk}");
         }
-        assert!(process(
-            &x,
-            48_000,
-            &ProcessOptions {
-                chunk_size: 0,
-                ..rnnoise()
-            }
-        )
-        .is_err());
+        assert!(
+            process(
+                &x,
+                48_000,
+                &ProcessOptions {
+                    chunk_size: 0,
+                    ..rnnoise()
+                }
+            )
+            .is_err()
+        );
         assert!(process(&x, 0, &rnnoise()).is_err());
     }
 

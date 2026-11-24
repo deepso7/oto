@@ -757,9 +757,18 @@ fn callback_json(c: &CallbackStats) -> Json {
         .int("deadline_misses", c.deadline_misses)
 }
 
+fn strength_name(s: Strength) -> &'static str {
+    match s {
+        Strength::Light => "light",
+        Strength::Balanced => "balanced",
+        Strength::Strong => "strong",
+    }
+}
+
 fn stats_json(s: &oto_engine::Stats) -> Json {
     Json::default()
         .bool("running", s.running)
+        .int("stream_starts", s.stream_starts)
         .str("model", s.model.map_or("", |m| m.name()))
         .int("input_rate", s.input_rate as u64)
         .int("output_rate", s.output_rate as u64)
@@ -852,6 +861,7 @@ fn latency(a: Args) -> Result<(), String> {
             .str("platform", std::env::consts::OS)
             .str("stimulus", r.stimulus.name())
             .str("tier", tier_name(a.tier))
+            .str("strength", strength_name(a.strength))
             .bool("denoise", !a.no_denoise)
             .num("seconds", seconds)
             .int("injections", r.injections)
@@ -961,11 +971,18 @@ fn bench_live(a: Args) -> Result<(), String> {
     let s = engine.stats();
     engine.try_events().into_iter().for_each(|e| seen.note(e));
     drop(engine);
+    if s.stream_starts > 1 {
+        seen.errors.push(format!(
+            "streams restarted {} time(s) during live bench; timing counters were reset",
+            s.stream_starts - 1
+        ));
+    }
     let cpu = seen.cpu_percent();
     if a.json {
         let json = Json::default()
             .str("platform", std::env::consts::OS)
             .str("tier", tier_name(a.tier))
+            .str("strength", strength_name(a.strength))
             .bool("denoise", !a.no_denoise)
             .num("seconds", seconds)
             .opt("cpu_percent", cpu)

@@ -61,12 +61,21 @@ def read_wav(path: str | Path) -> Audio:
         pos += 8 + size + (size & 1)
     if fmt is None or payload is None:
         raise ValueError(f"{path}: missing fmt or data chunk")
+    if len(fmt) < 16:
+        raise ValueError(f"{path}: truncated fmt chunk ({len(fmt)} bytes)")
     tag, nch, rate, _, block_align, bits = struct.unpack_from("<HHIIHH", fmt, 0)
-    if tag == EXTENSIBLE and len(fmt) >= 26:
+    if tag == EXTENSIBLE:
+        if len(fmt) < 26:
+            raise ValueError(f"{path}: truncated extensible fmt chunk ({len(fmt)} bytes)")
         tag = struct.unpack_from("<H", fmt, 24)[0]
     if nch < 1:
         raise ValueError(f"{path}: no channels")
-    width = bits // 8
+    if rate < 1:
+        raise ValueError(f"{path}: invalid sample rate {rate}")
+    if (tag == IEEE_FLOAT and bits in (32, 64)) or (tag == PCM and bits in (8, 16, 24, 32)):
+        width = bits // 8
+    else:
+        raise ValueError(f"{path}: unsupported WAV format tag {tag} with {bits} bits")
     usable = len(payload) - len(payload) % (width * nch)
     payload = payload[:usable]
     if tag == IEEE_FLOAT and bits == 32:

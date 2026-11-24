@@ -128,6 +128,8 @@ def envelope_delay(ref, ref_rate: int, out, out_rate: int, max_delay_s: float = 
 
     a, b = env(ref, ref_rate), env(out, out_rate)
     n = min(len(a), len(b))
+    if n == 0:
+        raise ValueError("envelope_delay: signal shorter than one frame")
     a, b = a[:n], b[:n]
     ma, mb = math.fsum(a) / n, math.fsum(b) / n
     a = [v - ma for v in a]
@@ -143,25 +145,126 @@ def envelope_delay(ref, ref_rate: int, out, out_rate: int, max_delay_s: float = 
     return best_lag * frame_ms / 1000
 
 
-def impulse_delays(out, impulses, max_delay: int) -> list[int]:
-    """For each input impulse position, where the largest output sample falls after it."""
+def impulse_delays(out, impulses, max_delay: int, min_amp: float = 0.05) -> list[int]:
+    """For each input impulse position, where the largest output sample falls after it.
+    Windows whose peak is below `min_amp` are skipped so all-silent output never looks aligned."""
     delays = []
     for p in impulses:
         seg = out[p : p + max_delay + 1]
         if not seg:
             continue
         mags = [abs(s) if math.isfinite(s) else 0.0 for s in seg]
-        delays.append(max(range(len(mags)), key=mags.__getitem__))
+        best_i = max(range(len(mags)), key=mags.__getitem__)
+        if mags[best_i] >= min_amp:
+            delays.append(best_i)
     return delays
 
 
-def step_delay(out, step: int, max_delay: int) -> int | None:
-    """Where the largest first difference falls after an input step."""
+def step_delay(out, step: int, max_delay: int, min_amp: float = 0.05) -> int | None:
+    """Where the largest first difference falls after an input step (`None` on silence)."""
     seg = out[max(0, step - 1) : step + max_delay + 1]
     if len(seg) < 2:
         return None
     d = [abs(seg[i + 1] - seg[i]) if math.isfinite(seg[i + 1] - seg[i]) else 0.0 for i in range(len(seg) - 1)]
-    return max(range(len(d)), key=d.__getitem__)
+    best_i = max(range(len(d)), key=d.__getitem__)
+    return best_i if d[best_i] >= min_amp else None
+
+
+def _fft(x: list[complex]) -> list[complex]:
+    """Iterative radix-2 Cooley-Tukey FFT (len(x) must be a power of two)."""
+    n = len(x)
+    a = list(x)
+    j = 0
+    for i in range(1, n):
+        bit = n >> 1
+        while j & bit:
+            j ^= bit
+            bit >>= 1
+        j ^= bit
+        if i < j:
+            a[i], a[j] = a[j], a[i]
+    size = 2
+    while size <= n:
+        half = size // 2
+        ang = -2.0 * math.pi / size
+        wlen = complex(math.cos(ang), math.sin(ang))
+        for start in range(0, n, size):
+            w = 1.0 + 0.0j
+            for k in range(half):
+                u = a[start + k]
+                v = a[start + k + half] * w
+                a[start + k] = u + v
+                a[start + k + half] = u - v
+                w *= wlen
+        size <<= 1
+    return a
+
+
+def overlap_leakage_db(inp, out, interferer, rate: int, clean=None) -> float | None:
+    """Phase-invariant interferer leakage in dB using short-time cross-spectral density.
+
+    For each STFT bin f where the interferer carries meaningful energy (`S_II(f) > 1e-4 * max`),
+    `|S_YI(f)|^2 / S_II(f)` estimates interferer power preserved in `out` regardless of
+    per-frequency phase shifts (such as an 80 Hz high-pass filter). When `clean` is supplied, its
+    per-bin complex projection is subtracted from `out` and `inp` first so target energy at
+    overlapping frequencies does not inflate leakage. Returns 10*log10(leaked_out / leaked_in)."""
+    sigs = [inp, out, interferer] + ([clean] if clean is not None else [])
+    n = min(len(s) for s in sigs)
+    nfft = 1024 if rate >= 32000 else 512
+    hop = nfft // 2
+    if n < nfft:
+        return None
+    win = [0.5 - 0.5 * math.cos(2.0 * math.pi * k / nfft) for k in range(nfft)]
+    bins = nfft // 2 + 1
+    s_ii = [0.0] * bins
+    s_xi = [0j] * bins
+    s_yi = [0j] * bins
+    s_cc = [0.0] * bins
+    s_xc = [0j] * bins
+    s_yc = [0j] * bins
+    frames_i, frames_x, frames_y, frames_c = [], [], [], []
+    for pos in range(0, n - nfft + 1, hop):
+        I = _fft([complex(interferer[pos + k] * win[k]) for k in range(nfft)])[:bins]
+        X = _fft([complex(inp[pos + k] * win[k]) for k in range(nfft)])[:bins]
+        Y = _fft([complex(out[pos + k] * win[k]) for k in range(nfft)])[:bins]
+        if clean is not None:
+            C = _fft([complex(clean[pos + k] * win[k]) for k in range(nfft)])[:bins]
+            frames_i.append(I)
+            frames_x.append(X)
+            frames_y.append(Y)
+            frames_c.append(C)
+            for f in range(bins):
+                cc = C[f].conjugate()
+                s_cc[f] += (C[f] * cc).real
+                s_xc[f] += X[f] * cc
+                s_yc[f] += Y[f] * cc
+        else:
+            for f in range(bins):
+                ic = I[f].conjugate()
+                s_ii[f] += (I[f] * ic).real
+                s_xi[f] += X[f] * ic
+                s_yi[f] += Y[f] * ic
+    if clean is not None:
+        max_cc = max(s_cc)
+        c_floor = max_cc * 1e-6
+        hx = [s_xc[f] / s_cc[f] if s_cc[f] > c_floor else 0j for f in range(bins)]
+        hy = [s_yc[f] / s_cc[f] if s_cc[f] > c_floor else 0j for f in range(bins)]
+        for I, X, Y, C in zip(frames_i, frames_x, frames_y, frames_c):
+            for f in range(bins):
+                ic = I[f].conjugate()
+                s_ii[f] += (I[f] * ic).real
+                s_xi[f] += (X[f] - hx[f] * C[f]) * ic
+                s_yi[f] += (Y[f] - hy[f] * C[f]) * ic
+    max_ii = max(s_ii)
+    if max_ii <= 1e-20:
+        return None
+    # Restrict to bins where the interferer carries energy (excludes window sidelobes at target bins).
+    floor = max_ii * 1e-4
+    p_in = math.fsum((abs(s_xi[f]) ** 2) / s_ii[f] for f in range(bins) if s_ii[f] > floor)
+    p_out = math.fsum((abs(s_yi[f]) ** 2) / s_ii[f] for f in range(bins) if s_ii[f] > floor)
+    if p_in <= 1e-20:
+        return None
+    return to_db(p_out / p_in)
 
 
 def median(values):

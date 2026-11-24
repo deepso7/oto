@@ -284,6 +284,8 @@ pub struct Shared {
     pub max_atten_bits: AtomicU32,
     pub levels: Arc<Levels>,
     pub running: AtomicBool,
+    /// Number of times streams were started on this engine (> 1 means a restart happened).
+    pub stream_starts: AtomicU64,
     pub in_cycles: AtomicU64,
     pub out_cycles: AtomicU64,
     /// Nanoseconds spent inside both callbacks and the DSP worker, cumulative.
@@ -331,6 +333,7 @@ impl Shared {
             max_atten_bits: AtomicU32::new(24f32.to_bits()),
             levels,
             running: AtomicBool::new(false),
+            stream_starts: AtomicU64::new(0),
             in_cycles: AtomicU64::new(0),
             out_cycles: AtomicU64::new(0),
             busy_ns: AtomicU64::new(0),
