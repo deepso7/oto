@@ -222,39 +222,30 @@ def overlap_leakage_db(inp, out, interferer, rate: int, clean=None) -> float | N
     s_cc = [0.0] * bins
     s_xc = [0j] * bins
     s_yc = [0j] * bins
-    frames_i, frames_x, frames_y, frames_c = [], [], [], []
+    s_ci = [0j] * bins
     for pos in range(0, n - nfft + 1, hop):
         I = _fft([complex(interferer[pos + k] * win[k]) for k in range(nfft)])[:bins]
         X = _fft([complex(inp[pos + k] * win[k]) for k in range(nfft)])[:bins]
         Y = _fft([complex(out[pos + k] * win[k]) for k in range(nfft)])[:bins]
-        if clean is not None:
-            C = _fft([complex(clean[pos + k] * win[k]) for k in range(nfft)])[:bins]
-            frames_i.append(I)
-            frames_x.append(X)
-            frames_y.append(Y)
-            frames_c.append(C)
-            for f in range(bins):
+        C = _fft([complex(clean[pos + k] * win[k]) for k in range(nfft)])[:bins] if clean is not None else None
+        for f in range(bins):
+            ic = I[f].conjugate()
+            s_ii[f] += (I[f] * ic).real
+            s_xi[f] += X[f] * ic
+            s_yi[f] += Y[f] * ic
+            if C is not None:
                 cc = C[f].conjugate()
                 s_cc[f] += (C[f] * cc).real
                 s_xc[f] += X[f] * cc
                 s_yc[f] += Y[f] * cc
-        else:
-            for f in range(bins):
-                ic = I[f].conjugate()
-                s_ii[f] += (I[f] * ic).real
-                s_xi[f] += X[f] * ic
-                s_yi[f] += Y[f] * ic
+                s_ci[f] += C[f] * ic
     if clean is not None:
         max_cc = max(s_cc)
         c_floor = max_cc * 1e-6
-        hx = [s_xc[f] / s_cc[f] if s_cc[f] > c_floor else 0j for f in range(bins)]
-        hy = [s_yc[f] / s_cc[f] if s_cc[f] > c_floor else 0j for f in range(bins)]
-        for I, X, Y, C in zip(frames_i, frames_x, frames_y, frames_c):
-            for f in range(bins):
-                ic = I[f].conjugate()
-                s_ii[f] += (I[f] * ic).real
-                s_xi[f] += (X[f] - hx[f] * C[f]) * ic
-                s_yi[f] += (Y[f] - hy[f] * C[f]) * ic
+        for f in range(bins):
+            if s_cc[f] > c_floor:
+                s_xi[f] -= (s_xc[f] / s_cc[f]) * s_ci[f]
+                s_yi[f] -= (s_yc[f] / s_cc[f]) * s_ci[f]
     max_ii = max(s_ii)
     if max_ii <= 1e-20:
         return None
