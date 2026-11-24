@@ -1,0 +1,20 @@
+[project]
+name = "oto-eval"
+version = "0.1.0"
+description = "Evaluation harness for Oto's noise-suppression models (docs/plans/0002-e2e-roadmap.md)"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT OR Apache-2.0"
+# The CI suite is stdlib only: `python3 tools/eval/eval.py --suite ci` needs nothing installed.
+dependencies = []
+
+[project.optional-dependencies]
+# Faster metrics on long files, and polyphase resampling for PESQ.
+metrics = ["numpy>=1.26", "scipy>=1.11"]
+# PESQ (wideband) and DNSMOS P.835 (bring your own sig_bak_ovr.onnx).
+perceptual = ["numpy>=1.26", "scipy>=1.11", "pesq>=0.0.4", "onnxruntime>=1.17"]
+# Same-ASR head-to-head: WER, first-word deletion, leaked and hallucinated words.
+asr = ["faster-whisper>=1.0"]
+
+[tool.uv]
+package = false

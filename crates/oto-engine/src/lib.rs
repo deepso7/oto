@@ -10,6 +10,7 @@ pub use oto_dsp as dsp;
 
 mod control;
 pub mod latency;
+pub mod offline;
 /// The realtime path. Public only for the integration tests in `tests/` (allocation counting
 /// needs its own test binary); not a stable API.
 #[doc(hidden)]
@@ -18,7 +19,7 @@ mod platform;
 mod state;
 
 pub use control::{available_tiers, model_for};
-pub use pipeline::Probe;
+pub use pipeline::{Probe, Stimulus};
 
 use std::path::PathBuf;
 use std::sync::atomic::Ordering::Relaxed;
@@ -333,6 +334,8 @@ impl EngineOptions {
 pub struct Stats {
     /// Streams are open (an app is recording and the driver is present).
     pub running: bool,
+    /// Times streams have been started since the engine launched (> 1 indicates a restart).
+    pub stream_starts: u64,
     pub input_rate: u32,
     pub output_rate: u32,
     /// Current ring fill and its target, ms at 48 kHz.
@@ -382,7 +385,10 @@ pub struct CallbackStats {
     pub period_us: f32,
     pub p50_us: f32,
     pub p99_us: f32,
+    pub p999_us: f32,
     pub max_us: f32,
+    /// Callbacks past the first that took longer than `period_us`.
+    pub deadline_misses: u64,
     /// The first callback, which primes the model on the audio thread. Not included in the
     /// percentiles or the maximum.
     pub first_us: f32,
@@ -396,7 +402,9 @@ impl CallbackStats {
             period_us: us(t.period_ns.load(Relaxed)),
             p50_us: t.quantile_ns(0.5).map_or(0.0, us),
             p99_us: t.quantile_ns(0.99).map_or(0.0, us),
+            p999_us: t.quantile_ns(0.999).map_or(0.0, us),
             max_us: us(t.max_ns()),
+            deadline_misses: t.deadline_misses(),
             first_us: us(t.first_ns()),
         }
     }
@@ -407,6 +415,7 @@ impl Stats {
         let ms = |frames: u32| frames as f32 * 1000.0 / dsp::SAMPLE_RATE as f32;
         Self {
             running: s.running.load(Relaxed),
+            stream_starts: s.stream_starts.load(Relaxed),
             input_rate: s.in_rate.load(Relaxed),
             output_rate: s.out_rate.load(Relaxed),
             ring_fill_ms: ms(s.fill_frames.load(Relaxed)),

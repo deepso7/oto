@@ -16,6 +16,9 @@ A plan describes one piece of work before it is built. Plans live in [`plans/`](
 | # | Plan | Status |
 |---|---|---|
 | 0001 | [DeepFilterNet3 as the default model](plans/0001-deepfilternet3-default.md) | Implemented |
+| 0002 | [End-to-end roadmap: evaluation, Linux, Voice Isolation, our own model](plans/0002-e2e-roadmap.md) | Accepted (Phase 1 Track A in progress) |
+
+Model provenance (sources, hashes, licences, what may ship) is machine-readable in [`MODELS.toml`](../MODELS.toml). Training and evaluation datasets are classified in the [training-data audit](training-data-audit.md); the evaluation harness is in [`tools/eval/`](../tools/eval/README.md).
 
 Each plan starts with a status line: **Proposed** (written, not agreed), **Accepted** (agreed, not started), **In progress**, **Done** or **Dropped**. When a plan is done, its outcome moves into [Status](status.md) and, if it changed the design, into [Architecture](architecture.md) or [Models](models.md). The plan file stays as the record of why.
 

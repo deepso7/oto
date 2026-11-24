@@ -1,0 +1,134 @@
+# Model provenance manifest.
+#
+# One table per denoising model Oto builds, ships or is evaluating. Machine-readable: the
+# evaluation harness (tools/eval) checks every `sha256` against the file at `path`, and release
+# tooling may only ship entries with `ship_in_release = true`. Human-readable licence notices
+# live in THIRD_PARTY_NOTICES.md; the research behind each choice is in docs/models.md.
+#
+# Units: `sample_rate`, `frame_samples` and `latency_samples` are at the engine's 48 kHz unless
+# a field says otherwise. `latency_samples` is the model's own algorithmic delay; the chain adds
+# one `frame_samples` of buffering on top (FrameAdapter), so chain delay = frame + latency.
+#
+# `cli_model` is the name `oto process` / `oto bench --model` take; `cli_tier` is the `--tier`
+# that runs the model in the live engine (`oto run`, `oto latency`, `oto bench --live`).
+
+schema_version = 1
+
+[models.rnnoise]
+display_name = "RNNoise (2018 weights)"
+engine_name = "RNNoise"
+status = "shipping"
+ship_in_release = true
+cli_model = "rnnoise"
+cli_tier = "light"
+cargo_feature = ""                 # always compiled in
+source = "https://github.com/jneem/nnnoiseless"
+version = "0.5.2"
+crate = "nnnoiseless"
+weights = "embedded"               # compiled into the crate; no separate file
+license_code = "BSD-3-Clause"
+license_weights = "BSD-3-Clause"
+sample_rate = 48000
+frame_samples = 480
+latency_samples = 480
+runtime = "nnnoiseless"
+placement = "inline"               # runs inside the audio callback
+architectures = ["aarch64-apple-darwin", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"]
+
+[models.dfn3]
+display_name = "DeepFilterNet3"
+engine_name = "DeepFilterNet3"
+status = "shipping-default"
+ship_in_release = true
+cli_model = "dfn3"
+cli_tier = "standard"
+cargo_feature = "dfn3"
+source = "https://github.com/Rikorose/DeepFilterNet"
+commit = "7b14b895fe7fc42cab72b4a4c1e49c982bd6404b"
+crate = "deep_filter"
+weights = "embedded"               # models/DeepFilterNet3_onnx.tar.gz via `default-model`
+license_code = "MIT OR Apache-2.0"
+license_weights = "MIT OR Apache-2.0"   # cleared: upstream commit 7b14b89 (issue #700)
+sample_rate = 48000
+frame_samples = 480
+latency_samples = 1440
+runtime = "tract 0.21.4"
+placement = "worker"
+architectures = ["aarch64-apple-darwin", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"]
+
+[models.dpdfnet2_48khz_hr]
+display_name = "DPDFNet-2 (48 kHz hr)"
+engine_name = "DPDFNet-2"
+status = "shipping"
+ship_in_release = true
+cli_model = "dpdfnet"
+cli_tier = "max"
+cargo_feature = "onnx"
+source = "https://huggingface.co/Ceva-IP/DPDFNet"
+upstream_file = "onnx/dpdfnet2_48khz_hr.onnx"
+code = "https://github.com/ceva-ip/DPDFNet"
+path = "crates/oto-dsp/models/dpdfnet2_48khz_hr.onnx"
+sha256 = "7f0575a5cec0ba4ffd8f8bd657e06d007e4ccdd955d76faab922b9d3291dc14b"
+license_code = "Apache-2.0"
+license_weights = "Apache-2.0"
+sample_rate = 48000
+frame_samples = 480
+latency_samples = 2400
+runtime = "onnxruntime (ort 2.0.0-rc.15, static, CPU, 1 thread)"
+placement = "worker"
+# No prebuilt x86_64 macOS ONNX Runtime: the Intel macOS slice ships without `onnx`.
+architectures = ["aarch64-apple-darwin", "x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"]
+
+[models.fastenhancer_s_48khz]
+display_name = "FastEnhancer-S (48 kHz)"
+engine_name = "FastEnhancer-S"
+status = "evaluation-only"
+ship_in_release = false
+cli_model = "fastenhancer"
+cli_tier = "fast"
+cargo_feature = "fastenhancer"     # on for local builds, off in scripts/macos/release.sh
+source = "https://github.com/aask1357/fastenhancer"
+release = "onnx-48khz-v1"
+upstream_file = "fastenhancer_s.onnx"
+path = "crates/oto-dsp/models/fastenhancer_s_48khz.onnx"
+sha256 = "f04ece2beed330da367264c54cedded62f65a117fbde5c005d3a88fc796d0ba3"
+license_code = "MIT"
+license_weights = "unstated"
+blockers = [
+  "weights licence not stated upstream",
+  "48 kHz training data includes corpora that may not be exported from South Korea (AI-Hub)",
+]
+sample_rate = 48000
+frame_samples = 512
+latency_samples = 512
+runtime = "onnxruntime (ort 2.0.0-rc.15, static, CPU, 1 thread)"
+placement = "worker"
+architectures = ["aarch64-apple-darwin"]
+
+[models.nearfield_v2_3_fast]
+display_name = "Nearfield v2.3 fast (Voice Isolation)"
+engine_name = "Nearfield"
+status = "candidate-pending-phase2-gates"
+ship_in_release = false
+cli_model = "nearfield"            # not wired up yet; Phase 2 (docs/plans/0002-e2e-roadmap.md)
+cargo_feature = ""
+source = "https://github.com/Ground-State-Foundry/nearfield"
+tag = "v2.3.0"
+variant = "fast"
+# path / sha256 are added when the weights are vendored in Phase 2; the harness skips the
+# hash check for entries without a `path`.
+license_code = "Apache-2.0"
+license_weights = "Apache-2.0"
+notice_required = true             # upstream ships a NOTICE file: reproduce it in THIRD_PARTY_NOTICES.md
+blockers = [
+  "copy upstream NOTICE verbatim into THIRD_PARTY_NOTICES.md before shipping",
+  "verify training-data provenance against docs/training-data-audit.md (no NC / export-restricted corpora)",
+  "pass the Phase 2 Voice Isolation gates in tools/eval/gates.toml",
+]
+model_sample_rate = 16000
+sample_rate = 48000                # engine side, through 48<->16 kHz resamplers
+frame_samples = 384                # frame_size = 384 at 48 kHz (8 ms)
+latency_samples = 2304             # 48 ms algorithmic delay, at 48 kHz
+resampler_latency_ms = [2.0, 3.0]  # approximate, 48->16->48 kHz round trip
+placement = "worker"
+architectures = ["aarch64-apple-darwin", "x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"]

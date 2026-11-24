@@ -391,6 +391,7 @@ impl<P: Platform> Control<P> {
                     .model
                     .store(encode_model(Some(key.model)), Relaxed);
                 self.running = Some(key);
+                self.shared.stream_starts.fetch_add(1, Relaxed);
                 self.shared.running.store(true, Relaxed);
                 self.last_error = None;
                 self.retry_at = None;

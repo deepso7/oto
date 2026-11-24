@@ -367,8 +367,10 @@ fn bench_reports_sane_numbers() {
     let r = bench(Model::RNNoise, 0.5);
     assert_eq!(r.frames, 50);
     assert!(r.p50_us > 0.0 && r.p50_us <= r.p99_us && r.p99_us <= r.max_us);
+    assert!(r.p99_us <= r.p999_us && r.p999_us <= r.max_us);
     assert!(r.realtime_factor > 1.0, "{r}");
     assert_eq!(r.latency_ms, 20.0);
+    assert_eq!(r.latency_samples, 960);
 }
 
 /// Regression: DFN3 must load in the default (debug) test profile. tract-core's
@@ -456,7 +458,11 @@ fn onnx_models_denoise_and_reset_to_the_same_output() {
         assert!(rms(&first[SR..]) > 1e-3, "no output on noisy speech");
         assert!(first.iter().all(|v| v.is_finite()));
         m.reset();
-        assert_eq!(first, run(m, &speech), "reset does not restore the start state");
+        assert_eq!(
+            first,
+            run(m, &speech),
+            "reset does not restore the start state"
+        );
     }
 }
 

@@ -19,12 +19,12 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use oto_engine::Levels;
 use oto_engine::dsp::{Chain, Model, signal};
 use oto_engine::pipeline::{
     CaptureStage, OutputStage, Placement, RING_CAPACITY, STOP_FADE_REQUESTED, Shared,
     placement_for, target_fill,
 };
+use oto_engine::{Levels, Probe, Stimulus};
 use rtrb::RingBuffer;
 
 struct Counting;
@@ -114,7 +114,17 @@ struct Path {
 
 impl Path {
     fn new(rate: f64, block: usize, chain: Chain, placement: Placement) -> Self {
-        let shared = Arc::new(Shared::new(Arc::new(Levels::default()), None));
+        Self::with_probe(rate, block, chain, placement, None)
+    }
+
+    fn with_probe(
+        rate: f64,
+        block: usize,
+        chain: Chain,
+        placement: Placement,
+        probe: Option<Arc<Probe>>,
+    ) -> Self {
+        let shared = Arc::new(Shared::new(Arc::new(Levels::default()), probe));
         let (prod, cons) = RingBuffer::new(RING_CAPACITY);
         let cap = CaptureStage::with_placement(rate, block, chain, prod, shared.clone(), placement)
             .unwrap();
@@ -155,7 +165,8 @@ impl Path {
             *x = self.audio[self.at];
             self.at = (self.at + 1) % self.audio.len();
         }
-        self.cap.process(n, 0);
+        // A nonzero capture time, so a probe stamps its bursts.
+        self.cap.process(n, 1_000_000 + i as u64 * 1_000_000);
         // The sink consumes at 48 kHz what the mic delivered at its rate.
         self.owed += n as f64 * 48_000.0 / self.rate;
         while self.owed >= 128.0 {
@@ -190,6 +201,32 @@ fn inline_capture_path_never_allocates_after_the_first_callback() {
         );
         assert_eq!(p.shared.overflows.load(Relaxed), 0, "{rate} Hz");
         assert_eq!(p.shared.starvations.load(Relaxed), 0, "{rate} Hz");
+    }
+}
+
+/// `oto latency`'s probe replaces the mic signal inside the capture callback; its bursts are
+/// rendered when the stage is built, so injecting them allocates nothing.
+#[test]
+fn latency_probes_never_allocate_in_the_callback() {
+    let _turn = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    for stimulus in [Stimulus::Tone, Stimulus::Speech] {
+        let probe = Arc::new(Probe::with_stimulus(stimulus));
+        let chain = Chain::with_model(Model::RNNoise).unwrap();
+        let mut p = Path::with_probe(44_100.0, 441, chain, Placement::Inline, Some(probe.clone()));
+        p.callback(0);
+        let (calls, bytes, ()) = count(|| {
+            for i in 1..500 {
+                p.callback(i);
+            }
+        });
+        assert_eq!(
+            calls, 0,
+            "{stimulus:?}: the probe made {calls} heap calls ({bytes} bytes)"
+        );
+        // 5 s of capture: one burst per period.
+        let want = (5.0 / stimulus.period_s()).floor() as u64;
+        let got = probe.injections.load(Relaxed);
+        assert!(got >= want && got <= want + 1, "{stimulus:?}: {got} bursts");
     }
 }
 
