@@ -455,6 +455,24 @@ fn candidates(uids: &Uids) -> Vec<Candidate> {
     .collect()
 }
 
+/// The physical mic to capture from: `preferred` if present, else the system default input if
+/// it is not an Oto device, else `last` (the physical default seen before Oto Microphone became
+/// the default), else the built-in mic, else any input. The engine and "Hear the Difference"
+/// both resolve through this, so a test take records the mic a call would use.
+fn pick<'a>(
+    c: &'a [Candidate],
+    preferred: Option<&str>,
+    last: Option<&str>,
+) -> Option<&'a Candidate> {
+    let by_id = |id: &str| c.iter().find(|c| c.dev.id == id);
+    preferred
+        .and_then(by_id)
+        .or_else(|| c.iter().find(|c| c.dev.is_default))
+        .or_else(|| last.and_then(by_id))
+        .or_else(|| c.iter().find(|c| c.builtin))
+        .or(c.first())
+}
+
 pub fn input_devices(uids: &Uids) -> Vec<InputDevice> {
     candidates(uids).into_iter().map(|c| c.dev).collect()
 }
@@ -570,6 +588,35 @@ fn first_sample_ns(ts: *const AudioTimeStamp) -> u64 {
     }
 }
 
+/// Frames in one callback's buffers (the shortest buffer's, so every buffer covers them).
+fn abl_frames(bufs: &[AudioBuffer]) -> usize {
+    bufs.iter()
+        .filter(|b| b.mNumberChannels > 0)
+        .map(|b| b.mDataByteSize as usize / 4 / b.mNumberChannels as usize)
+        .min()
+        .unwrap_or(0)
+}
+
+/// Downmixes frames `at..at + mono.len()` of every buffer of a callback (interleaved or one
+/// per channel) into `mono` with [`downmix`].
+///
+/// # Safety
+/// Each buffer's `mData` is null or points to at least `frames` frames of `f32` samples, and
+/// `at + mono.len() <= frames`.
+unsafe fn downmix_abl(bufs: &[AudioBuffer], frames: usize, at: usize, mono: &mut [f32]) {
+    let n = mono.len();
+    // Each buffer's frames `at..at + n`; a buffer without data is passed as empty.
+    let parts = bufs.iter().map(|b| {
+        let ch = b.mNumberChannels as usize;
+        if b.mData.is_null() || ch == 0 {
+            return (&[][..], ch);
+        }
+        let data = unsafe { std::slice::from_raw_parts(b.mData as *const f32, frames * ch) };
+        (&data[at * ch..(at + n) * ch], ch)
+    });
+    downmix(parts, mono);
+}
+
 unsafe extern "C" fn input_proc(
     _dev: AudioObjectID,
     _now: *const AudioTimeStamp,
@@ -585,12 +632,7 @@ unsafe extern "C" fn input_proc(
         return 0;
     }
     let bufs = unsafe { abl_slice(input) };
-    let frames = bufs
-        .iter()
-        .filter(|b| b.mNumberChannels > 0)
-        .map(|b| b.mDataByteSize as usize / 4 / b.mNumberChannels as usize)
-        .min()
-        .unwrap_or(0);
+    let frames = abl_frames(bufs);
     if frames == 0 {
         return 0;
     }
@@ -598,17 +640,7 @@ unsafe extern "C" fn input_proc(
     let mut at = 0;
     while at < frames {
         let n = (frames - at).min(MAX_BLOCK);
-        let mono = &mut ctx.stage.mono_mut()[..n];
-        // Each buffer's frames `at..at + n`; a buffer without data is passed as empty.
-        let parts = bufs.iter().map(|b| {
-            let ch = b.mNumberChannels as usize;
-            if b.mData.is_null() || ch == 0 {
-                return (&[][..], ch);
-            }
-            let data = unsafe { std::slice::from_raw_parts(b.mData as *const f32, frames * ch) };
-            (&data[at * ch..(at + n) * ch], ch)
-        });
-        downmix(parts, mono);
+        unsafe { downmix_abl(bufs, frames, at, &mut ctx.stage.mono_mut()[..n]) };
         let ns = if first_ns == 0 {
             0
         } else {
@@ -792,20 +824,19 @@ impl Platform for Mac {
 
     fn resolve_input(&self, preferred: Option<&str>) -> Option<String> {
         let c = candidates(&self.uids);
-        if let Some(p) = preferred.and_then(|p| c.iter().find(|c| c.dev.id == p)) {
-            return Some(p.dev.id.clone());
-        }
         if let Some(d) = c.iter().find(|c| c.dev.is_default) {
+            // Remembered for when Oto Microphone becomes the default (shared with test_capture).
             *self.last_physical_default.borrow_mut() = Some(d.dev.id.clone());
-            return Some(d.dev.id.clone());
+            *LAST_PHYSICAL_DEFAULT
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = Some(d.dev.id.clone());
         }
-        // The default input is Oto Microphone (or none): use the last physical default we saw,
-        // then the built-in mic, then anything.
-        let last = self.last_physical_default.borrow().clone();
-        last.and_then(|l| c.iter().find(|c| c.dev.id == l))
-            .or_else(|| c.iter().find(|c| c.builtin))
-            .or(c.first())
-            .map(|c| c.dev.id.clone())
+        // Prefer the persisted restore target when Oto is the system default so live capture
+        // and Hear the Difference pick the same physical mic even after an idle default change.
+        let remembered =
+            crate::state::default_dir().and_then(|d| crate::state::remembered_input(&d));
+        let last = remembered.or_else(|| self.last_physical_default.borrow().clone());
+        pick(&c, preferred, last.as_deref()).map(|c| c.dev.id.clone())
     }
 
     fn start(&mut self, input: &str, chain: Chain, shared: &Arc<Shared>) -> Result<(), String> {
@@ -970,6 +1001,205 @@ impl Recorder {
     }
 }
 
+// ---------------------------------------------------------------------------------------------
+// "Hear the Difference" (`crate::test_capture`)
+
+/// Gets each block (≤ `MAX_BLOCK` frames) of a recording, downmixed to mono like live capture.
+type MonoFn = Box<dyn FnMut(&[f32]) + Send>;
+
+struct MonoCtx {
+    f: MonoFn,
+    mono: Box<[f32]>,
+}
+
+unsafe extern "C" fn mono_record_proc(
+    _dev: AudioObjectID,
+    _now: *const AudioTimeStamp,
+    input: *const AudioBufferList,
+    _input_time: *const AudioTimeStamp,
+    _output: *mut AudioBufferList,
+    _output_time: *const AudioTimeStamp,
+    data: *mut c_void,
+) -> OSStatus {
+    let ctx = unsafe { &mut *(data as *mut MonoCtx) };
+    if input.is_null() {
+        return 0;
+    }
+    let bufs = unsafe { abl_slice(input) };
+    let frames = abl_frames(bufs);
+    let mut at = 0;
+    while at < frames {
+        let n = (frames - at).min(MAX_BLOCK);
+        let mono = &mut ctx.mono[..n];
+        unsafe { downmix_abl(bufs, frames, at, mono) };
+        (ctx.f)(mono);
+        at += n;
+    }
+    0
+}
+
+/// Last physical default observed by [`Backend::resolve_input`], shared with
+/// [`resolve_physical_input`] so Hear the Difference matches live capture even when the user
+/// picked Oto Microphone manually in System Settings (no `restore-input` file on disk).
+static LAST_PHYSICAL_DEFAULT: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// Records mono from an input device by UID, downmixing every buffer exactly like live
+/// capture, until dropped. Checks `cancel` right before starting hardware IO.
+pub struct MonoRecorder {
+    _io: IoProc<MonoCtx>,
+}
+
+impl MonoRecorder {
+    pub fn start(
+        uid: &str,
+        cancel: &std::sync::atomic::AtomicBool,
+        f: MonoFn,
+    ) -> Result<Self, String> {
+        if cancel.load(Relaxed) {
+            return Err("cancelled".into());
+        }
+        let dev = device_for_uid(uid).ok_or_else(|| format!("no device with UID {uid}"))?;
+        check_float(dev, kAudioObjectPropertyScopeInput, uid)?;
+        let ctx = MonoCtx {
+            f,
+            mono: vec![0.0; MAX_BLOCK].into(),
+        };
+        let mut io = IoProc::new(dev, mono_record_proc, ctx, uid)?;
+        if cancel.load(Relaxed) {
+            return Err("cancelled".into());
+        }
+        io.start(uid)?;
+        Ok(Self { _io: io })
+    }
+}
+
+/// The physical mic the engine captures from for `preferred` (see [`pick`]). `last` is the
+/// physical default from before Oto Microphone became the default, if it is now; when absent,
+/// falls back to the last physical default observed by the running engine.
+pub fn resolve_physical_input(
+    uids: &Uids,
+    preferred: Option<&str>,
+    last: Option<&str>,
+) -> Option<String> {
+    let mem = LAST_PHYSICAL_DEFAULT
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    let fallback = last.or(mem.as_deref());
+    pick(&candidates(uids), preferred, fallback).map(|c| c.dev.id.clone())
+}
+
+/// Whether the device's transport is Bluetooth (Classic or LE).
+pub fn is_bluetooth(uid: &str) -> bool {
+    device_for_uid(uid).is_some_and(|d| {
+        let t = get::<u32>(
+            d,
+            kAudioDevicePropertyTransportType,
+            kAudioObjectPropertyScopeGlobal,
+        )
+        .unwrap_or(0);
+        t == kAudioDeviceTransportTypeBluetooth || t == kAudioDeviceTransportTypeBluetoothLE
+    })
+}
+
+/// The device's nominal sample rate.
+pub fn nominal_rate(uid: &str) -> Option<f64> {
+    device_for_uid(uid)
+        .map(rate_of)
+        .filter(|r| r.is_finite() && *r > 0.0)
+}
+
+fn default_output() -> Result<AudioObjectID, String> {
+    get::<AudioObjectID>(
+        kAudioObjectSystemObject,
+        kAudioHardwarePropertyDefaultOutputDevice,
+        kAudioObjectPropertyScopeGlobal,
+    )
+    .ok()
+    .filter(|&d| d != kAudioObjectUnknown)
+    .ok_or_else(|| "no default output device".into())
+}
+
+/// The system default output device's sample rate.
+pub fn default_output_rate() -> Result<f64, String> {
+    let r = rate_of(default_output()?);
+    if r.is_finite() && r > 0.0 {
+        Ok(r)
+    } else {
+        Err("cannot read the output device's sample rate".into())
+    }
+}
+
+/// Fills a mono block at the output device's rate. Runs on the device's IO thread.
+type PlayFn = Box<dyn FnMut(&mut [f32]) + Send>;
+
+struct PlayCtx {
+    f: PlayFn,
+    mono: Box<[f32]>,
+}
+
+unsafe extern "C" fn play_proc(
+    _dev: AudioObjectID,
+    _now: *const AudioTimeStamp,
+    _input: *const AudioBufferList,
+    _input_time: *const AudioTimeStamp,
+    output: *mut AudioBufferList,
+    _output_time: *const AudioTimeStamp,
+    data: *mut c_void,
+) -> OSStatus {
+    let ctx = unsafe { &mut *(data as *mut PlayCtx) };
+    if output.is_null() {
+        return 0;
+    }
+    let bufs = unsafe { abl_slice_mut(output) };
+    let frames = bufs
+        .iter()
+        .filter(|b| b.mNumberChannels > 0)
+        .map(|b| b.mDataByteSize as usize / 4 / b.mNumberChannels as usize)
+        .min()
+        .unwrap_or(0);
+    let mut at = 0;
+    while at < frames {
+        let n = (frames - at).min(MAX_BLOCK);
+        let mono = &mut ctx.mono[..n];
+        (ctx.f)(mono);
+        for b in bufs.iter_mut() {
+            let ch = b.mNumberChannels as usize;
+            if b.mData.is_null() || ch == 0 {
+                continue;
+            }
+            let data = unsafe { std::slice::from_raw_parts_mut(b.mData as *mut f32, frames * ch) };
+            for (frame, s) in data[at * ch..(at + n) * ch]
+                .chunks_exact_mut(ch)
+                .zip(mono.iter())
+            {
+                frame.fill(*s);
+            }
+        }
+        at += n;
+    }
+    0
+}
+
+/// Plays a mono callback on the system default output device until dropped.
+pub struct Player {
+    _io: IoProc<PlayCtx>,
+}
+
+impl Player {
+    pub fn start(f: PlayFn) -> Result<Self, String> {
+        let dev = default_output()?;
+        check_float(dev, kAudioObjectPropertyScopeOutput, "output device")?;
+        let ctx = PlayCtx {
+            f,
+            mono: vec![0.0; MAX_BLOCK].into(),
+        };
+        let mut io = IoProc::new(dev, play_proc, ctx, "output device")?;
+        io.start("output device")?;
+        Ok(Self { _io: io })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -977,6 +1207,50 @@ mod tests {
     use crate::pipeline::{Placement, default_dsp_setup};
     use oto_dsp::Model;
     use std::time::Duration;
+
+    /// Non-interleaved stereo (one mono buffer per channel, as many USB mics deliver it) is
+    /// averaged across both buffers, the same for live capture and Hear the Difference.
+    #[test]
+    fn non_interleaved_stereo_averages_both_buffers() {
+        let (mut l, mut r) = (vec![0.2f32, 0.4, 0.6, 0.8], vec![0.0f32, -0.4, 0.2, 0.0]);
+        let buf = |x: &mut Vec<f32>| AudioBuffer {
+            mNumberChannels: 1,
+            mDataByteSize: (x.len() * 4) as u32,
+            mData: x.as_mut_ptr().cast(),
+        };
+        let bufs = [buf(&mut l), buf(&mut r)];
+        assert_eq!(abl_frames(&bufs), 4);
+        let mut mono = [9.0f32; 3];
+        unsafe { downmix_abl(&bufs, 4, 1, &mut mono) };
+        assert_eq!(mono, [0.0, 0.4, 0.4], "frames 1..4, (L + R) / 2");
+    }
+
+    /// The engine and Hear the Difference resolve the same mic: with Oto Microphone the
+    /// default, the remembered physical default wins over the built-in mic.
+    #[test]
+    fn input_resolution_prefers_the_remembered_physical_default() {
+        let cand = |id: &str, is_default: bool, builtin: bool| Candidate {
+            dev: InputDevice {
+                id: id.into(),
+                name: id.into(),
+                is_default,
+            },
+            builtin,
+        };
+        let id = |c: Option<&Candidate>| c.map(|c| c.dev.id.clone());
+        // Oto Microphone is the default: no candidate is.
+        let c = [cand("builtin", false, true), cand("usb", false, false)];
+        assert_eq!(id(pick(&c, None, Some("usb"))).as_deref(), Some("usb"));
+        assert_eq!(id(pick(&c, None, None)).as_deref(), Some("builtin"));
+        assert_eq!(id(pick(&c, None, Some("gone"))).as_deref(), Some("builtin"));
+        assert_eq!(
+            id(pick(&c, Some("builtin"), Some("usb"))).as_deref(),
+            Some("builtin")
+        );
+        // A physical default wins over the remembered one.
+        let c = [cand("builtin", true, true), cand("usb", false, false)];
+        assert_eq!(id(pick(&c, None, Some("usb"))).as_deref(), Some("builtin"));
+    }
 
     /// Live check of the DSP worker on a real mic's IO thread, without Oto's devices (so it
     /// runs next to a running Oto app): the mic's callback drives `CaptureStage` exactly like

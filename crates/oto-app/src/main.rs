@@ -13,23 +13,32 @@ mod state;
 mod tray;
 mod view;
 
+use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Mutex, OnceLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use oto_engine::test_capture::{self, TestPlayer, TestRecording};
 use oto_engine::{Engine, InputDevice, Settings, Tier};
 use rune::{App, AppHandle, AppSpec, Tx};
 
 use crate::meter::Meter;
 use crate::permission::Mic;
-use crate::state::{EngineState, Hooks, Install, Link, Open, Page, Probe, State};
+use crate::state::{
+    EngineState, HEAR_SECONDS, HearJob, HearTest, Hooks, Install, Link, Open, Page, Probe, State,
+};
 
 /// The running app's handle, for hooks that are plain `fn`s.
 static HANDLE: OnceLock<AppHandle<State>> = OnceLock::new();
 /// The current engine host thread, so quitting can wait for it to put things back.
 static HOST: Mutex<Option<JoinHandle<()>>> = Mutex::new(None);
+thread_local! {
+    /// "Hear the Difference" playback. Started and stopped only from state hooks, which run on
+    /// the UI thread.
+    static HEAR_PLAYER: RefCell<Option<TestPlayer>> = const { RefCell::new(None) };
+}
 /// A [`refresh`] is under way.
 static REFRESHING: AtomicBool = AtomicBool::new(false);
 
@@ -172,6 +181,42 @@ const SCENES: &[Scene] = &[
         s.tiers = vec![Tier::Light, Tier::Standard];
         s.prefs.tier = Tier::Light;
     }),
+    ("main-voice-isolation", |s| {
+        s.tiers = vec![Tier::Light, Tier::Standard, Tier::Max, Tier::Isolate];
+        s.set_tier(Tier::Isolate);
+        active(s);
+        s.set_running(Some((oto_engine::dsp::Model::Nearfield, 42.0)));
+    }),
+    ("main-degraded", |s| {
+        s.tiers = vec![Tier::Light, Tier::Standard, Tier::Max, Tier::Isolate];
+        s.set_tier(Tier::Isolate);
+        active(s);
+        s.set_running(Some((oto_engine::dsp::Model::Nearfield, 42.0)));
+        s.on_event(oto_engine::Event::Degraded(
+            "Voice Isolation couldn\u{2019}t load, so Oto Microphone is muted.".into(),
+        ));
+    }),
+    ("main-hear-recording", |s| {
+        s.hear = HearTest::Recording { processing: false };
+    }),
+    ("main-hear-ready", |s| {
+        s.hear = HearTest::Ready {
+            cleaned: true,
+            is_bluetooth_hfp: true,
+        };
+    }),
+    ("settings-models", |s| {
+        s.page = Page::Settings;
+        s.tiers = vec![
+            Tier::Light,
+            Tier::Standard,
+            Tier::Max,
+            Tier::Fast,
+            Tier::Isolate,
+        ];
+        s.set_tier(Tier::Max);
+        s.set_tier(Tier::Isolate);
+    }),
     ("main-model-fallback", |s| {
         active(s);
         s.on_event(oto_engine::Event::ModelFallback {
@@ -250,6 +295,7 @@ fn after_prompt(s: &mut State, h: &AppHandle<State>) {
         h.update(move |s, _| {
             if s.popover && !s.focused && !s.holding() && h2.is_visible() {
                 s.open = None;
+                s.stop_hear_test();
                 h2.hide();
             }
         });
@@ -303,6 +349,55 @@ fn request_mic() {
     });
 }
 
+/// Records and cleans a "Hear the Difference" take off the UI thread and reports back. Marks
+/// the switch from recording to cleaning when the recording time is up.
+fn start_hear_test(job: HearJob) {
+    let Some(h) = HANDLE.get().cloned() else {
+        return;
+    };
+    let (h2, cancel) = (h.clone(), job.cancel.clone());
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_secs_f32(HEAR_SECONDS));
+        if !cancel.load(Ordering::Acquire) {
+            h2.update(move |s, _| s.hear_processing(&cancel));
+        }
+    });
+    let spawned = std::thread::Builder::new()
+        .name("oto-hear-test".into())
+        .spawn(move || {
+            let r = test_capture::record_and_process(
+                job.device.as_deref(),
+                job.model,
+                job.strength,
+                HEAR_SECONDS,
+                &job.cancel,
+            );
+            h.update(move |s, _| s.hear_recorded(&job.cancel, r));
+        });
+    if let Err(e) = spawned {
+        eprintln!("oto: can't start the mic test: {e}");
+    }
+}
+
+fn play_hear_test(r: &TestRecording) -> Result<(), String> {
+    let player = TestPlayer::start(r, false)?;
+    HEAR_PLAYER.with(|p| *p.borrow_mut() = Some(player));
+    Ok(())
+}
+
+fn stop_hear_test() {
+    // Dropping the player stops the output.
+    HEAR_PLAYER.with(|p| p.borrow_mut().take());
+}
+
+fn set_hear_cleaned(on: bool) {
+    HEAR_PLAYER.with(|p| {
+        if let Some(p) = p.borrow().as_ref() {
+            p.set_cleaned(on);
+        }
+    });
+}
+
 /// Starts an engine on a new host thread; `started` hears how `Engine::start` went.
 fn launch(
     settings: Settings,
@@ -337,6 +432,10 @@ fn live(h: AppHandle<State>) -> State {
         start_engine: |settings, meter| launch(settings, meter, None),
         request_mic,
         open_mic_settings: permission::open_settings,
+        start_hear_test,
+        play_hear_test,
+        stop_hear_test,
+        set_hear_cleaned,
     };
     let (started_tx, started_rx) = mpsc::sync_channel(1);
     s.link = launch(s.prefs.engine_settings(), s.meter.clone(), Some(started_tx));
@@ -375,6 +474,8 @@ fn on_focus(s: &mut State, focused: bool, tx: &mut Tx) {
         refresh();
     } else if s.popover && !s.holding() {
         s.open = None;
+        // A hidden popover must not keep the mic or the speakers.
+        s.stop_hear_test();
         s.hidden_at = Some(Instant::now());
         tx.close_window();
     }

@@ -15,9 +15,14 @@ pub struct Prefs {
     pub input_device_name: Option<String>,
     #[serde(with = "StrengthDef")]
     pub strength: Strength,
+    /// The tier the engine runs: the Noise Cancellation model, or "isolate" (Voice Isolation).
+    /// Saved as "standard", "max", "fast", "light" or "isolate".
     #[serde(with = "TierDef")]
-    /// Saved as "standard" (DeepFilterNet3) or "light" (RNNoise, "Low CPU mode").
     pub tier: Tier,
+    /// The model Noise Cancellation mode runs, remembered while Voice Isolation is on. Never
+    /// [`Tier::Isolate`]. Files from before it existed take it from `tier`.
+    #[serde(with = "TierDef")]
+    pub nc_tier: Tier,
     pub start_at_login: bool,
     /// "Use Oto as the system microphone": Oto Microphone is the default input while Oto runs.
     pub system_microphone: bool,
@@ -33,6 +38,7 @@ impl Default for Prefs {
             input_device_name: None,
             strength: Strength::default(),
             tier: Tier::default(),
+            nc_tier: Tier::default(),
             start_at_login: false,
             system_microphone: false,
             onboarded: false,
@@ -86,15 +92,21 @@ impl Prefs {
                 _ => bad("strength", v),
             }
         }
+        // A tier this build doesn't offer falls back in `State::new`.
         if let Some(v) = table.get("tier") {
-            match v.as_str() {
-                Some("light") => p.tier = Tier::Light,
-                Some("standard") => p.tier = Tier::Standard,
-                // A tier this build doesn't offer falls back to the default in `State::new`.
-                Some("max") => p.tier = Tier::Max,
-                Some("fast") => p.tier = Tier::Fast,
-                _ => bad("tier", v),
+            match v.as_str().and_then(parse_tier) {
+                Some(t) => p.tier = t,
+                None => bad("tier", v),
             }
+        }
+        match table.get("nc_tier") {
+            Some(v) => match v.as_str().and_then(parse_tier) {
+                Some(t) if t != Tier::Isolate => p.nc_tier = t,
+                _ => bad("nc_tier", v),
+            },
+            // Saved before Voice Isolation: the tier was the Noise Cancellation model.
+            None if p.tier != Tier::Isolate => p.nc_tier = p.tier,
+            None => {}
         }
         // A device's name without the device says nothing.
         if p.input_device.is_none() {
@@ -106,6 +118,17 @@ impl Prefs {
     pub fn to_toml(&self) -> String {
         toml::to_string(self).unwrap_or_default()
     }
+}
+
+fn parse_tier(s: &str) -> Option<Tier> {
+    Some(match s {
+        "light" => Tier::Light,
+        "standard" => Tier::Standard,
+        "max" => Tier::Max,
+        "fast" => Tier::Fast,
+        "isolate" => Tier::Isolate,
+        _ => return None,
+    })
 }
 
 #[derive(Serialize)]
@@ -123,6 +146,7 @@ enum TierDef {
     Standard,
     Max,
     Fast,
+    Isolate,
 }
 
 pub fn path() -> Option<PathBuf> {
@@ -172,6 +196,7 @@ mod tests {
             input_device_name: Some("MacBook Pro Microphone".into()),
             strength: Strength::Strong,
             tier: Tier::Light,
+            nc_tier: Tier::Light,
             start_at_login: true,
             system_microphone: true,
             onboarded: true,
@@ -190,9 +215,17 @@ mod tests {
         assert_eq!(tier("light"), Tier::Light);
         assert_eq!(tier("max"), Tier::Max);
         assert_eq!(tier("fast"), Tier::Fast);
+        assert_eq!(tier("isolate"), Tier::Isolate);
         for t in [Tier::Light, Tier::Standard, Tier::Max, Tier::Fast] {
             let p = Prefs {
                 tier: t,
+                nc_tier: t,
+                ..Prefs::default()
+            };
+            assert_eq!(Prefs::parse(&p.to_toml()), (p, Vec::new()));
+            let p = Prefs {
+                tier: Tier::Isolate,
+                nc_tier: t,
                 ..Prefs::default()
             };
             assert_eq!(Prefs::parse(&p.to_toml()), (p, Vec::new()));
@@ -200,6 +233,23 @@ mod tests {
         assert!(!Prefs::parse("tier = \"huge\"\n").1.is_empty());
         assert_eq!(Prefs::default().tier, Tier::Standard);
         assert!(Prefs::default().to_toml().contains("tier = \"standard\""));
+    }
+
+    #[test]
+    fn the_noise_cancellation_model_comes_from_older_files() {
+        // Before Voice Isolation, `tier` was the Noise Cancellation model.
+        let (p, w) = Prefs::parse("tier = \"max\"\n");
+        assert_eq!((p.tier, p.nc_tier, w.len()), (Tier::Max, Tier::Max, 0));
+        // Isolation saved without a model to come back to: the default model.
+        let (p, w) = Prefs::parse("tier = \"isolate\"\n");
+        assert_eq!(
+            (p.tier, p.nc_tier, w.len()),
+            (Tier::Isolate, Tier::Standard, 0)
+        );
+        // Isolation is a mode, not a Noise Cancellation model.
+        let (p, w) = Prefs::parse("tier = \"isolate\"\nnc_tier = \"isolate\"\n");
+        assert_eq!(p.nc_tier, Tier::Standard);
+        assert_eq!(w, ["nc_tier = \"isolate\""]);
     }
 
     #[test]

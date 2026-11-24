@@ -418,7 +418,7 @@ pub fn process_file(
 
 /// Resamples a whole mono clip with its startup delay trimmed, so `out[i]` lines up with
 /// `x[i * to / from]`. `ceil(len * to / from)` samples long. A copy when the rates match.
-fn resample(x: &[f32], from: u32, to: u32) -> Result<Vec<f32>, String> {
+pub(crate) fn resample(x: &[f32], from: u32, to: u32) -> Result<Vec<f32>, String> {
     if from == to || x.is_empty() {
         return Ok(x.to_vec());
     }

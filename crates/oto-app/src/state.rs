@@ -1,10 +1,12 @@
 //! The app's state and everything that changes it. No Rune views and no I/O beyond the hooks
 //! [`Hooks`] names, so it unit-tests without a window or an engine.
 
-use std::sync::atomic::Ordering;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 
 use oto_engine::dsp::Model;
+use oto_engine::test_capture::TestRecording;
 use oto_engine::{Command, Event, InputDevice, Settings, Strength, Tier};
 
 use crate::driver::{Outcome, REBOOT_MESSAGE, UninstallOutcome};
@@ -13,15 +15,33 @@ use crate::permission::Mic;
 use crate::prefs::Prefs;
 use crate::tray::Tray;
 
-/// Shows the "Hear the difference" test. Off until the engine can record and play back.
-pub const HEAR_TEST: bool = false;
+/// Shows the "Hear the Difference" test: record a few seconds, then compare raw and cleaned.
+pub const HEAR_TEST: bool = true;
+/// How long "Hear the Difference" records, seconds.
+pub const HEAR_SECONDS: f32 = 5.0;
+/// Why "Hear the Difference" can't start during a call: it opens the mic and the speakers.
+pub const HEAR_IN_CALL: &str = "End your call to run the mic test.";
+
+/// The main page's two modes. Noise Cancellation runs the model picked in Settings
+/// ([`Prefs::nc_tier`]); Voice Isolation is [`Tier::Isolate`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Mode {
+    NoiseCancellation,
+    VoiceIsolation,
+}
+
+pub const MODES: [(Mode, &str); 2] = [
+    (Mode::NoiseCancellation, "Noise Cancellation"),
+    (Mode::VoiceIsolation, "Voice Isolation"),
+];
 
 pub const STRENGTHS: [(Strength, &str); 3] = [
     (Strength::Light, "Light"),
     (Strength::Balanced, "Balanced"),
     (Strength::Strong, "Strong"),
 ];
-/// The model picker's rows, in the order offered. Only tiers in [`State::tiers`] show.
+/// The Noise Cancellation model picker's rows (Settings), in the order offered. Only tiers in
+/// [`State::tiers`] show. [`Tier::Isolate`] is a mode, not one of these.
 pub const TIERS: [(Tier, &str); 4] = [
     (Tier::Standard, "DeepFilterNet3"),
     (Tier::Max, "DPDFNet-2 (stronger)"),
@@ -82,6 +102,32 @@ pub enum Open {
     Model,
 }
 
+/// "Hear the Difference", from the button press to the A/B playback.
+#[derive(Clone, Debug, PartialEq)]
+pub enum HearTest {
+    Idle,
+    /// Recording [`HEAR_SECONDS`] from the mic, then (`processing`) cleaning it offline.
+    Recording {
+        processing: bool,
+    },
+    /// Looping playback; `cleaned` is the side playing.
+    Ready {
+        cleaned: bool,
+        is_bluetooth_hfp: bool,
+    },
+    Failed(String),
+}
+
+/// One "Hear the Difference" take, for [`Hooks::start_hear_test`]. Setting `cancel` stops the
+/// recording and tells the hook its result is no longer wanted.
+#[derive(Clone, Debug)]
+pub struct HearJob {
+    pub device: Option<String>,
+    pub model: Model,
+    pub strength: Strength,
+    pub cancel: Arc<AtomicBool>,
+}
+
 /// What the UI asks of the engine's host thread.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Request {
@@ -133,6 +179,15 @@ pub struct Hooks {
     pub request_mic: fn(),
     /// Opens System Settings at Privacy, Microphone.
     pub open_mic_settings: fn() -> Result<(), String>,
+    /// Records and cleans a "Hear the Difference" take off the UI thread; the result comes back
+    /// through [`State::hear_recorded`] (and [`State::hear_processing`] once recording ends).
+    pub start_hear_test: fn(HearJob),
+    /// Starts looping a take, raw first.
+    pub play_hear_test: fn(&TestRecording) -> Result<(), String>,
+    /// Stops the playback [`Hooks::play_hear_test`] started.
+    pub stop_hear_test: fn(),
+    /// Switches the playback between raw (`false`) and cleaned.
+    pub set_hear_cleaned: fn(bool),
 }
 
 impl Hooks {
@@ -144,6 +199,10 @@ impl Hooks {
         start_engine: |_, _| Link::None,
         request_mic: || {},
         open_mic_settings: || Ok(()),
+        start_hear_test: |_| {},
+        play_hear_test: |_| Ok(()),
+        stop_hear_test: || {},
+        set_hear_cleaned: |_| {},
     };
 }
 
@@ -182,6 +241,13 @@ pub struct State {
     /// Share of one core the audio callback uses, while active.
     pub load: Option<f32>,
     pub error: Option<String>,
+    /// Voice Isolation can't run, so Oto Microphone is muted ([`Event::Degraded`]). Cleared by
+    /// `Event::DegradedCleared` and by leaving Voice Isolation.
+    pub degraded: Option<String>,
+    /// "Hear the Difference".
+    pub hear: HearTest,
+    /// The take being recorded: its cancel flag, which also identifies it.
+    hear_job: Option<Arc<AtomicBool>>,
     /// `error` came from the engine, so the engine's `Recovered` clears it.
     error_from_engine: bool,
     pub page: Page,
@@ -214,8 +280,13 @@ impl State {
     /// snapshots want. The live app resets `driver_known` and `engine` (see `main.rs`).
     pub fn new(mut prefs: Prefs, driver_installed: bool) -> State {
         let tiers = oto_engine::available_tiers().to_vec();
-        if !tiers.contains(&prefs.tier) {
-            prefs.tier = Tier::default();
+        if prefs.nc_tier == Tier::Isolate || !tiers.contains(&prefs.nc_tier) {
+            prefs.nc_tier = Tier::default();
+        }
+        // Never silently rewrite a saved Voice Isolation choice to Noise Cancellation: if this
+        // build lacks Nearfield, the engine must fail closed and surface Event::Degraded.
+        if prefs.tier != Tier::Isolate && !tiers.contains(&prefs.tier) {
+            prefs.tier = prefs.nc_tier;
         }
         State {
             prefs,
@@ -236,6 +307,9 @@ impl State {
             clients_active: false,
             load: None,
             error: None,
+            degraded: None,
+            hear: HearTest::Idle,
+            hear_job: None,
             error_from_engine: false,
             page: Page::Main,
             open: None,
@@ -321,18 +395,82 @@ impl State {
         }
     }
 
+    /// Runs tier `t`. A Noise Cancellation tier also becomes the one that mode comes back to.
     pub fn set_tier(&mut self, t: Tier) {
         self.open = None;
-        if self.prefs.tier != t && self.tiers.contains(&t) {
+        if !self.tiers.contains(&t) {
+            return;
+        }
+        let mut changed = false;
+        if t != Tier::Isolate {
+            // Leaving Voice Isolation leaves its muted state behind.
+            self.degraded = None;
+            changed = self.prefs.nc_tier != t;
+            self.prefs.nc_tier = t;
+        }
+        if self.prefs.tier != t {
             self.prefs.tier = t;
             // The engine forgets a failed load on a tier change and tries again; so does this.
             self.model_notice = None;
             self.command(Command::SetTier(t));
+            changed = true;
+        }
+        if changed {
             self.save();
         }
     }
 
-    /// The model picker's labels: one per tier this build offers.
+    /// The main page's mode.
+    pub fn mode(&self) -> Mode {
+        if self.prefs.tier == Tier::Isolate {
+            Mode::VoiceIsolation
+        } else {
+            Mode::NoiseCancellation
+        }
+    }
+
+    /// Voice Isolation runs.
+    pub fn isolating(&self) -> bool {
+        self.mode() == Mode::VoiceIsolation
+    }
+
+    /// This build has Voice Isolation, so the main page offers the two modes.
+    pub fn offers_isolation(&self) -> bool {
+        self.tiers.contains(&Tier::Isolate)
+    }
+
+    /// Noise Cancellation runs the model picked in Settings; Voice Isolation runs Nearfield.
+    pub fn set_mode(&mut self, m: Mode) {
+        match m {
+            Mode::NoiseCancellation => self.set_tier(self.prefs.nc_tier),
+            Mode::VoiceIsolation => self.set_tier(Tier::Isolate),
+        }
+    }
+
+    /// The degraded banner's way out: Noise Cancellation, which never goes silent.
+    pub fn switch_to_noise_cancellation(&mut self) {
+        self.set_mode(Mode::NoiseCancellation);
+        self.degraded = None;
+    }
+
+    /// Picks the Noise Cancellation model (Settings). In Voice Isolation it is only remembered,
+    /// for when Noise Cancellation is picked again.
+    pub fn set_nc_tier(&mut self, t: Tier) {
+        self.open = None;
+        if t == Tier::Isolate || !self.tiers.contains(&t) {
+            return;
+        }
+        if self.isolating() {
+            if self.prefs.nc_tier != t {
+                self.prefs.nc_tier = t;
+                self.save();
+            }
+        } else {
+            self.set_tier(t);
+        }
+    }
+
+    /// The Noise Cancellation model picker's labels: one per such tier this build offers.
     pub fn tier_options(&self) -> Vec<&'static str> {
         TIERS
             .iter()
@@ -341,24 +479,26 @@ impl State {
             .collect()
     }
 
+    /// The Noise Cancellation model's label.
     pub fn tier_label(&self) -> &'static str {
         TIERS
             .iter()
-            .find(|(t, _)| *t == self.prefs.tier)
+            .find(|(t, _)| *t == self.prefs.nc_tier)
             .map_or("", |(_, l)| *l)
     }
 
-    /// Picks a model by its label in [`TIERS`].
+    /// Picks the Noise Cancellation model by its label in [`TIERS`].
     pub fn choose_tier(&mut self, label: &str) {
         self.open = None;
         if let Some((t, _)) = TIERS.iter().find(|(_, l)| *l == label) {
-            self.set_tier(*t);
+            self.set_nc_tier(*t);
         }
     }
 
-    /// Whether the build offers a choice of model, so the picker does something.
+    /// Whether the build offers a choice of Noise Cancellation model, so the picker does
+    /// something.
     pub fn offers_tiers(&self) -> bool {
-        self.tiers.len() > 1
+        self.tiers.iter().filter(|t| **t != Tier::Isolate).count() > 1
     }
 
     pub fn set_start_at_login(&mut self, on: bool) {
@@ -486,6 +626,10 @@ impl State {
         match e {
             Event::ClientsActive(on) => {
                 self.clients_active = on;
+                if on {
+                    // A call: the test must not hold the mic or the speakers.
+                    self.stop_hear_test();
+                }
                 if !on {
                     self.load = None;
                 }
@@ -496,9 +640,13 @@ impl State {
                 self.error = Some(msg);
                 self.error_from_engine = true;
             }
+            // Only the engine error: Voice Isolation can stay muted (a failed load) while a
+            // missing mic or a stall comes and goes; `DegradedCleared` ends that.
             Event::Recovered => self.clear_engine_error(),
+            Event::DegradedCleared => self.degraded = None,
             // The host thread re-reads the device list and calls `set_devices`.
             Event::DevicesChanged => {}
+            Event::Degraded(msg) => self.degraded = Some(msg),
             Event::ModelFallback {
                 requested,
                 effective,
@@ -541,8 +689,10 @@ impl State {
         self.clients_active = false;
         self.load = None;
         self.running = None;
+        self.degraded = None;
         self.clear_engine_error();
         self.meter_gate();
+        self.stop_hear_test();
     }
 
     pub fn retry_engine(&mut self) {
@@ -554,7 +704,108 @@ impl State {
     /// Quitting: the host thread drops the engine, which stops audio and puts back the default
     /// input if "Use Oto as the system microphone" changed it.
     pub fn shutdown(&mut self) {
+        self.stop_hear_test();
         self.command(Command::Shutdown);
+    }
+
+    // ----- "Hear the Difference" ---------------------------------------------------------------
+
+    /// Why the test can't start now, if it can't. `None` means it can.
+    pub fn hear_blocked(&self) -> Option<&'static str> {
+        if self.clients_active {
+            Some(HEAR_IN_CALL)
+        } else if self.engine != EngineState::Running {
+            Some("Waits for Oto\u{2019}s audio engine.")
+        } else if !self.driver_installed {
+            Some("Needs the audio driver.")
+        } else if self.mic != Mic::Authorized {
+            Some("Needs microphone access.")
+        } else {
+            None
+        }
+    }
+
+    /// Goes to Settings. A take recording or playing stops first: its controls live on the
+    /// main page, and Settings would hide them while the mic or the speakers stay busy.
+    pub fn open_settings(&mut self) {
+        self.stop_hear_test();
+        self.open = None;
+        self.page = Page::Settings;
+    }
+
+    /// Records a take (again). Not during a call.
+    pub fn start_hear_test(&mut self) {
+        if self.hear_blocked().is_some() {
+            return;
+        }
+        self.stop_hear_test();
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.hear_job = Some(cancel.clone());
+        self.hear = HearTest::Recording { processing: false };
+        (self.hooks.start_hear_test)(HearJob {
+            device: self.prefs.input_device.clone(),
+            model: oto_engine::model_for(self.prefs.tier),
+            strength: self.prefs.strength,
+            cancel,
+        });
+    }
+
+    /// The take being recorded, for tests that play the hook's part.
+    #[cfg(test)]
+    pub fn hear_job_for_test(&self) -> Arc<AtomicBool> {
+        self.hear_job.clone().expect("a take is recording")
+    }
+
+    fn is_hear_job(&self, job: &Arc<AtomicBool>) -> bool {
+        self.hear_job.as_ref().is_some_and(|j| Arc::ptr_eq(j, job))
+    }
+
+    /// Take `job` is recorded and now being cleaned.
+    pub fn hear_processing(&mut self, job: &Arc<AtomicBool>) {
+        if self.is_hear_job(job) && matches!(self.hear, HearTest::Recording { .. }) {
+            self.hear = HearTest::Recording { processing: true };
+        }
+    }
+
+    /// Take `job` is done. A cancelled or replaced take is dropped unplayed.
+    pub fn hear_recorded(&mut self, job: &Arc<AtomicBool>, r: Result<TestRecording, String>) {
+        if !self.is_hear_job(job) || job.load(Ordering::Acquire) {
+            return;
+        }
+        self.hear_job = None;
+        self.hear = match r {
+            // A call started meanwhile (that cancels the job, so this is belt and braces).
+            Ok(_) if self.clients_active => HearTest::Idle,
+            Ok(rec) => match (self.hooks.play_hear_test)(&rec) {
+                Ok(()) => HearTest::Ready {
+                    cleaned: false,
+                    is_bluetooth_hfp: rec.is_bluetooth_hfp,
+                },
+                Err(e) => HearTest::Failed(format!("Couldn\u{2019}t play the test back: {e}")),
+            },
+            Err(e) => HearTest::Failed(format!("Couldn\u{2019}t record the test: {e}")),
+        };
+    }
+
+    /// Plays the cleaned take (`true`) or the original.
+    pub fn set_hear_cleaned(&mut self, on: bool) {
+        if let HearTest::Ready { cleaned, .. } = &mut self.hear
+            && *cleaned != on
+        {
+            *cleaned = on;
+            (self.hooks.set_hear_cleaned)(on);
+        }
+    }
+
+    /// Cancels a recording or stops the playback; back to the button.
+    pub fn stop_hear_test(&mut self) {
+        if let Some(job) = self.hear_job.take() {
+            job.store(true, Ordering::Release);
+        }
+        if matches!(self.hear, HearTest::Ready { .. }) {
+            (self.hooks.stop_hear_test)();
+        }
+        self.hear = HearTest::Idle;
     }
 
     // ----- what the system reports -------------------------------------------------------------
@@ -697,7 +948,14 @@ impl State {
             return "No microphone access".into();
         }
         if !self.prefs.enabled {
-            return "Noise cancellation is off".into();
+            return if self.isolating() {
+                "Voice Isolation is off".into()
+            } else {
+                "Noise cancellation is off".into()
+            };
+        }
+        if self.degraded.is_some() {
+            return "Voice Isolation can\u{2019}t run: microphone muted".into();
         }
         if self.clients_active {
             "In use by an app".into()
@@ -1022,10 +1280,7 @@ mod tests {
             ]
         );
         s.tiers = vec![Tier::Light, Tier::Standard];
-        assert_eq!(
-            s.tier_options(),
-            ["DeepFilterNet3", "RNNoise (low CPU)"]
-        );
+        assert_eq!(s.tier_options(), ["DeepFilterNet3", "RNNoise (low CPU)"]);
         s.tiers = vec![Tier::Standard];
         assert!(!s.offers_tiers());
     }
@@ -1075,6 +1330,254 @@ mod tests {
             true,
         );
         assert_eq!(s.prefs.tier, Tier::default());
+    }
+
+    fn isolation_state() -> State {
+        let mut s = state();
+        s.tiers = vec![Tier::Light, Tier::Standard, Tier::Max, Tier::Isolate];
+        s
+    }
+
+    #[test]
+    fn modes_keep_the_chosen_noise_cancellation_model() {
+        let mut s = isolation_state();
+        assert_eq!(s.mode(), Mode::NoiseCancellation);
+        assert!(s.offers_isolation());
+        s.choose_tier("DPDFNet-2 (stronger)");
+        s.set_mode(Mode::VoiceIsolation);
+        assert_eq!((s.prefs.tier, s.prefs.nc_tier), (Tier::Isolate, Tier::Max));
+        assert_eq!(s.tier_label(), "DPDFNet-2 (stronger)");
+        // Picking a model in Voice Isolation only remembers it.
+        s.choose_tier("RNNoise (low CPU)");
+        assert_eq!(
+            (s.prefs.tier, s.prefs.nc_tier),
+            (Tier::Isolate, Tier::Light)
+        );
+        s.set_mode(Mode::NoiseCancellation);
+        assert_eq!(s.prefs.tier, Tier::Light);
+        s.set_mode(Mode::NoiseCancellation);
+        assert_eq!(
+            sent(&s),
+            [
+                Command::SetTier(Tier::Max),
+                Command::SetTier(Tier::Isolate),
+                Command::SetTier(Tier::Light)
+            ]
+        );
+        // Isolation is a mode, not a model.
+        s.set_nc_tier(Tier::Isolate);
+        assert_eq!(s.prefs.nc_tier, Tier::Light);
+        assert!(!s.tier_options().contains(&""));
+        assert_eq!(s.tier_options().len(), 3);
+
+        // Without Nearfield there is no second mode.
+        let mut s = state();
+        s.tiers = vec![Tier::Light, Tier::Standard];
+        assert!(!s.offers_isolation());
+        s.set_mode(Mode::VoiceIsolation);
+        assert_eq!(s.prefs.tier, Tier::Standard);
+    }
+
+    #[test]
+    fn a_saved_isolation_without_nearfield_keeps_isolate_to_fail_closed() {
+        let s = State::new(
+            Prefs {
+                tier: Tier::Isolate,
+                nc_tier: Tier::Light,
+                ..Prefs::default()
+            },
+            true,
+        );
+        let tiers = oto_engine::available_tiers();
+        // A non-isolating model this build lacks falls back to the default, but a saved
+        // Voice Isolation choice stays Isolate so the engine fails closed instead of leaking.
+        let nc = if tiers.contains(&Tier::Light) {
+            Tier::Light
+        } else {
+            Tier::default()
+        };
+        assert_eq!(s.prefs.nc_tier, nc);
+        assert_eq!(s.prefs.tier, Tier::Isolate);
+    }
+
+    #[test]
+    fn degraded_is_its_own_banner_until_recovered_or_switched() {
+        let mut s = isolation_state();
+        s.set_mode(Mode::VoiceIsolation);
+        s.on_event(Event::ClientsActive(true));
+        s.on_event(Event::Degraded("Voice Isolation fell behind".into()));
+        assert_eq!(s.degraded.as_deref(), Some("Voice Isolation fell behind"));
+        assert_eq!(s.error, None, "not an error");
+        assert!(s.status().contains("muted"));
+        s.on_event(Event::Recovered);
+        assert!(
+            s.degraded.is_some(),
+            "an engine recovery is not the isolation's"
+        );
+        s.on_event(Event::DegradedCleared);
+        assert_eq!(s.degraded, None);
+        assert_eq!(s.status(), "In use by an app");
+
+        s.on_event(Event::Degraded("couldn't load".into()));
+        s.switch_to_noise_cancellation();
+        assert_eq!(s.degraded, None);
+        assert_eq!(s.prefs.tier, Tier::Standard);
+        assert_eq!(sent(&s).last(), Some(&Command::SetTier(Tier::Standard)));
+
+        // Picking another model from Settings leaves Isolation too.
+        s.set_mode(Mode::VoiceIsolation);
+        s.on_event(Event::Degraded("couldn't load".into()));
+        s.set_tier(Tier::Max);
+        assert_eq!(s.degraded, None);
+    }
+
+    /// Voice Isolation failed to load; then the mic goes missing and the call ends. The engine
+    /// recovers from the missing mic, but the failed load still mutes the next call, so the
+    /// banner stays.
+    #[test]
+    fn degraded_banner_survives_an_unrelated_recovery() {
+        let mut s = isolation_state();
+        s.set_mode(Mode::VoiceIsolation);
+        s.on_event(Event::ClientsActive(true));
+        s.on_event(Event::Degraded("Voice Isolation could not load".into()));
+        s.on_event(Event::Error("no microphone found".into()));
+        s.on_event(Event::ClientsActive(false));
+        s.on_event(Event::Recovered);
+        assert_eq!(s.error, None, "the missing-mic error is over");
+        assert_eq!(
+            s.degraded.as_deref(),
+            Some("Voice Isolation could not load")
+        );
+        s.on_event(Event::ClientsActive(true));
+        assert!(s.status().contains("muted"), "{}", s.status());
+    }
+
+    fn take() -> TestRecording {
+        TestRecording {
+            sample_rate: 16_000,
+            raw: vec![0.0; 1600].into(),
+            cleaned: vec![0.0; 1600].into(),
+            is_bluetooth_hfp: false,
+        }
+    }
+
+    static HEAR_JOBS: std::sync::Mutex<Vec<HearJob>> = std::sync::Mutex::new(Vec::new());
+    static PLAYING: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+    static CLEANED: AtomicBool = AtomicBool::new(false);
+
+    fn hear_state() -> State {
+        let mut s = state();
+        s.hooks.start_hear_test = |job| HEAR_JOBS.lock().unwrap().push(job);
+        s.hooks.play_hear_test = |_| {
+            PLAYING.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        };
+        s.hooks.stop_hear_test = || {
+            PLAYING.fetch_sub(1, Ordering::Relaxed);
+        };
+        s.hooks.set_hear_cleaned = |on| CLEANED.store(on, Ordering::Relaxed);
+        s
+    }
+
+    /// The one test that uses the hear hooks' statics, so parallel tests can't disturb them.
+    #[test]
+    fn hear_the_difference() {
+        let mut s = hear_state();
+        s.prefs.strength = Strength::Strong;
+        s.start_hear_test();
+        assert_eq!(s.hear, HearTest::Recording { processing: false });
+        let job = HEAR_JOBS.lock().unwrap().pop().unwrap();
+        assert_eq!(job.strength, Strength::Strong);
+        assert_eq!(job.model, oto_engine::model_for(s.prefs.tier));
+        s.hear_processing(&job.cancel);
+        assert_eq!(s.hear, HearTest::Recording { processing: true });
+        s.hear_recorded(&job.cancel, Ok(take()));
+        assert_eq!(
+            s.hear,
+            HearTest::Ready {
+                cleaned: false,
+                is_bluetooth_hfp: false
+            }
+        );
+        assert_eq!(PLAYING.load(Ordering::Relaxed), 1);
+        s.set_hear_cleaned(true);
+        assert!(CLEANED.load(Ordering::Relaxed));
+        s.set_hear_cleaned(false);
+        assert!(!CLEANED.load(Ordering::Relaxed));
+
+        // A call stops the playback at once.
+        s.on_event(Event::ClientsActive(true));
+        assert_eq!(s.hear, HearTest::Idle);
+        assert_eq!(PLAYING.load(Ordering::Relaxed), 0);
+        // And nothing starts during it.
+        s.start_hear_test();
+        assert_eq!(s.hear, HearTest::Idle);
+        assert!(HEAR_JOBS.lock().unwrap().is_empty());
+        assert_eq!(s.hear_blocked(), Some(HEAR_IN_CALL));
+        s.on_event(Event::ClientsActive(false));
+
+        // A call during the recording cancels it; its late result is dropped unplayed.
+        s.start_hear_test();
+        let job = HEAR_JOBS.lock().unwrap().pop().unwrap();
+        s.on_event(Event::ClientsActive(true));
+        assert!(job.cancel.load(Ordering::Relaxed));
+        assert_eq!(s.hear, HearTest::Idle);
+        s.hear_recorded(&job.cancel, Ok(take()));
+        assert_eq!(s.hear, HearTest::Idle);
+        assert_eq!(PLAYING.load(Ordering::Relaxed), 0);
+        s.on_event(Event::ClientsActive(false));
+
+        // "Record Again" replaces the take; the old one's result is ignored.
+        s.start_hear_test();
+        let old = HEAR_JOBS.lock().unwrap().pop().unwrap();
+        s.start_hear_test();
+        let new = HEAR_JOBS.lock().unwrap().pop().unwrap();
+        assert!(old.cancel.load(Ordering::Relaxed));
+        s.hear_recorded(&old.cancel, Err("late".into()));
+        assert_eq!(s.hear, HearTest::Recording { processing: false });
+        s.hear_recorded(&new.cancel, Err("no microphone found".into()));
+        assert!(matches!(&s.hear, HearTest::Failed(m) if m.contains("no microphone found")));
+
+        // Opening Settings stops a recording, and a playing take.
+        s.start_hear_test();
+        let job = HEAR_JOBS.lock().unwrap().pop().unwrap();
+        s.open_settings();
+        assert_eq!(s.page, Page::Settings);
+        assert!(job.cancel.load(Ordering::Relaxed));
+        assert_eq!(s.hear, HearTest::Idle);
+        s.page = Page::Main;
+        s.start_hear_test();
+        let job = HEAR_JOBS.lock().unwrap().pop().unwrap();
+        s.hear_recorded(&job.cancel, Ok(take()));
+        assert_eq!(PLAYING.load(Ordering::Relaxed), 1);
+        s.open_settings();
+        assert_eq!(PLAYING.load(Ordering::Relaxed), 0);
+        assert_eq!(s.hear, HearTest::Idle);
+        s.page = Page::Main;
+
+        // Quitting stops a playing test.
+        s.start_hear_test();
+        let job = HEAR_JOBS.lock().unwrap().pop().unwrap();
+        s.hear_recorded(&job.cancel, Ok(take()));
+        assert_eq!(PLAYING.load(Ordering::Relaxed), 1);
+        s.shutdown();
+        assert_eq!(PLAYING.load(Ordering::Relaxed), 0);
+        assert_eq!(s.hear, HearTest::Idle);
+        assert_eq!(sent(&s).last(), Some(&Command::Shutdown));
+
+        // A playback that can't start is a failure, not a Ready with silence.
+        s.hooks.play_hear_test = |_| Err("no output device".into());
+        s.start_hear_test();
+        let job = HEAR_JOBS.lock().unwrap().pop().unwrap();
+        s.hear_recorded(&job.cancel, Ok(take()));
+        assert!(matches!(&s.hear, HearTest::Failed(m) if m.contains("no output device")));
+
+        // Not without the mic, the driver or the engine.
+        s.mic = Mic::Denied;
+        assert!(s.hear_blocked().is_some());
+        s.mic = Mic::Authorized;
+        s.engine_failed("boom");
+        assert!(s.hear_blocked().is_some());
     }
 
     #[test]

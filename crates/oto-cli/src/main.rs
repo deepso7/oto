@@ -32,7 +32,8 @@ USAGE:
         --no-denoise keeps the tier's model and its delay but bypasses its processing, so it
         cannot suppress the test tone. --stimulus speech injects voiced bursts the models
         keep, to measure with denoising on. Exits 1 if fewer than 80% of the bursts arrive.
-    oto bench [--model rnnoise|dfn3|dpdfnet|fastenhancer] [--tier TIER] [--seconds N] [--json]
+    oto bench [--model rnnoise|dfn3|dpdfnet|fastenhancer|nearfield] [--tier TIER] [--seconds N]
+              [--json]
         Time the DSP chain on synthetic audio.
     oto bench --live [--tier TIER] [--seconds N] [--device ID] [--strength S] [--no-denoise]
                      [--json]
@@ -44,10 +45,16 @@ USAGE:
         the live chain offline. Writes mono at the input's rate, aligned with the input and of
         the same length unless --no-delay-comp keeps the chain's delay. --chunk-size is the
         block size fed to the chain at 48 kHz (default 480).
+    oto fault-check [--json]
+        Inject every Voice Isolation fault (start-up, worker starvation, overflow and flush,
+        inference errors, load failure, mode-switch preload) at every strength and count raw
+        mic samples that leak to the output. Exits 1 on any leak or fallback. --json prints
+        the report `tools/eval/eval.py --fault-report` checks.
     oto --version | --help
 
 --tier takes standard (DeepFilterNet3, the default), light (RNNoise, the app's Low CPU
-mode), max (DPDFNet-2) or fast (FastEnhancer-S), limited to the tiers this build has a
+mode), max (DPDFNet-2), fast (FastEnhancer-S) or isolate (Nearfield Voice Isolation: also
+removes background voices, and fails closed to silence), limited to the tiers this build has a
 distinct model for.
 --seconds takes a number above 0, up to 86400.
 
@@ -83,6 +90,7 @@ enum Cmd {
     Latency,
     Bench,
     Process,
+    FaultCheck,
 }
 
 impl Cmd {
@@ -94,6 +102,7 @@ impl Cmd {
             "latency" => Cmd::Latency,
             "bench" => Cmd::Bench,
             "process" => Cmd::Process,
+            "fault-check" => Cmd::FaultCheck,
             _ => return None,
         })
     }
@@ -106,6 +115,7 @@ impl Cmd {
             Cmd::Latency => "latency",
             Cmd::Bench => "bench",
             Cmd::Process => "process",
+            Cmd::FaultCheck => "fault-check",
         }
     }
 
@@ -163,6 +173,7 @@ impl Cmd {
             Cmd::Latency => &LATENCY,
             Cmd::Bench => &BENCH,
             Cmd::Process => &PROCESS,
+            Cmd::FaultCheck => &["json"],
             Cmd::Devices | Cmd::Status => &[],
         }
     }
@@ -202,6 +213,7 @@ fn tier_name(t: Tier) -> &'static str {
         Tier::Standard => "standard",
         Tier::Max => "max",
         Tier::Fast => "fast",
+        Tier::Isolate => "isolate",
     }
 }
 
@@ -213,7 +225,12 @@ fn parse_tier(s: &str, available: &[Tier]) -> Result<Tier, String> {
         "standard" => Tier::Standard,
         "max" => Tier::Max,
         "fast" => Tier::Fast,
-        _ => return Err(format!("unknown tier {s:?} (light, standard, max or fast)")),
+        "isolate" => Tier::Isolate,
+        _ => {
+            return Err(format!(
+                "unknown tier {s:?} (light, standard, max, fast or isolate)"
+            ));
+        }
     };
     if available.contains(&tier) {
         return Ok(tier);
@@ -295,6 +312,7 @@ where
                     "dfn3" => dsp::Model::DeepFilterNet3,
                     "dpdfnet" => dsp::Model::DpdfNet,
                     "fastenhancer" => dsp::Model::FastEnhancer,
+                    "nearfield" => dsp::Model::Nearfield,
                     s => return Err(format!("unknown model {s:?}")),
                 });
                 "model"
@@ -404,6 +422,7 @@ fn main() {
         Cmd::Bench if args.live => bench_live(args),
         Cmd::Bench => bench(args),
         Cmd::Process => process(args),
+        Cmd::FaultCheck => fault_check(args),
     };
     if let Err(e) = result {
         eprintln!("oto: {e}");
@@ -505,7 +524,9 @@ fn run(a: Args) -> Result<(), String> {
                 Event::ClientsActive(false) => println!("no app is recording; idle"),
                 Event::DevicesChanged => println!("devices changed"),
                 Event::Error(e) => println!("error: {e}"),
+                Event::Degraded(e) => println!("degraded: {e}"),
                 Event::Recovered => println!("recovered"),
+                Event::DegradedCleared => println!("degraded cleared"),
                 Event::ModelFallback {
                     requested,
                     effective,
@@ -801,6 +822,7 @@ impl Incidents {
     fn note(&mut self, e: Event) {
         match e {
             Event::Error(e) => self.errors.push(e),
+            Event::Degraded(e) => self.errors.push(format!("degraded: {e}")),
             Event::ModelFallback {
                 requested,
                 effective,
@@ -1081,6 +1103,40 @@ fn process(a: Args) -> Result<(), String> {
     Ok(())
 }
 
+/// `oto fault-check`: every Voice Isolation fault case at every strength.
+fn fault_check(a: Args) -> Result<(), String> {
+    if !a.json {
+        println!(
+            "injecting {} Voice Isolation faults × {} strengths with −12 dBFS background speech",
+            oto_engine::fault_check::CASES.len(),
+            oto_engine::fault_check::STRENGTHS.len()
+        );
+    }
+    let report = oto_engine::fault_check::run_all()?;
+    if a.json {
+        println!("{}", report.to_json());
+    } else {
+        for c in &report.cases {
+            println!(
+                "{:20} {:8} {}  leaked {} samples / {} frames, {} fallbacks ({} checked, {})",
+                c.case,
+                c.strength,
+                if c.passed() { "pass" } else { "FAIL" },
+                c.leaked_samples,
+                c.leaked_frames,
+                c.fallback_to_other_model,
+                c.checked_samples,
+                c.isolator,
+            );
+        }
+    }
+    if report.passed() {
+        Ok(())
+    } else {
+        Err("Voice Isolation leaked the raw mic or fell back to another model".into())
+    }
+}
+
 fn process_json(r: &ProcessReport, input: &str, output: &str) -> Json {
     Json::default()
         .str("input", input)
@@ -1225,6 +1281,27 @@ mod tests {
             "--force-clients does not apply to `oto bench`"
         );
         assert_eq!(error("--no-denoise"), "--no-denoise needs a command");
+    }
+
+    #[test]
+    fn voice_isolation_flags() {
+        let (cmd, a) = args("process in.wav out.wav --model nearfield").unwrap();
+        assert_eq!(cmd, Cmd::Process);
+        assert_eq!(a.model, Some(dsp::Model::Nearfield));
+        if oto_engine::available_tiers().contains(&Tier::Isolate) {
+            assert_eq!(args("run --tier isolate").unwrap().1.tier, Tier::Isolate);
+            assert_eq!(oto_engine::model_for(Tier::Isolate), dsp::Model::Nearfield);
+        } else {
+            assert!(error("run --tier isolate").contains("not available"));
+        }
+        let (cmd, a) = args("fault-check --json").unwrap();
+        assert_eq!(cmd, Cmd::FaultCheck);
+        assert!(a.json);
+        assert_eq!(
+            error("fault-check --no-denoise"),
+            "--no-denoise does not apply to `oto fault-check`"
+        );
+        assert_eq!(tier_name(Tier::Isolate), "isolate");
     }
 
     #[test]

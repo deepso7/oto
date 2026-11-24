@@ -300,8 +300,18 @@ pub struct Shared {
     pub worker_realtime: AtomicBool,
     /// The worker joined the mic's IO-thread audio workgroup.
     pub worker_workgroup: AtomicBool,
-    /// Capture blocks the worker had not processed in time, so dry audio filled in.
+    /// Capture blocks the worker had not processed in time, so dry audio filled in (silence
+    /// for a fail-closed chain).
     pub starvations: AtomicU64,
+    /// A fail-closed (Voice Isolation) worker is currently starved or restarting, so its output
+    /// is silence. Set by the capture callback, cleared once a whole block of wet audio plays.
+    pub degraded: AtomicBool,
+    /// Set by the control thread: the output callback fades to silence and holds it, without
+    /// stopping (while Voice Isolation preloads, so the previous, non-isolating stream stops
+    /// leaking background voices at once). Cleared when the next streams start.
+    pub mute_output: AtomicBool,
+    /// Set by the output callback once [`Shared::mute_output`] has faded it to silence.
+    pub mute_silent: AtomicBool,
     /// Times the worker fell a whole ring behind and its backlog was dropped.
     pub worker_overflows: AtomicU64,
     /// The worker reserve of the running streams, samples at 48 kHz (0 when inline).
@@ -343,6 +353,9 @@ impl Shared {
             worker_realtime: AtomicBool::new(false),
             worker_workgroup: AtomicBool::new(false),
             starvations: AtomicU64::new(0),
+            degraded: AtomicBool::new(false),
+            mute_output: AtomicBool::new(false),
+            mute_silent: AtomicBool::new(false),
             worker_overflows: AtomicU64::new(0),
             reserve_frames: AtomicU32::new(0),
             stop_fade: AtomicU8::new(STOP_FADE_IDLE),
@@ -370,6 +383,7 @@ pub fn encode_model(m: Option<Model>) -> u8 {
         Some(Model::DeepFilterNet3) => 2,
         Some(Model::DpdfNet) => 3,
         Some(Model::FastEnhancer) => 4,
+        Some(Model::Nearfield) => 5,
     }
 }
 
@@ -379,6 +393,7 @@ pub fn decode_model(v: u8) -> Option<Model> {
         2 => Some(Model::DeepFilterNet3),
         3 => Some(Model::DpdfNet),
         4 => Some(Model::FastEnhancer),
+        5 => Some(Model::Nearfield),
         _ => None,
     }
 }
@@ -644,11 +659,13 @@ pub enum Placement {
     Worker,
 }
 
-/// Where this engine runs `model`'s chain: DeepFilterNet3 on the DSP worker, RNNoise inline.
+/// Where this engine runs `model`'s chain: RNNoise inline, every neural model on the DSP worker.
 pub fn placement_for(model: Model) -> Placement {
     match model {
         Model::RNNoise => Placement::Inline,
-        Model::DeepFilterNet3 | Model::DpdfNet | Model::FastEnhancer => Placement::Worker,
+        Model::DeepFilterNet3 | Model::DpdfNet | Model::FastEnhancer | Model::Nearfield => {
+            Placement::Worker
+        }
     }
 }
 
@@ -744,8 +761,8 @@ struct WorkerSync {
     /// input and acknowledges by copying the value to `flush_ack`.
     flush_req: AtomicU32,
     flush_ack: AtomicU32,
-    /// Tests: the worker leaves its input alone while set, to force starvation and overflow.
-    #[cfg(test)]
+    /// Fault injection (tests, `oto fault-check`): the worker leaves its input alone while set,
+    /// to force starvation and overflow.
     pause: AtomicBool,
 }
 
@@ -756,7 +773,12 @@ struct WorkerSync {
 /// sample number `w` (counted from `wet_base`, where the current worker stream started) is the
 /// chain's output after it consumed input `wet_base + w`, i.e. the processed version of input
 /// `wet_base + w - chain_latency`.
+///
+/// A fail-closed chain (Voice Isolation, [`Chain::is_fail_closed`]) has no dry fallback: where
+/// there is no wet audio (start-up, a flush restart, starvation) the output is silence, reached
+/// by fading the last wet sample out over [`WORKER_FADE`], and [`Shared::degraded`] is set.
 struct Worker {
+    fail_closed: bool,
     to: Producer<f32>,
     from: Consumer<f32>,
     sync: Arc<WorkerSync>,
@@ -785,6 +807,7 @@ impl Worker {
     /// the realtime thread.
     fn spawn(
         chain: Chain,
+        fail_closed: bool,
         max_block48: usize,
         period_ns: u64,
         shared: &Arc<Shared>,
@@ -800,9 +823,9 @@ impl Worker {
             stop: AtomicBool::new(false),
             flush_req: AtomicU32::new(0),
             flush_ack: AtomicU32::new(0),
-            #[cfg(test)]
             pause: AtomicBool::new(false),
         });
+        shared.degraded.store(false, Relaxed);
         shared.worker_times.reset();
         shared.worker_times.period_ns.store(period_ns, Relaxed);
         shared.worker_realtime.store(false, Relaxed);
@@ -825,6 +848,7 @@ impl Worker {
         let handle = thread.thread().clone();
         let delay = chain_latency + reserve;
         let w = Self {
+            fail_closed,
             to,
             from,
             sync,
@@ -883,13 +907,21 @@ impl Worker {
                 // The worker is a ring (≈340 ms) behind. Pushing part of the block would break
                 // the sample accounting, so drop its backlog and restart the wet stream.
                 shared.worker_overflows.fetch_add(1, Relaxed);
+                if self.fail_closed {
+                    shared.degraded.store(true, Relaxed);
+                }
                 self.flush_gen = self.flush_gen.wrapping_add(1);
                 self.sync.flush_req.store(self.flush_gen, Release);
                 self.flushing = true;
             }
             self.handle.unpark();
         }
-        self.dry.process(buf, &mut self.dry_buf[..len]);
+        if self.fail_closed {
+            // No dry fallback: wherever wet audio is missing, silence (via the fade below).
+            self.dry_buf[..len].fill(0.0);
+        } else {
+            self.dry.process(buf, &mut self.dry_buf[..len]);
+        }
         let o0 = self.in_pos - self.delay() as i64;
         self.in_pos += n;
 
@@ -944,7 +976,19 @@ impl Worker {
         }
         if first < n && end < n {
             shared.starvations.fetch_add(1, Relaxed);
+            if self.fail_closed {
+                shared.degraded.store(true, Relaxed);
+            }
+        } else if self.fail_closed && first == 0 && end >= n && self.mix >= 1.0 {
+            // A whole block of wet audio at full level: no longer degraded.
+            shared.degraded.store(false, Relaxed);
         }
+    }
+
+    /// Fault injection: pause (or resume) the worker.
+    fn pause(&self, on: bool) {
+        self.sync.pause.store(on, Release);
+        self.handle.unpark();
     }
 }
 
@@ -988,7 +1032,6 @@ fn worker_main(
             continue;
         }
         let n = input.slots().min(MAX_BLOCK);
-        #[cfg(test)]
         let n = if sync.pause.load(Acquire) { 0 } else { n };
         if n == 0 {
             std::thread::park_timeout(WORKER_IDLE);
@@ -1116,7 +1159,15 @@ impl CaptureStage {
                 let block = in_block.clamp(1, MAX_BLOCK);
                 let period_ns = (block as f64 * 1e9 / rate) as u64;
                 let max48 = max_block48(block, rate, resampler.is_some()).min(max_out);
-                ChainRunner::Worker(Worker::spawn(chain, max48, period_ns, &shared, setup)?)
+                let fail_closed = chain.is_fail_closed();
+                ChainRunner::Worker(Worker::spawn(
+                    chain,
+                    fail_closed,
+                    max48,
+                    period_ns,
+                    &shared,
+                    setup,
+                )?)
             }
         };
         let reserve = match &runner {
@@ -1167,6 +1218,41 @@ impl CaptureStage {
             ChainRunner::Inline(c) => c.chain.latency(),
             ChainRunner::Worker(w) => w.delay(),
         }
+    }
+
+    /// Fault injection (tests, `oto fault-check`): stop (or resume) the DSP worker consuming
+    /// its input, to force starvation or, held long enough, an overflow and flush restart.
+    /// No effect when the chain runs inline.
+    #[doc(hidden)]
+    pub fn fault_pause_worker(&self, on: bool) {
+        if let ChainRunner::Worker(w) = &self.runner {
+            w.pause(on);
+        }
+    }
+
+    /// Blocks until the DSP worker has processed everything handed to it (or `timeout`
+    /// passes). Returns whether it caught up. Tests and `oto fault-check` only: it spins.
+    #[doc(hidden)]
+    pub fn wait_worker_idle(&self, timeout: Duration) -> bool {
+        let ChainRunner::Worker(w) = &self.runner else {
+            return true;
+        };
+        let t = Instant::now();
+        let caught_up = |w: &Worker| {
+            if w.flushing {
+                // Nothing to process until the next callback starts the new wet stream.
+                w.sync.flush_ack.load(Acquire) == w.flush_gen
+            } else {
+                w.wet_read + w.from.slots() as i64 == w.in_pos - w.wet_base
+            }
+        };
+        while !w.sync.pause.load(Acquire) && !caught_up(w) {
+            if t.elapsed() > timeout {
+                return false;
+            }
+            std::thread::sleep(Duration::from_micros(100));
+        }
+        true
     }
 
     /// Scratch buffer (`MAX_BLOCK` long) to downmix device audio into before [`Self::process`].
@@ -1340,6 +1426,8 @@ pub struct OutputStage {
     /// Gain of the fade-out before a stop ([`Shared::stop_fade`]) and its per-sample step.
     stop_gain: f32,
     stop_step: f32,
+    /// Gain of the [`Shared::mute_output`] fade (same step as the stop fade).
+    mute_gain: f32,
 }
 
 impl OutputStage {
@@ -1363,6 +1451,11 @@ impl OutputStage {
         let pend = vec![0.0; resampler.output_frames_max()].into();
         shared.target_frames.store(target as u32, Relaxed);
         shared.stop_fade.store(STOP_FADE_IDLE, Relaxed);
+        let mute_gain = if shared.mute_output.load(Acquire) {
+            0.0
+        } else {
+            1.0
+        };
         Ok(Self {
             consumer,
             resampler,
@@ -1383,6 +1476,7 @@ impl OutputStage {
             was_over: false,
             stop_gain: 1.0,
             stop_step: (1.0 / (STOP_FADE_S * rate).max(1.0)) as f32,
+            mute_gain,
         })
     }
 
@@ -1434,6 +1528,21 @@ impl OutputStage {
             return;
         }
         self.render_ring(out);
+        let muted = self.shared.mute_output.load(Acquire);
+        if muted || self.mute_gain < 1.0 {
+            let step = if muted {
+                -self.stop_step
+            } else {
+                self.stop_step
+            };
+            for s in out.iter_mut() {
+                self.mute_gain = (self.mute_gain + step).clamp(0.0, 1.0);
+                *s *= self.mute_gain;
+            }
+            if muted && self.mute_gain <= 0.0 {
+                self.shared.mute_silent.store(true, Release);
+            }
+        }
         if self.shared.stop_fade.load(Acquire) == STOP_FADE_REQUESTED {
             for s in out.iter_mut() {
                 self.stop_gain = (self.stop_gain - self.stop_step).max(0.0);
@@ -2150,6 +2259,99 @@ mod tests {
         let f = run_capture(48_000.0, 256, Placement::Worker, 700, shared(), src, fixed);
         let differs = |a: usize, b: usize| (a * 256..b * 256).any(|k| w.out[k] != f.out[k]);
         assert!(differs(110, 200) && differs(210, 300) && differs(310, 450));
+    }
+
+    /// Voice Isolation on the worker: start-up and starvation are silence, never the dry mic.
+    /// The model here passes its input (so wet audio is audible), which makes any fallback to
+    /// the dry signal indistinguishable from... nothing: so the check is on *silence* where wet
+    /// audio is missing, and on the degraded flag.
+    #[test]
+    fn fail_closed_worker_outputs_silence_where_wet_audio_is_missing() {
+        let rate = 48_000.0;
+        let (prod, mut cons) = RingBuffer::new(1 << 22);
+        let sh = shared();
+        sh.denoise.store(true, Relaxed);
+        let chain =
+            Chain::with_denoiser(Model::Nearfield, Box::new(oto_dsp::Passthrough::new(384)));
+        assert!(chain.is_fail_closed());
+        let mut cap =
+            CaptureStage::with_placement(rate, 256, chain, prod, sh.clone(), Placement::Worker)
+                .unwrap();
+        let mut out = Vec::new();
+        let mut degraded_seen = false;
+        for b in 0..300 {
+            let stalled = (150..156).contains(&b);
+            cap.fault_pause_worker(stalled);
+            for (i, s) in cap.mono_mut()[..256].iter_mut().enumerate() {
+                *s = tone(b * 256 + i, rate);
+            }
+            cap.process(256, 0);
+            if !stalled {
+                assert!(cap.wait_worker_idle(Duration::from_secs(5)));
+            }
+            degraded_seen |= sh.degraded.load(Relaxed);
+            let n = cons.slots();
+            let at = out.len();
+            out.resize(at + n, 0.0);
+            cons.pop_entire_slice(&mut out[at..]).unwrap();
+        }
+        let lat = cap.latency_frames();
+        // Start-up: silence until the first wet sample, which is (delayed) audio.
+        assert!(out[..lat].iter().all(|&s| s == 0.0));
+        assert!(out[lat + 256..lat + 2048].iter().any(|s| s.abs() > 0.1));
+        // Starvation: after a WORKER_FADE fade, silence for the rest of the stalled blocks.
+        assert!(sh.starvations.load(Relaxed) >= 3);
+        assert!(degraded_seen);
+        assert!(!sh.degraded.load(Relaxed), "cleared after catching up");
+        let starts = 151 * 256..156 * 256;
+        let silent = out[starts].iter().filter(|s| s.abs() < 1e-6).count();
+        assert!(
+            silent >= 4 * 256,
+            "only {silent} silent samples in the stall"
+        );
+        assert!(max_step(&out[1000..]) < 0.03, "{}", max_step(&out[1000..]));
+    }
+
+    #[test]
+    fn mute_output_fades_holds_silence_and_unmutes_smoothly() {
+        let sh = shared();
+        let (mut prod, cons) = RingBuffer::new(RING_CAPACITY);
+        let mut out = OutputStage::new(cons, 48_000.0, 300, sh.clone()).unwrap();
+        // Under the 100 ms resync threshold, enough for all 20 callbacks.
+        prod.push_entire_slice(&[0.5; 4000]).unwrap();
+        let mut buf = [0.0f32; 128];
+        for _ in 0..4 {
+            out.render(&mut buf);
+        }
+        sh.mute_output.store(true, Release);
+        let mut rec = Vec::new();
+        for _ in 0..8 {
+            out.render(&mut buf);
+            rec.extend_from_slice(&buf);
+        }
+        assert!(sh.mute_silent.load(Acquire));
+        assert!(
+            rec[480..].iter().all(|&s| s == 0.0),
+            "holds silence after 10 ms"
+        );
+        assert!(max_step(&rec) <= 0.5 / 480.0 + 1e-6);
+        sh.mute_output.store(false, Release);
+        rec.clear();
+        for _ in 0..8 {
+            out.render(&mut buf);
+            rec.extend_from_slice(&buf);
+        }
+        assert!(max_step(&rec) <= 0.5 / 480.0 + 1e-6);
+        assert!((rec.last().unwrap() - 0.5).abs() < 1e-3);
+        // Streams built while muted start silent.
+        sh.mute_output.store(true, Release);
+        let (mut p2, c2) = RingBuffer::new(RING_CAPACITY);
+        p2.push_entire_slice(&[0.5; 2000]).unwrap();
+        let mut o2 = OutputStage::new(c2, 48_000.0, 300, sh.clone()).unwrap();
+        for _ in 0..4 {
+            o2.render(&mut buf);
+            assert!(buf.iter().all(|&s| s == 0.0));
+        }
     }
 
     #[test]

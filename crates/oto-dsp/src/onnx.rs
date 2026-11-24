@@ -1,4 +1,5 @@
 //! DPDFNet-2 and FastEnhancer-S through ONNX Runtime (`ort`). Behind the `onnx` feature.
+//! Nearfield (`nearfield.rs`) shares the session setup here.
 //!
 //! Both are streaming models exported with their recurrent state as explicit inputs and
 //! outputs, so each frame is one `Session::run` that also returns the state for the next frame.
@@ -26,7 +27,7 @@ static FASTENHANCER_S: &[u8] = include_bytes!("../models/fastenhancer_s_48khz.on
 
 /// One single-threaded CPU session: inference shares the DSP worker's core, and spinning
 /// intra-op threads would burn a second one.
-fn session(model: &[u8]) -> Result<Session, String> {
+pub(crate) fn session(model: &[u8]) -> Result<Session, String> {
     // ONNX Runtime allows one environment per process: every session (each model, each reload
     // after a model switch) shares this one.
     static ENV: std::sync::OnceLock<Result<ort::environment::Environment, String>> =
@@ -55,7 +56,7 @@ fn session(model: &[u8]) -> Result<Session, String> {
         .map_err(|e| format!("ONNX Runtime: {e}"))
 }
 
-fn err(e: ort::Error) -> String {
+pub(crate) fn err(e: ort::Error) -> String {
     format!("ONNX Runtime: {e}")
 }
 
@@ -90,14 +91,23 @@ impl DpdfNet {
     pub fn new() -> Result<Self, String> {
         let session = session(DPDFNET2)?;
         let meta = session.metadata().map_err(err)?;
-        let get = |k: &str| meta.custom(k).ok_or_else(|| format!("DPDFNet: no {k} metadata"));
+        let get = |k: &str| {
+            meta.custom(k)
+                .ok_or_else(|| format!("DPDFNet: no {k} metadata"))
+        };
         let num = |k: &str| -> Result<usize, String> {
-            get(k)?.parse().map_err(|_| format!("DPDFNet: bad {k} metadata"))
+            get(k)?
+                .parse()
+                .map_err(|_| format!("DPDFNet: bad {k} metadata"))
         };
         let floats = |k: &str| -> Result<Vec<f32>, String> {
             get(k)?
                 .split(',')
-                .map(|v| v.trim().parse().map_err(|_| format!("DPDFNet: bad {k} metadata")))
+                .map(|v| {
+                    v.trim()
+                        .parse()
+                        .map_err(|_| format!("DPDFNet: bad {k} metadata"))
+                })
                 .collect()
         };
         let mut init_state = vec![0.0; num("state_size")?];
@@ -173,7 +183,13 @@ impl Denoiser for DpdfNet {
             .fft
             .process_with_scratch(&mut self.time, &mut self.spec, &mut self.scratch_fwd)
             .is_ok();
-        for (ri, c) in self.spec_ri.as_chunks_mut::<2>().0.iter_mut().zip(&self.spec) {
+        for (ri, c) in self
+            .spec_ri
+            .as_chunks_mut::<2>()
+            .0
+            .iter_mut()
+            .zip(&self.spec)
+        {
             *ri = [c.re, c.im];
         }
         if !ok || self.infer().is_err() {
@@ -233,7 +249,11 @@ impl FastEnhancer {
         let session = session(FASTENHANCER_S)?;
         let mut caches = Vec::new();
         let mut names_in = Vec::new();
-        for i in session.inputs().iter().filter(|i| i.name().starts_with("cache_in_")) {
+        for i in session
+            .inputs()
+            .iter()
+            .filter(|i| i.name().starts_with("cache_in_"))
+        {
             let shape: Vec<usize> = match i.dtype().tensor_shape() {
                 Some(s) => s.iter().map(|&d| d.max(1) as usize).collect(),
                 None => return Err(format!("FastEnhancer: {} is not a tensor", i.name())),
@@ -242,7 +262,10 @@ impl FastEnhancer {
             caches.push((shape, vec![0.0; len]));
             names_in.push(i.name().to_string());
         }
-        let names_out = names_in.iter().map(|n| n.replace("cache_in_", "cache_out_")).collect();
+        let names_out = names_in
+            .iter()
+            .map(|n| n.replace("cache_in_", "cache_out_"))
+            .collect();
         Ok(Self {
             session,
             caches,
@@ -258,14 +281,18 @@ impl FastEnhancer {
         for (name, (shape, data)) in self.names_in.iter().zip(&self.caches) {
             inputs.push((
                 name.clone().into(),
-                TensorRef::from_array_view((shape.clone(), &data[..])).map_err(err)?.into(),
+                TensorRef::from_array_view((shape.clone(), &data[..]))
+                    .map_err(err)?
+                    .into(),
             ));
         }
         let out = self.session.run(inputs).map_err(err)?;
         let (_, wav) = out["wav_out"].try_extract_tensor::<f32>().map_err(err)?;
         output.copy_from_slice(wav);
         for (name, (_, data)) in self.names_out.iter().zip(self.caches.iter_mut()) {
-            let (_, c) = out[name.as_str()].try_extract_tensor::<f32>().map_err(err)?;
+            let (_, c) = out[name.as_str()]
+                .try_extract_tensor::<f32>()
+                .map_err(err)?;
             data.copy_from_slice(c);
         }
         Ok(())

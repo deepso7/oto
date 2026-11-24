@@ -110,25 +110,32 @@ display_name = "Nearfield v2.3 fast (Voice Isolation)"
 engine_name = "Nearfield"
 status = "candidate-pending-phase2-gates"
 ship_in_release = false
-cli_model = "nearfield"            # not wired up yet; Phase 2 (docs/plans/0002-e2e-roadmap.md)
-cargo_feature = ""
+cli_model = "nearfield"
+cli_tier = "isolate"
+cargo_feature = "nearfield"        # on for local builds, off in scripts/macos/release.sh
 source = "https://github.com/Ground-State-Foundry/nearfield"
 tag = "v2.3.0"
 variant = "fast"
-# path / sha256 are added when the weights are vendored in Phase 2; the harness skips the
-# hash check for entries without a `path`.
+upstream_file = "src/nearfield/nearfield-v2.3.onnx"   # upstream weights.py MODEL_SHA256["fast"]
+path = "crates/oto-dsp/models/nearfield_v2_3_fast.onnx"
+sha256 = "d3634c3c12fc9c320f10d1665cf50910565852222d2e2c601e3acf9c04250d7c"
 license_code = "Apache-2.0"
 license_weights = "Apache-2.0"
-notice_required = true             # upstream ships a NOTICE file: reproduce it in THIRD_PARTY_NOTICES.md
+notice_required = true             # upstream NOTICE reproduced in THIRD_PARTY_NOTICES.md
 blockers = [
-  "copy upstream NOTICE verbatim into THIRD_PARTY_NOTICES.md before shipping",
   "verify training-data provenance against docs/training-data-audit.md (no NC / export-restricted corpora)",
   "pass the Phase 2 Voice Isolation gates in tools/eval/gates.toml",
 ]
 model_sample_rate = 16000
-sample_rate = 48000                # engine side, through 48<->16 kHz resamplers
-frame_samples = 384                # frame_size = 384 at 48 kHz (8 ms)
-latency_samples = 2304             # 48 ms algorithmic delay, at 48 kHz
-resampler_latency_ms = [2.0, 3.0]  # approximate, 48->16->48 kHz round trip
+sample_rate = 48000                # engine side, through 48<->16 kHz polyphase FIR resamplers
+frame_samples = 384                # frame_size = 384 at 48 kHz (8 ms) = 3 x the model's 128-sample hop
+# Measured sample-synchronous delay at 48 kHz (oto-dsp `nearfield::tests`, impulse and
+# cross-correlation): 3 x (384 STFT overlap + 256 lookahead) at 16 kHz = 1920, plus the two
+# 95-tap linear-phase resamplers (47 each). Upstream quotes 48 ms because it counts the whole
+# 512-sample window; Oto's FrameAdapter adds its 384-sample frame on top (chain 2398 = 49.96 ms).
+latency_samples = 2014
+resampler_latency_samples = 94     # included in latency_samples (not extra tolerance)
+runtime = "onnxruntime (ort 2.0.0-rc.15, static, CPU, 1 thread)"
 placement = "worker"
+fail_closed = true                 # Voice Isolation: silence, never the raw mic or another model
 architectures = ["aarch64-apple-darwin", "x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"]

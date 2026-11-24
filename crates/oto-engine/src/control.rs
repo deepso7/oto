@@ -43,7 +43,10 @@ pub fn decide(enabled: bool, clients_active: bool, driver_installed: bool) -> Mo
 /// [`Tier::Light`] ("Low CPU mode") is RNNoise. [`Tier::Standard`] is DeepFilterNet3 with the
 /// `dfn3` cargo feature and RNNoise without. [`Tier::Max`] is DPDFNet-2 with the `onnx`
 /// feature and [`Tier::Fast`] FastEnhancer-S with `fastenhancer`; without them they resolve to
-/// Standard's model. Every model
+/// Standard's model (and [`available_tiers`] does not offer them). [`Tier::Isolate`] is always
+/// Nearfield (Voice Isolation): without the `nearfield` feature it fails to load, and the
+/// engine fails closed (silence, [`crate::Event::Degraded`]) instead of quietly running another
+/// model; [`available_tiers`] does not offer it then. Every model
 /// but RNNoise allocates during inference and runs on a realtime worker thread rather than in
 /// the audio callback ([`crate::pipeline::placement_for`]).
 pub fn model_for(tier: Tier) -> Model {
@@ -57,19 +60,32 @@ pub fn model_for(tier: Tier) -> Model {
         Tier::Standard => standard,
         Tier::Max if cfg!(feature = "onnx") => Model::DpdfNet,
         Tier::Fast if cfg!(feature = "fastenhancer") => Model::FastEnhancer,
+        Tier::Isolate => Model::Nearfield,
         Tier::Max | Tier::Fast => standard,
     }
 }
 
-/// The tiers worth offering: one per distinct model in this build, Light first. Always
+const ALL_TIERS: [Tier; 5] = [
+    Tier::Light,
+    Tier::Standard,
+    Tier::Max,
+    Tier::Fast,
+    Tier::Isolate,
+];
+
+/// The tiers worth offering: one per distinct model this build has, Light first. Always
 /// contains [`Tier::default`]. With a single entry the tier setting does nothing and a UI
 /// should hide its picker.
 pub fn available_tiers() -> &'static [Tier] {
     static TIERS: std::sync::OnceLock<Vec<Tier>> = std::sync::OnceLock::new();
     TIERS.get_or_init(|| {
         let mut out: Vec<Tier> = Vec::new();
-        for t in [Tier::Light, Tier::Standard, Tier::Max, Tier::Fast] {
+        for t in ALL_TIERS {
             let m = model_for(t);
+            if !m.available() {
+                // Isolate without `nearfield`: requestable (it fails closed), never offered.
+                continue;
+            }
             // Folded tiers resolve to Standard's model; offer that once, as Standard.
             if !out.iter().any(|&o| model_for(o) == m) || t == Tier::Standard {
                 out.retain(|&o| model_for(o) != m);
@@ -84,10 +100,21 @@ pub fn available_tiers() -> &'static [Tier] {
 pub(crate) type Hook = Box<dyn Fn() + Send>;
 
 /// Builds the chain for a model. [`Chain::with_model`] outside tests.
-type Loader = Box<dyn FnMut(Model) -> Result<Chain, String>>;
+pub(crate) type Loader = Box<dyn FnMut(Model) -> Result<Chain, String>>;
 
-/// What runs when the requested model cannot be loaded. Always compiled in.
+/// What runs when the requested model cannot be loaded. Always compiled in. Never used in place
+/// of an isolating model ([`Model::is_isolating`]) while denoising is on: Voice Isolation that
+/// fails stays silent instead.
 const FALLBACK: Model = Model::RNNoise;
+
+/// Why Voice Isolation is degraded ([`Event::Degraded`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Degraded {
+    /// The model failed to load; silent until the tier changes.
+    Load,
+    /// The worker starved or restarted; silent until it catches up.
+    Starved,
+}
 
 const TICK: Duration = Duration::from_millis(250);
 /// How long a stop waits for the output callback to fade to silence (it takes `STOP_FADE_S`,
@@ -124,8 +151,18 @@ pub(crate) struct Control<P: Platform> {
     tier_model: fn(Tier) -> Model,
     loader: Loader,
     /// A model that failed to load. While set, a request for it resolves to [`FALLBACK`]
-    /// without retrying. Cleared when the tier changes; nothing retries on a timer.
+    /// without retrying (or, for an isolating model, to silence). Cleared when the tier
+    /// changes; nothing retries on a timer.
     failed: Option<Model>,
+    /// The [`Event::Degraded`] being reported, if any.
+    degraded: Option<Degraded>,
+    /// Starvations plus worker overflows seen at the last tick.
+    starved_seen: u64,
+    /// The running streams have played bypassed (raw) audio since they started.
+    ran_bypassed: bool,
+    /// Runs on each poll while [`Self::mute_output`] waits for the output to fade (fault
+    /// injection: `fault_check` pumps its simulated callbacks here).
+    mute_wait: Option<Box<dyn FnMut()>>,
 }
 
 impl<P: Platform> Control<P> {
@@ -155,7 +192,24 @@ impl<P: Platform> Control<P> {
             tier_model: model_for,
             loader: Box::new(Chain::with_model),
             failed: None,
+            degraded: None,
+            starved_seen: 0,
+            ran_bypassed: false,
+            mute_wait: None,
         }
+    }
+
+    /// Replaces the tier → model map and the chain loader (fault injection, `fault_check`).
+    pub(crate) fn with_models(mut self, tier_model: fn(Tier) -> Model, loader: Loader) -> Self {
+        self.tier_model = tier_model;
+        self.loader = loader;
+        self
+    }
+
+    /// Runs `f` on each poll while waiting for the output to fade before Voice Isolation loads.
+    pub(crate) fn with_mute_wait(mut self, f: Box<dyn FnMut()>) -> Self {
+        self.mute_wait = Some(f);
+        self
     }
 
     pub fn on_default_input(mut self, hook: Hook) -> Self {
@@ -195,6 +249,24 @@ impl<P: Platform> Control<P> {
             self.last_error = None;
             self.emit(Event::Recovered);
         }
+    }
+
+    fn degrade(&mut self, why: Degraded, msg: String) {
+        if self.degraded != Some(why) {
+            self.degraded = Some(why);
+            self.emit(Event::Degraded(msg));
+        }
+    }
+
+    /// The reported [`Event::Degraded`] no longer applies.
+    fn undegrade(&mut self) {
+        if self.degraded.take().is_some() {
+            self.emit(Event::DegradedCleared);
+        }
+    }
+
+    fn starved_count(&self) -> u64 {
+        self.shared.starvations.load(Relaxed) + self.shared.worker_overflows.load(Relaxed)
     }
 
     pub fn handle(&mut self, msg: Msg) {
@@ -258,6 +330,26 @@ impl<P: Platform> Control<P> {
             self.retry_at = None;
             return;
         }
+        if self
+            .running
+            .as_ref()
+            .is_some_and(|k| k.model.is_isolating())
+        {
+            // Fail-closed starvation is silence, not a leak, but the user should know.
+            let seen = self.starved_count();
+            let starved = self.shared.degraded.load(Relaxed) || seen != self.starved_seen;
+            self.starved_seen = seen;
+            if starved {
+                self.degrade(
+                    Degraded::Starved,
+                    "Voice Isolation fell behind; Oto Microphone is silent until it catches up \
+                     (the raw mic is never passed through)"
+                        .into(),
+                );
+            } else if self.degraded == Some(Degraded::Starved) {
+                self.undegrade();
+            }
+        }
         let (t0, b0) = self.load;
         let dt = now.duration_since(t0);
         if dt >= Duration::from_secs(1) {
@@ -274,6 +366,32 @@ impl<P: Platform> Control<P> {
             self.p.stop();
             self.shared.running.store(false, Relaxed);
             self.shared.model.store(encode_model(None), Relaxed);
+            self.shared.degraded.store(false, Relaxed);
+        }
+        if self.degraded == Some(Degraded::Starved) {
+            self.undegrade();
+        }
+    }
+
+    /// Fades the running output to silence and holds it there without stopping the streams,
+    /// waiting (bounded) for the fade to finish. Used before Voice Isolation loads, so a
+    /// non-isolating stream stops passing background voices at once. Cleared by the next start.
+    /// If the output callback does not confirm silence in time (stalled or late), the streams
+    /// are stopped instead, so a late callback cannot play anything while the model loads.
+    fn mute_output(&mut self) {
+        let s = self.shared.clone();
+        if !s.mute_output.swap(true, Release) {
+            s.mute_silent.store(false, Release);
+        }
+        let deadline = Instant::now() + STOP_FADE_WAIT;
+        while !s.mute_silent.load(Acquire) && Instant::now() < deadline {
+            if let Some(f) = &mut self.mute_wait {
+                f();
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        if !s.mute_silent.load(Acquire) {
+            self.stop();
         }
     }
 
@@ -288,21 +406,44 @@ impl<P: Platform> Control<P> {
         }
     }
 
-    /// The model to run: what the tier asks for, unless that failed to load.
-    fn effective_model(&self) -> Model {
+    /// The model to run: what the tier asks for, unless that failed to load. In bypass, an
+    /// isolating tier uses `FALLBACK` so starting a call with processing off never depends on
+    /// loading the isolation model; while denoising, a failed isolating model stays requested
+    /// so `reconcile` runs nothing and stays fail-closed.
+    fn effective_model(&self, mode: Mode, input: &str) -> Model {
         let requested = (self.tier_model)(self.settings.tier);
-        if self.failed == Some(requested) {
-            FALLBACK
-        } else {
+        let already_running = self
+            .running
+            .as_ref()
+            .is_some_and(|r| r.model == requested && r.input == input);
+        if mode == Mode::Bypass && requested.is_isolating() && !already_running {
+            return FALLBACK;
+        }
+        if self.failed != Some(requested) || (requested.is_isolating() && mode == Mode::Denoise) {
             requested
+        } else {
+            FALLBACK
         }
     }
 
     /// Builds the chain for `key`. If its model cannot load and is not already the fallback,
-    /// remembers the failure, reports it once and switches `key` to the fallback.
+    /// remembers the failure, reports it once and switches `key` to the fallback. An isolating
+    /// model is never replaced: its failure is reported as [`Event::Degraded`] and returned.
     fn load_chain(&mut self, key: &mut RunKey) -> Result<Chain, String> {
         match (self.loader)(key.model) {
             Ok(c) => Ok(c),
+            Err(reason) if key.model.is_isolating() => {
+                self.failed = Some(key.model);
+                self.degrade(
+                    Degraded::Load,
+                    format!(
+                        "Voice Isolation ({}) could not load: {reason}. Oto Microphone is muted \
+                         so background voices cannot leak; pick another mode to unmute",
+                        key.model.name()
+                    ),
+                );
+                Err(reason)
+            }
             Err(reason) if key.model != FALLBACK => {
                 let requested = key.model;
                 self.failed = Some(requested);
@@ -335,6 +476,15 @@ impl<P: Platform> Control<P> {
             self.emit(Event::ClientsActive(clients));
         }
         let mode = decide(self.settings.enabled, clients, driver);
+        let requested = (self.tier_model)(self.settings.tier);
+        if self.degraded == Some(Degraded::Load)
+            && (self.failed != Some(requested) || !self.settings.enabled)
+        {
+            // Another mode was picked, or processing was turned off (even while idle):
+            // the mic is no longer muted by the load failure. `self.failed` stays cached so
+            // turning Voice Isolation back on fails closed again.
+            self.undegrade();
+        }
         self.shared.denoise.store(mode == Mode::Denoise, Relaxed);
         self.shared.max_atten_bits.store(
             self.settings.strength.max_attenuation_db().to_bits(),
@@ -354,11 +504,43 @@ impl<P: Platform> Control<P> {
             self.error("no microphone found".into());
             return;
         };
-        let mut key = RunKey {
-            input,
-            model: self.effective_model(),
-        };
+        let model = self.effective_model(mode, &input);
+        let mut key = RunKey { input, model };
+        if self.running.is_some() && mode == Mode::Bypass {
+            self.ran_bypassed = true;
+        }
         if self.running.as_ref() == Some(&key) {
+            if !(mode == Mode::Denoise && key.model.is_isolating() && self.ran_bypassed) {
+                return;
+            }
+            // Voice Isolation is back on mid-call, but the worker and the rings still hold
+            // bypassed (raw) mic audio. Silence the output and rebuild the streams, so none of
+            // it plays.
+            self.mute_output();
+            self.stop();
+        }
+        if key.model.is_isolating()
+            && self
+                .running
+                .as_ref()
+                .is_some_and(|r| !r.model.is_isolating() || self.ran_bypassed)
+        {
+            // Voice Isolation is about to load (or has failed), or the old stream ran bypassed:
+            // silence the old stream now so it cannot pass queued raw audio while loading.
+            self.mute_output();
+        }
+        if key.model.is_isolating() && self.failed == Some(key.model) {
+            // Failed to load before: stay silent until the tier changes (no retry timer).
+            // Re-emit Degraded if a prior bypass cleared the banner.
+            self.stop();
+            self.degrade(
+                Degraded::Load,
+                format!(
+                    "Voice Isolation ({}) could not load. Oto Microphone is muted \
+                     so background voices cannot leak; pick another mode to unmute",
+                    key.model.name()
+                ),
+            );
             return;
         }
         if self.retry_at.is_some_and(|t| Instant::now() < t) {
@@ -370,6 +552,11 @@ impl<P: Platform> Control<P> {
         // the fallback is what already runs.
         let chain = match self.load_chain(&mut key) {
             Ok(c) => c,
+            Err(_) if key.model.is_isolating() => {
+                // Fail closed: no fallback model, no raw mic. Degraded is reported.
+                self.stop();
+                return;
+            }
             Err(e) => {
                 self.stop();
                 self.error(e);
@@ -381,6 +568,9 @@ impl<P: Platform> Control<P> {
             return;
         }
         self.stop();
+        // The new streams are what was asked for: unmuted from their first sample.
+        self.shared.mute_output.store(false, Release);
+        self.shared.mute_silent.store(false, Release);
         let started = self.p.start(&key.input, chain, &self.shared);
         // Opening devices can take a while (Bluetooth: seconds). The stall watchdog and the
         // load meter count from when the streams were actually started, not from before.
@@ -391,6 +581,7 @@ impl<P: Platform> Control<P> {
                     .model
                     .store(encode_model(Some(key.model)), Relaxed);
                 self.running = Some(key);
+                self.ran_bypassed = mode == Mode::Bypass;
                 self.shared.stream_starts.fetch_add(1, Relaxed);
                 self.shared.running.store(true, Relaxed);
                 self.last_error = None;
@@ -398,6 +589,7 @@ impl<P: Platform> Control<P> {
                 let s = &self.shared;
                 self.watch = (now, s.in_cycles.load(Relaxed), s.out_cycles.load(Relaxed));
                 self.load = (now, s.busy_ns.load(Relaxed));
+                self.starved_seen = self.starved_count();
             }
             Err(e) => {
                 self.error(e);
@@ -602,13 +794,15 @@ mod tests {
             assert!(!models[..i].contains(m), "{m:?} offered twice");
         }
         // Nothing reachable is left out.
-        for t in [Tier::Light, Tier::Standard, Tier::Max, Tier::Fast] {
-            assert!(models.contains(&model_for(t)));
+        for t in ALL_TIERS {
+            assert!(models.contains(&model_for(t)) || !model_for(t).available());
         }
+        assert_eq!(model_for(Tier::Isolate), Model::Nearfield, "never folded");
         let expected = 1
             + cfg!(feature = "dfn3") as usize
             + cfg!(feature = "onnx") as usize
-            + cfg!(feature = "fastenhancer") as usize;
+            + cfg!(feature = "fastenhancer") as usize
+            + cfg!(feature = "nearfield") as usize;
         assert_eq!(tiers.len(), expected);
     }
 
@@ -832,7 +1026,7 @@ mod tests {
     fn dfn3_fails(c: &mut Control<Fake>) -> std::rc::Rc<std::cell::RefCell<Vec<Model>>> {
         c.tier_model = |t| match t {
             Tier::Light => Model::RNNoise,
-            Tier::Standard | Tier::Max | Tier::Fast => Model::DeepFilterNet3,
+            Tier::Standard | Tier::Max | Tier::Fast | Tier::Isolate => Model::DeepFilterNet3,
         };
         let loads = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
         let l = loads.clone();
@@ -853,7 +1047,7 @@ mod tests {
     }
 
     /// What `Stats::model` reports.
-    fn running_model(c: &Control<Fake>) -> Option<Model> {
+    fn running_model<P: Platform>(c: &Control<P>) -> Option<Model> {
         crate::pipeline::decode_model(c.shared.model.load(Relaxed))
     }
 
@@ -951,6 +1145,184 @@ mod tests {
         assert_eq!(running_model(&c), Some(Dfn3));
         assert_eq!(c.p.started.len(), 2);
         assert_eq!(fallbacks(&rx.try_iter().collect::<Vec<_>>()), 0);
+    }
+
+    /// Tiers as with `onnx`: Isolate is Nearfield, everything else RNNoise.
+    fn isolate_tiers(t: Tier) -> Model {
+        match t {
+            Tier::Isolate => Model::Nearfield,
+            _ => Model::RNNoise,
+        }
+    }
+
+    #[test]
+    fn voice_isolation_load_failure_stays_silent_and_never_falls_back() {
+        let (mut c, rx) = ctl(
+            Fake {
+                clients: true,
+                ..fake()
+            },
+            true,
+        );
+        let loads = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let l = loads.clone();
+        c.tier_model = isolate_tiers;
+        c.loader = Box::new(move |m| {
+            l.borrow_mut().push(m);
+            match m {
+                Model::Nearfield => Err("no weights".into()),
+                _ => Chain::with_model(Model::RNNoise),
+            }
+        });
+        c.settings.tier = Tier::Isolate;
+        for _ in 0..5 {
+            c.reconcile();
+            advance(&c);
+            c.tick(Instant::now());
+        }
+        // Nothing runs (Oto Microphone is silent), one attempt, no fallback, no retry timer.
+        assert!(!c.p.live);
+        assert!(c.p.started.is_empty());
+        assert_eq!(*loads.borrow(), [Model::Nearfield]);
+        assert_eq!(running_model(&c), None);
+        assert!(c.retry_at.is_none());
+        let ev: Vec<_> = rx.try_iter().collect();
+        assert_eq!(fallbacks(&ev), 0, "{ev:?}");
+        assert!(!ev.iter().any(|e| matches!(e, Event::Error(_))), "{ev:?}");
+        let degraded: Vec<_> = ev
+            .iter()
+            .filter(|e| matches!(e, Event::Degraded(_)))
+            .collect();
+        assert_eq!(degraded.len(), 1, "{ev:?}");
+        assert!(matches!(degraded[0], Event::Degraded(m) if m.contains("muted")));
+
+        // Bypass is the user's explicit request for the raw mic: it plays (via the fallback
+        // chain, bypassed); enabling again goes silent without a new load attempt.
+        c.handle(Msg::Cmd(Command::SetEnabled(false)));
+        c.reconcile();
+        assert!(c.p.live);
+        assert!(!c.shared.denoise.load(Relaxed));
+        c.handle(Msg::Cmd(Command::SetEnabled(true)));
+        c.reconcile();
+        assert!(!c.p.live);
+        assert_eq!(loads.borrow().len(), 2, "{:?}", loads.borrow());
+
+        // Another mode clears it, and that mode runs.
+        c.handle(Msg::Cmd(Command::SetTier(Tier::Light)));
+        c.reconcile();
+        assert!(c.p.live);
+        assert_eq!(running_model(&c), Some(Model::RNNoise));
+        let ev: Vec<_> = rx.try_iter().collect();
+        assert!(ev.contains(&Event::DegradedCleared), "{ev:?}");
+        assert!(!ev.contains(&Event::Recovered), "{ev:?}");
+        assert!(
+            !c.shared.mute_output.load(Relaxed),
+            "new streams start unmuted"
+        );
+    }
+
+    #[test]
+    fn switching_to_voice_isolation_mutes_the_old_stream_before_loading() {
+        let (mut c, _rx) = ctl(
+            Fake {
+                clients: true,
+                ..fake()
+            },
+            true,
+        );
+        c.tier_model = isolate_tiers;
+        let shared = c.shared.clone();
+        let muted_at_load = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let m2 = muted_at_load.clone();
+        c.loader = Box::new(move |m| {
+            m2.borrow_mut().push((m, shared.mute_output.load(Relaxed)));
+            Chain::with_model(Model::RNNoise)
+        });
+        c.settings.tier = Tier::Light;
+        c.reconcile();
+        c.handle(Msg::Cmd(Command::SetTier(Tier::Isolate)));
+        c.reconcile();
+        assert_eq!(
+            *muted_at_load.borrow(),
+            [(Model::RNNoise, false), (Model::Nearfield, true)]
+        );
+        assert_eq!(running_model(&c), Some(Model::Nearfield));
+        assert!(!c.shared.mute_output.load(Relaxed), "unmuted once it runs");
+        // Leaving Voice Isolation does not mute: the new stream is the user's choice.
+        c.handle(Msg::Cmd(Command::SetTier(Tier::Light)));
+        c.reconcile();
+        assert_eq!(
+            muted_at_load.borrow().last(),
+            Some(&(Model::RNNoise, false))
+        );
+    }
+
+    #[test]
+    fn voice_isolation_starvation_is_reported_degraded_then_recovered() {
+        let (mut c, rx) = ctl(
+            Fake {
+                clients: true,
+                ..fake()
+            },
+            true,
+        );
+        c.tier_model = isolate_tiers;
+        c.loader = Box::new(loads_anything);
+        c.settings.tier = Tier::Isolate;
+        c.reconcile();
+        assert_eq!(running_model(&c), Some(Model::Nearfield));
+        assert_eq!(
+            rx.try_iter().collect::<Vec<_>>(),
+            [Event::ClientsActive(true)]
+        );
+        advance(&c);
+        c.tick(Instant::now());
+        assert!(rx.try_iter().next().is_none());
+        c.shared.starvations.fetch_add(2, Relaxed);
+        advance(&c);
+        c.tick(Instant::now());
+        advance(&c);
+        c.tick(Instant::now());
+        let ev: Vec<_> = rx.try_iter().collect();
+        assert!(
+            matches!(&ev[..], [Event::Degraded(m), Event::DegradedCleared] if m.contains("fell behind")),
+            "{ev:?}"
+        );
+        // Non-isolating models do not report starvation as degraded (they fall back to dry).
+        c.handle(Msg::Cmd(Command::SetTier(Tier::Light)));
+        c.reconcile();
+        c.shared.starvations.fetch_add(2, Relaxed);
+        advance(&c);
+        c.tick(Instant::now());
+        assert!(!rx.try_iter().any(|e| matches!(e, Event::Degraded(_))));
+    }
+
+    /// Without the `nearfield` feature an explicit Isolate request still asks for Nearfield,
+    /// which cannot load: silence and `Degraded`, never Standard's model.
+    #[cfg(not(feature = "nearfield"))]
+    #[test]
+    fn explicit_isolate_without_nearfield_fails_closed() {
+        assert!(!available_tiers().contains(&Tier::Isolate));
+        let (mut c, rx) = ctl(
+            Fake {
+                clients: true,
+                ..fake()
+            },
+            true,
+        );
+        c.handle(Msg::Cmd(Command::SetTier(Tier::Isolate)));
+        c.reconcile();
+        c.reconcile();
+        assert!(!c.p.live);
+        assert!(c.p.started.is_empty());
+        assert_eq!(running_model(&c), None);
+        let ev: Vec<_> = rx.try_iter().collect();
+        assert_eq!(fallbacks(&ev), 0, "{ev:?}");
+        assert!(
+            ev.iter()
+                .any(|e| matches!(e, Event::Degraded(m) if m.contains("not in this build"))),
+            "{ev:?}"
+        );
     }
 
     #[test]
@@ -1072,12 +1444,99 @@ mod tests {
         fn refresh(&mut self) {}
     }
 
+    /// Voice Isolation turned back on mid-call (bypass → on, same model, same mic): the worker
+    /// and the rings still hold bypassed raw mic audio from before the command. Past the 10 ms
+    /// mute fade, not one sample of it may reach the sink.
+    #[test]
+    fn reenabling_voice_isolation_mid_call_plays_no_queued_raw_audio() {
+        use crate::fault_check::{LEAK_THRESHOLD, silencer};
+        use crate::pipeline::STOP_FADE_S;
+        let _rt = crate::REALTIME_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut sh = Shared::new(Arc::new(Levels::default()), None);
+        let tone: Vec<f32> = (0..4800)
+            .map(|k| 0.3 * (2.0 * std::f32::consts::PI * 480.0 * k as f32 / 48_000.0).sin())
+            .collect();
+        sh.source = Some(tone.into());
+        let (tx, _rx) = mpsc::channel();
+        let s = Settings {
+            enabled: true,
+            tier: Tier::Isolate,
+            ..Default::default()
+        };
+        let loader = Box::new(|m: Model| {
+            if m.is_isolating() {
+                Ok(silencer())
+            } else {
+                Chain::with_model(m)
+            }
+        });
+        let mut c = Control::new(Sim::default(), s, true, Arc::new(sh), tx)
+            .with_models(isolate_tiers, loader);
+        c.reconcile();
+        assert_eq!(running_model(&c), Some(Model::Nearfield));
+        // Bypass mid-call (streams stay on Nearfield) so bypassed raw audio fills worker and rings.
+        c.handle(Msg::Cmd(Command::SetEnabled(false)));
+        c.reconcile();
+        assert_eq!(running_model(&c), Some(Model::Nearfield));
+        let play = Duration::from_millis(400);
+        std::thread::sleep(play);
+        // Every block rendered from here on comes after the command.
+        let at = c.p.rec.lock().unwrap().len();
+        c.handle(Msg::Cmd(Command::SetEnabled(true)));
+        c.reconcile();
+        std::thread::sleep(play);
+        c.stop();
+        assert_eq!(c.p.placements.len(), 2, "the streams were rebuilt");
+
+        let rec = c.p.rec.lock().unwrap();
+        let before = rec[at.saturating_sub(100)..at]
+            .iter()
+            .flat_map(|(_, b)| b)
+            .filter(|x| x.abs() > LEAK_THRESHOLD)
+            .count();
+        assert!(
+            before > 10_000,
+            "bypass played the mic ({before} loud samples)"
+        );
+        // After the command the output may only fade out what was already playing: up to two
+        // 128-frame blocks before the mute reaches the output callback, then its linear 10 ms
+        // ramp to silence. A sample above that envelope is queued raw mic audio played after
+        // Voice Isolation came back on (without the restart, ~15 ms of it at full level).
+        let fade = STOP_FADE_S as f32 * 48_000.0;
+        let lead = 2 * 128;
+        let post: Vec<f32> = rec[at..]
+            .iter()
+            .flat_map(|(_, b)| b.iter().copied())
+            .collect();
+        let over: Vec<(usize, f32)> = post
+            .iter()
+            .enumerate()
+            .filter(|&(k, x)| {
+                let env = (1.0 - k.saturating_sub(lead) as f32 / fade).max(0.0);
+                x.abs() > 0.32 * env + LEAK_THRESHOLD
+            })
+            .map(|(k, x)| (k, *x))
+            .collect();
+        assert!(post.len() > 10_000, "checked {}", post.len());
+        assert!(
+            over.is_empty(),
+            "{} raw samples past the fade, first {:?}",
+            over.len(),
+            over.first()
+        );
+    }
+
     /// Plan 0001 step 5: a tier change during a call loads the new model while audio still
     /// plays, fades out over 10 ms, restarts and fades in. Measures the silent gap in both
     /// directions (worker model ↔ inline model) and checks there is no click.
     #[test]
     fn switching_models_mid_call_is_short_and_click_free() {
         use crate::pipeline::Placement;
+        let _rt = crate::REALTIME_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         const AUDIBLE: f32 = 0.01;
         let mut sh = Shared::new(Arc::new(Levels::default()), None);
         // 480 Hz at 0.3: a whole number of periods in the loop, < 0.019 per sample.
@@ -1094,7 +1553,7 @@ mod tests {
         let mut c = Control::new(Sim::default(), s, true, Arc::new(sh), tx);
         c.tier_model = |t| match t {
             Tier::Light => Model::RNNoise,
-            Tier::Standard | Tier::Max | Tier::Fast => Model::DeepFilterNet3,
+            Tier::Standard | Tier::Max | Tier::Fast | Tier::Isolate => Model::DeepFilterNet3,
         };
         if !cfg!(feature = "dfn3") {
             // No DeepFilterNet3 in this build: an RNNoise chain stands in, on the worker.

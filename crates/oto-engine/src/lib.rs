@@ -9,6 +9,8 @@
 pub use oto_dsp as dsp;
 
 mod control;
+/// Fault injection for Voice Isolation's fail-closed paths (`oto fault-check`).
+pub mod fault_check;
 pub mod latency;
 pub mod offline;
 /// The realtime path. Public only for the integration tests in `tests/` (allocation counting
@@ -17,8 +19,15 @@ pub mod offline;
 pub mod pipeline;
 mod platform;
 mod state;
+/// "Hear the Difference": record the mic, clean it offline, play raw and cleaned A/B.
+pub mod test_capture;
 
 pub use control::{available_tiers, model_for};
+
+/// Held by tests that pace audio in real time and by CPU-heavy tests, so the latter cannot
+/// starve the former's simulated callbacks when the harness runs them in parallel.
+#[cfg(test)]
+pub(crate) static REALTIME_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 pub use pipeline::{Probe, Stimulus};
 
 use std::path::PathBuf;
@@ -53,6 +62,10 @@ pub enum Tier {
     /// FastEnhancer-S: the lowest delay of the neural models. Evaluation only (weights
     /// licence unstated upstream).
     Fast,
+    /// Voice Isolation (Nearfield v2.3 `fast`): removes background voices as well as noise.
+    /// Opt-in, and fails closed: when it cannot run correctly Oto Microphone is silent, never
+    /// the raw mic and never another model ([`Event::Degraded`]).
+    Isolate,
 }
 
 /// Requests from the UI or CLI to the engine.
@@ -89,6 +102,14 @@ pub enum Event {
         effective: dsp::Model,
         reason: String,
     },
+    /// Voice Isolation cannot run correctly, so Oto Microphone is silent rather than passing
+    /// the raw mic or switching models: the model failed to load (until the tier changes), or
+    /// its worker fell behind (until it catches up). Cleared by [`Event::DegradedCleared`],
+    /// not by [`Event::Recovered`] (which is about [`Event::Error`]s only).
+    Degraded(String),
+    /// The last [`Event::Degraded`] no longer applies: the worker caught up, or a mode other
+    /// than the one that failed to load was picked. UIs clear their degraded banner on it.
+    DegradedCleared,
 }
 
 impl Strength {
@@ -351,6 +372,8 @@ pub struct Stats {
     pub starvations: u64,
     /// Times the DSP worker fell a whole ring (≈340 ms) behind and its backlog was dropped.
     pub worker_overflows: u64,
+    /// Voice Isolation's worker is starved or restarting right now, so the output is silence.
+    pub degraded: bool,
     /// Mic-to-sink latency estimated from device-reported latencies, buffers and ring target.
     /// Includes the running model's delay and the worker reserve.
     pub estimated_latency_ms: f32,
@@ -426,6 +449,7 @@ impl Stats {
             overflows: s.overflows.load(Relaxed),
             starvations: s.starvations.load(Relaxed),
             worker_overflows: s.worker_overflows.load(Relaxed),
+            degraded: s.degraded.load(Relaxed),
             estimated_latency_ms: s.estimate_us.load(Relaxed) as f32 / 1000.0,
             worker_reserve_ms: ms(s.reserve_frames.load(Relaxed)),
             worker_realtime: s.worker_realtime.load(Relaxed),

@@ -50,6 +50,29 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 - License: Apache-2.0 (the model card's licence; the code repository is Apache-2.0 too). The
   licence text is in `LICENSE-APACHE`; upstream gives no copyright line beyond the publisher, Ceva.
 
+## Nearfield (Nearfield v2.3 `fast` model weights)
+
+- Source: https://github.com/Ground-State-Foundry/nearfield, tag `v2.3.0`
+  (`src/nearfield/nearfield-v2.3.onnx`, SHA-256
+  `d3634c3c12fc9c320f10d1665cf50910565852222d2e2c601e3acf9c04250d7c`). Oto's streaming
+  front end (`crates/oto-dsp/src/nearfield.rs`) is a port of the algorithm in that tag's
+  `src/nearfield/core.py`.
+- Used: the model weights, embedded unmodified. Present only in builds with the `nearfield`
+  feature: on for local builds, left out of releases until Voice Isolation passes its Phase 2
+  gates and its training-data provenance is cleared (`MODELS.toml`).
+- License: Apache-2.0 (code and weights). The licence text is in `LICENSE-APACHE`. Upstream's
+  `NOTICE` file, reproduced verbatim as section 4(d) of the licence requires:
+
+```text
+Nearfield
+Copyright 2026 Ground State Foundry
+
+Nearfield v2 (this version) contains no third-party model. The model and its weights are by Ground State Foundry.
+
+Nearfield v1 (tags v1.0.0 and v1.1.0) includes the DeepFilterNet3 model weights and architecture by Hendrik Schröter
+(https://github.com/Rikorose/DeepFilterNet), licensed under MIT OR Apache-2.0; see the NOTICE file at those tags.
+```
+
 ## FastEnhancer (FastEnhancer-S 48 kHz model weights)
 
 - Source: https://github.com/aask1357/fastenhancer, release `onnx-48khz-v1`
@@ -89,8 +112,8 @@ SOFTWARE.
 
 - Source: https://github.com/microsoft/onnxruntime, statically linked from pyke's prebuilt
   binaries via `ort` 2.0.0-rc.15 (https://github.com/pykeio/ort, MIT OR Apache-2.0).
-- Used: inference for DPDFNet-2 and FastEnhancer-S. Present only in builds with the `onnx`
-  feature.
+- Used: inference for DPDFNet-2, Nearfield and FastEnhancer-S. Present only in builds with the
+  `onnx` feature.
 - License: MIT.
 
 ```text

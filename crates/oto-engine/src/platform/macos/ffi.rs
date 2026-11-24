@@ -25,6 +25,7 @@ pub const kAudioObjectPropertyName: u32 = fourcc(b"lnam");
 pub const kAudioObjectPropertyManufacturer: u32 = fourcc(b"lmak");
 pub const kAudioHardwarePropertyDevices: u32 = fourcc(b"dev#");
 pub const kAudioHardwarePropertyDefaultInputDevice: u32 = fourcc(b"dIn ");
+pub const kAudioHardwarePropertyDefaultOutputDevice: u32 = fourcc(b"dOut");
 pub const kAudioHardwarePropertyTranslateUIDToDevice: u32 = fourcc(b"uidd");
 pub const kAudioHardwarePropertyRunLoop: u32 = fourcc(b"rnlp");
 pub const kAudioDevicePropertyDeviceUID: u32 = fourcc(b"uid ");
@@ -45,6 +46,8 @@ pub const kAudioDevicePropertyIOThreadOSWorkgroup: u32 = fourcc(b"oswg");
 
 pub const kAudioDeviceTransportTypeBuiltIn: u32 = fourcc(b"bltn");
 pub const kAudioDeviceTransportTypeAggregate: u32 = fourcc(b"grup");
+pub const kAudioDeviceTransportTypeBluetooth: u32 = fourcc(b"blue");
+pub const kAudioDeviceTransportTypeBluetoothLE: u32 = fourcc(b"blea");
 
 pub const kAudioFormatLinearPCM: u32 = fourcc(b"lpcm");
 pub const kAudioFormatFlagIsFloat: u32 = 1 << 0;

@@ -116,8 +116,9 @@ min_bench_realtime_factor = 4.0
 max_bench_p999_us = 7000.0
 
 [models.nearfield_v2_3_fast]
-# Phase 2 candidate. 48 ms model + 8 ms adapter + ~2–3 ms resamplers.
-chain_latency_ms = 59.0
+# Phase 2 candidate. Measured chain (oto-dsp): 384 adapter + 1920 STFT/lookahead + 94 resamplers
+# = 2398 samples = 49.96 ms (the plan's 59 ms estimate counted upstream's full 32 ms window).
+chain_latency_ms = 50.0
 max_macos_e2e_latency_ms = 82.0        # provisional; ~87–90 ms behind the Phase 3 10 ms clock + 6 ms FIFO
 max_linux_e2e_latency_ms = 81.0        # provisional; ~83–89 ms behind the 10 ms clock
 max_macos_e2e_latency_ms_phase3 = 90.0
@@ -147,6 +148,9 @@ max_leaked_samples = 0
 max_leaked_frames = 0
 # A load failure must raise Event::Degraded and stay muted, never fall back to RNNoise.
 max_fallback_to_other_model = 0
+# Cases that only count when the real model ran (`isolator` in the report), not the
+# perfect-isolator stand-in the plumbing cases use.
+real_model_cases = ["inference_error"]
 
 [voice_isolation.opt_in]
 # Healthy inference, to ship Voice Isolation as an opt-in mode. Same-ASR head-to-head on the

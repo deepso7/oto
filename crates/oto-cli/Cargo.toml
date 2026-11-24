@@ -6,13 +6,16 @@ license.workspace = true
 publish.workspace = true
 
 [features]
-default = ["dfn3", "onnx", "fastenhancer"]
+default = ["dfn3", "onnx", "fastenhancer", "nearfield"]
 # DeepFilterNet3 as the default model. `--no-default-features` builds an RNNoise-only CLI.
 dfn3 = ["oto-engine/dfn3"]
 # DPDFNet-2 through ONNX Runtime, as the Max tier.
 onnx = ["oto-engine/onnx"]
 # FastEnhancer-S as the Fast tier. Evaluation only; release builds leave it out.
 fastenhancer = ["onnx", "oto-engine/fastenhancer"]
+# Nearfield v2.3 `fast` as the Isolate tier (Voice Isolation). Not cleared to ship yet; release
+# builds leave it out.
+nearfield = ["onnx", "oto-engine/nearfield"]
 
 [dependencies]
 lexopt = "0.3"

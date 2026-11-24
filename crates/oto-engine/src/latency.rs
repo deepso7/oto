@@ -225,6 +225,7 @@ pub fn measure_with_stimulus(
         for e in engine.try_events() {
             match e {
                 Event::Error(e) => errors.push(e),
+                Event::Degraded(e) => errors.push(format!("degraded: {e}")),
                 Event::ModelFallback {
                     requested,
                     effective,

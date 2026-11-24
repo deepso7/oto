@@ -6,7 +6,7 @@ license.workspace = true
 publish.workspace = true
 
 [features]
-default = ["dfn3", "onnx", "fastenhancer"]
+default = ["dfn3", "onnx", "fastenhancer", "nearfield"]
 # DeepFilterNet3 via upstream libDF + tract, the default model. Without it the build is
 # RNNoise-only and has no tract.
 dfn3 = ["dep:deep_filter", "dep:ndarray", "dep:tract-core", "dep:tract-onnx", "dep:tract-pulse", "dep:tract-hir"]
@@ -16,6 +16,9 @@ onnx = ["dep:ort", "dep:realfft"]
 # FastEnhancer-S on top of `onnx`. Its weights licence is unstated upstream, so release builds
 # (scripts/macos/release.sh) leave this out; it is for local evaluation.
 fastenhancer = ["onnx"]
+# Nearfield v2.3 `fast` (Voice Isolation) on top of `onnx`. A Phase 2 candidate whose weights
+# are not cleared to ship yet (MODELS.toml), so release builds leave this out like `fastenhancer`.
+nearfield = ["onnx"]
 
 [dependencies]
 nnnoiseless = { version = "0.5.2", default-features = false }

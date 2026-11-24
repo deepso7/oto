@@ -340,9 +340,18 @@ class GateTests(unittest.TestCase):
 
     def test_fault_report(self):
         fi = self.gates["voice_isolation"]["fault_injection"]
-        cases = [{"case": c, "strength": s, "leaked_samples": 0, "leaked_frames": 0, "fallback_to_other_model": 0} for c in fi["cases"] for s in fi["strengths"]]
+        cases = [{"case": c, "strength": s, "leaked_samples": 0, "leaked_frames": 0, "fallback_to_other_model": 0, "checked_samples": 4800, "isolator": "nearfield" if c == "inference_error" else "silencer"} for c in fi["cases"] for s in fi["strengths"]]
         ok = harness.evaluate_fault_report({"cases": cases}, self.gates)
-        self.assertTrue(all(c["status"] == "pass" for c in ok["checks"]))
+        self.assertTrue(all(c["status"] == "pass" for c in ok["checks"]), ok["checks"])
+        # inference_error must run the real "nearfield" model (rejecting silencer, mock, empty, bool) and check >0 samples.
+        for bad_iso in ("silencer", "mock", "", False, None):
+            mock = [dict(c, isolator=bad_iso) if c["case"] == "inference_error" else c for c in cases]
+            failed = {c["gate"] for c in harness.evaluate_fault_report({"cases": mock}, self.gates)["checks"] if c["status"] == "fail"}
+            self.assertEqual(failed, {f"inference_error/{s}/real_model" for s in fi["strengths"]}, bad_iso)
+        for bad_checked in (0, 0.5, float("inf"), True, None):
+            zero_checked = [dict(c, checked_samples=bad_checked) if c["case"] == "startup" else c for c in cases]
+            failed_zero = {c["gate"] for c in harness.evaluate_fault_report({"cases": zero_checked}, self.gates)["checks"] if c["status"] == "fail"}
+            self.assertEqual(failed_zero, {f"startup/{s}/checked_samples" for s in fi["strengths"]}, bad_checked)
         cases[0]["leaked_samples"] = 3
         bad = harness.evaluate_fault_report({"cases": cases[:-1]}, self.gates)
         failed = {c["gate"] for c in bad["checks"] if c["status"] == "fail"}
@@ -366,7 +375,7 @@ class ModelsManifestTests(unittest.TestCase):
         rows = harness.verify_hashes(self.models, REPO)
         for r in rows:
             self.assertTrue(r["ok"], r)
-        self.assertEqual({r["model"] for r in rows if r["status"] == "ok"}, {"dpdfnet2_48khz_hr", "fastenhancer_s_48khz"})
+        self.assertEqual({r["model"] for r in rows if r["status"] == "ok"}, {"dpdfnet2_48khz_hr", "fastenhancer_s_48khz", "nearfield_v2_3_fast"})
 
     def test_hash_mismatch_and_missing_file_fail(self):
         with tempfile.TemporaryDirectory() as d:
@@ -390,7 +399,7 @@ class ModelsManifestTests(unittest.TestCase):
         self.assertEqual((fe["ship_in_release"], fe["status"], fe["license_weights"]), (False, "evaluation-only", "unstated"))
         nf = m["nearfield_v2_3_fast"]
         self.assertEqual((nf["ship_in_release"], nf["status"], nf["tag"], nf["frame_samples"], nf["model_sample_rate"]), (False, "candidate-pending-phase2-gates", "v2.3.0", 384, 16000))
-        self.assertEqual(nf["latency_samples"], 48 * 48)
+        self.assertEqual((nf["latency_samples"], nf["cli_model"], nf["cli_tier"], nf["cargo_feature"]), (2014, "nearfield", "isolate", "nearfield"))
         self.assertTrue(nf["notice_required"])
         for key, spec in m.items():
             if spec["ship_in_release"]:
@@ -617,8 +626,9 @@ class BenchParseTests(unittest.TestCase):
         spec = harness.load_models(REPO / "MODELS.toml")["dpdfnet2_48khz_hr"]
         self.assertEqual(harness.bench_command("oto", spec, 5, False)[1:4], ["bench", "--model", "dpdfnet"])
         self.assertEqual(harness.bench_command("oto", spec, 5, True)[1:5], ["bench", "--live", "--tier", "max"])
-        with self.assertRaises(ValueError):
-            harness.bench_command("oto", harness.load_models(REPO / "MODELS.toml")["nearfield_v2_3_fast"], 5, True)
+        self.assertEqual(harness.bench_command("oto", harness.load_models(REPO / "MODELS.toml")["nearfield_v2_3_fast"], 5, True)[1:5], ["bench", "--live", "--tier", "isolate"])
+        with self.assertRaises(ValueError):  # a model with no live tier cannot be benched live
+            harness.bench_command("oto", harness.ModelSpec("x", "x", None, 480, 480), 5, True)
 
     def test_rejects_garbage(self):
         with self.assertRaises(ValueError):
