@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.3](https://github.com/deepso7/oto/compare/v0.0.2...v0.0.3) - 2026-11-24
+
+### Added
+
+- add fail-closed Voice Isolation (Nearfield v2.3) and Hear the Difference ([#10](https://github.com/deepso7/oto/pull/10))
+- add offline WAV processing, speech-onset latency, and eval harness ([#8](https://github.com/deepso7/oto/pull/8))
+
 ## [0.0.2](https://github.com/deepso7/oto/compare/v0.0.1...v0.0.2) - 2026-11-11
 
 ### Added
