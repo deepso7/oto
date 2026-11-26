@@ -9,44 +9,50 @@ use rune::AppHandle;
 
 use crate::state::State;
 
-/// The status item's glyph: five rounded level bars, a template image so macOS tints it for
-/// the menu bar. Off draws the bars faint. `px` square, straight RGBA.
-pub fn glyph(px: u32, on: bool) -> Vec<u8> {
-    let heights = [0.30, 0.62, 0.92, 0.62, 0.30];
-    let s = px as f32 / 22.0; // pixels per point; the menu bar draws the image 22 pt tall
-    let (bar_w, gap) = (2.4 * s, 1.6 * s);
-    let total = heights.len() as f32 * bar_w + (heights.len() - 1) as f32 * gap;
-    let left = (px as f32 - total) / 2.0;
-    let alpha = if on { 1.0 } else { 0.4 };
-    let max_h = 15.0 * s;
-    let mid = px as f32 / 2.0;
-    let mut rgba = vec![0u8; (px * px * 4) as usize];
+/// The status item's glyph, in points: the menu bar draws images 22 pt tall.
+pub const GLYPH_PT: (u32, u32) = (26, 22);
+
+/// The status item's glyph: the Oto mark (packaging/brand), simplified for the menu bar. Two
+/// faint, uneven noise bars go into the o and two even voice bars come out. A template image,
+/// so macOS tints it; off draws it all faint. `scale` pixels per point, straight RGBA, returned
+/// with its pixel width and height.
+pub fn glyph(scale: u32, on: bool) -> (u32, u32, Vec<u8>) {
+    let (w, h) = (GLYPH_PT.0 * scale, GLYPH_PT.1 * scale);
+    let s = scale as f32;
+    let (cx, mid) = (w as f32 / 2.0, h as f32 / 2.0);
+    let r = s; // bar half-width: 2 pt bars
+    // Bars as (centre offset from the o, half-height, opacity), in points.
+    let bars = [
+        (-10.75, 3.0, 0.45),
+        (-7.25, 6.5, 0.45),
+        (7.25, 6.0, 1.0),
+        (10.75, 3.0, 1.0),
+    ];
+    let (ring_r, ring_half_w) = (3.25 * s, 1.0 * s);
+    let dim = if on { 1.0 } else { 0.4 };
+    let mut rgba = vec![0u8; (w * h * 4) as usize];
     const SS: usize = 4;
-    for y in 0..px {
-        for x in 0..px {
-            let mut cover = 0usize;
+    for y in 0..h {
+        for x in 0..w {
+            let mut cover = 0.0f32;
             for sy in 0..SS {
                 for sx in 0..SS {
                     let fx = x as f32 + (sx as f32 + 0.5) / SS as f32;
                     let fy = y as f32 + (sy as f32 + 0.5) / SS as f32;
-                    let inside = heights.iter().enumerate().any(|(i, h)| {
-                        let x0 = left + i as f32 * (bar_w + gap);
-                        let half = (h * max_h / 2.0).max(bar_w / 2.0);
-                        let r = bar_w / 2.0;
-                        let cx = x0 + r;
-                        // A vertical capsule centred on the middle line.
-                        let dy = ((fy - mid).abs() - (half - r)).max(0.0);
-                        let dx = fx - cx;
-                        dx * dx + dy * dy <= r * r
+                    let ring = ((fx - cx).hypot(fy - mid) - ring_r).abs() <= ring_half_w;
+                    // Bars are vertical capsules centred on the middle line.
+                    let bar = bars.iter().find(|(off, half, _)| {
+                        let dy = ((fy - mid).abs() - (half * s - r)).max(0.0);
+                        (fx - (cx + off * s)).hypot(dy) <= r
                     });
-                    cover += inside as usize;
+                    cover += if ring { 1.0 } else { bar.map_or(0.0, |b| b.2) };
                 }
             }
-            let a = cover as f32 / (SS * SS) as f32 * alpha;
-            rgba[((y * px + x) * 4 + 3) as usize] = (a * 255.0).round() as u8;
+            let a = cover / (SS * SS) as f32 * dim;
+            rgba[((y * w + x) * 4 + 3) as usize] = (a * 255.0).round() as u8;
         }
     }
-    rgba
+    (w, h, rgba)
 }
 
 /// A press on the status item right after the popover hid for losing focus is the same click
@@ -159,7 +165,8 @@ mod mac {
     }
 
     fn icon(on: bool) -> Icon {
-        Icon::from_rgba(super::glyph(44, on), 44, 44).expect("glyph size matches")
+        let (w, h, rgba) = super::glyph(2, on);
+        Icon::from_rgba(rgba, w, h).expect("glyph size matches")
     }
 
     impl Tray {
@@ -270,20 +277,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn glyph_is_centred_and_dims_when_off() {
-        let on = glyph(44, true);
-        let off = glyph(44, false);
-        assert_eq!(on.len(), 44 * 44 * 4);
-        let alpha = |v: &[u8], x: usize, y: usize| v[(y * 44 + x) * 4 + 3];
-        // The middle bar is solid through the centre; corners are empty.
-        assert_eq!(alpha(&on, 22, 22), 255);
+    fn glyph_is_the_mark_and_dims_when_off() {
+        let (w, h, on) = glyph(2, true);
+        let (_, _, off) = glyph(2, false);
+        assert_eq!((w, h), (52, 44));
+        assert_eq!(on.len(), (w * h * 4) as usize);
+        let alpha = |v: &[u8], x: u32, y: u32| v[((y * w + x) * 4 + 3) as usize];
+        // The o is centred, solid on its rim and empty in the middle; the corners are empty.
+        assert_eq!(alpha(&on, 26, 22), 0);
+        assert_eq!(alpha(&on, 26 + 6, 22), 255);
         assert_eq!(alpha(&on, 0, 0), 0);
-        assert!(alpha(&off, 22, 22) < 128);
-        // Symmetric left to right.
-        for y in 0..44 {
-            for x in 0..22 {
-                assert_eq!(alpha(&on, x, y), alpha(&on, 43 - x, y), "({x}, {y})");
-            }
+        // Voice bars (right) are solid, noise bars (left) faint, about the o.
+        let (voice, noise) = (alpha(&on, 26 + 14, 22), alpha(&on, 26 - 14, 22));
+        assert_eq!(voice, 255);
+        assert!((100..140).contains(&noise), "{noise}");
+        // Off dims everything.
+        assert!(alpha(&off, 26 + 6, 22) < 128);
+        // The glyph stays within the canvas, with no clipped ink at the edges.
+        for y in 0..h {
+            assert_eq!(alpha(&on, 0, y), 0);
+            assert_eq!(alpha(&on, w - 1, y), 0);
         }
     }
 

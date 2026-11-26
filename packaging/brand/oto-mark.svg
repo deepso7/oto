@@ -1,0 +1,8 @@
+<!-- Oto mark without the tile, for docs and the web. Uses currentColor. -->
+<svg xmlns="http://www.w3.org/2000/svg" width="111" height="48" viewBox="216 384 592 256">
+  <g stroke="currentColor" stroke-width="30" stroke-linecap="round" fill="none">
+    <path d="M236 476V548M278 428V596M320 488V536M362 404V620" stroke-opacity=".4"/>
+    <circle cx="512" cy="512" r="78" stroke-width="42"/>
+    <path d="M662 458V566M704 416V608M746 458V566M788 494V530"/>
+  </g>
+</svg>

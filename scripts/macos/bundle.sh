@@ -113,7 +113,7 @@ rm -rf "$OUT/Oto.app"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$APP_BIN" "$APP/Contents/MacOS/oto-app"
 sed "s/@VERSION@/$VERSION/g" "$PKG/Info.plist.in" > "$APP/Contents/Info.plist"
-# The app icon is optional until there is artwork: packaging/macos/AppIcon.icns, if present.
+# The app icon: packaging/macos/AppIcon.icns, built by scripts/macos/make-icon.sh.
 if [ -f "$PKG/AppIcon.icns" ]; then
     cp "$PKG/AppIcon.icns" "$APP/Contents/Resources/AppIcon.icns"
     plutil -insert CFBundleIconFile -string AppIcon "$APP/Contents/Info.plist"
