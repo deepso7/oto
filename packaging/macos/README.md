@@ -5,6 +5,7 @@
 ```
 Oto.app/Contents/
   Info.plist                      from Info.plist.in (version from the workspace Cargo.toml)
+  Resources/AppIcon.icns          from packaging/macos/AppIcon.icns
   MacOS/oto-app                   release build of crates/oto-app
   Resources/OtoMicrophone.driver  the prebuilt, signed HAL driver the app installs
   Resources/LICENSE-MIT, LICENSE-APACHE, THIRD_PARTY_NOTICES.md
@@ -175,7 +176,12 @@ gh run watch
 or Actions → *macOS release* → Run workflow, with the tag. It replaces the release's DMG and
 `.sha256` if they are already attached.
 
+## App icon
+
+The artwork is SVG in `packaging/brand`: `oto-icon.svg` (the app icon), `oto-icon-small.svg`
+(a heavier version for 16 and 32 px) and `oto-mark.svg` (the mark alone, in `currentColor`).
+After changing them, rebuild the committed `AppIcon.icns` with `scripts/macos/make-icon.sh`.
+
 ## Still to do
 
-- An app icon: put artwork at `packaging/macos/AppIcon.icns` and `bundle.sh` picks it up.
 - A Homebrew cask, and an updater.
