@@ -77,8 +77,9 @@ pub fn show_window(s: &mut State, h: &AppHandle<State>) {
     h.open();
 }
 
-/// How far below its display's top edge a status item can sit and still be in the menu bar
-/// (which is 24 to 40 pt tall). A new item's window sits elsewhere until it's given a place.
+/// How far below its display's top edge a status item's bottom can sit and still be in the
+/// menu bar (which is 24 to 40 pt tall). A new item's window sits elsewhere until it's given a
+/// place.
 const MENU_BAR_MAX: f64 = 64.0;
 /// The gap under the menu bar, and the margin kept to the display's side edges.
 const GAP: f64 = 6.0;
@@ -86,11 +87,12 @@ const MARGIN: f64 = 8.0;
 
 /// Where a popover of `size` goes under a status item: its top-left in points from the primary
 /// display's top-left, y down (negative on displays left of or above the primary). Centred on
-/// the item, [`GAP`] below it, kept [`MARGIN`] inside the side edges of the item's display.
+/// the item, [`GAP`] below the item (and below the display's menu bar, when taller than the
+/// button), kept [`MARGIN`] inside the side edges of the item's display.
 ///
 /// Inputs are AppKit rects, `[x, y, width, height]` with y up from the primary display's
-/// bottom-left: the status item's window, and its display's frame and visible frame when
-/// known. `None` when the item isn't in a menu bar yet.
+/// bottom-left: the status item's button (or window), and its display's frame and visible
+/// frame when known. `None` when the item isn't in a menu bar yet.
 #[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
 pub fn popover_origin(
     primary_height: f64,
@@ -100,21 +102,30 @@ pub fn popover_origin(
 ) -> Option<(f32, f32)> {
     let top_down = |r: [f64; 4]| primary_height - r[1] - r[3];
     let item_top = top_down(item);
+    let item_bottom = item_top + item[3];
     // Measured from the top of the item's own display: other displays' tops needn't be level
-    // with the primary's.
+    // with the primary's. Checking the bottom tolerates status item windows on macOS 26/27
+    // whose frame extends a few points above the display's top edge.
     let display_top = display.map_or(0.0, |(frame, _)| top_down(frame));
-    let below = item_top - display_top;
-    if item[2] <= 0.0 || !(-1.0..=MENU_BAR_MAX).contains(&below) {
+    let bottom_below = item_bottom - display_top;
+    if item[2] <= 0.0 || item[3] <= 0.0 || bottom_below <= 0.0 || bottom_below > MENU_BAR_MAX {
         return None;
     }
     let width = f64::from(size.0);
     let mut x = item[0] + item[2] / 2.0 - width / 2.0;
+    let mut bar_bottom = item_bottom;
     if let Some((_, visible)) = display {
         x = x
             .min(visible[0] + visible[2] - width - MARGIN)
             .max(visible[0] + MARGIN);
+        // The button (22 pt) sits inside a taller menu bar (30 pt on macOS 27, 37 pt on
+        // notched displays): keep the gap below the menu bar itself, not just the button.
+        let visible_top = top_down(visible);
+        if visible_top - display_top <= MENU_BAR_MAX {
+            bar_bottom = bar_bottom.max(visible_top);
+        }
     }
-    Some((x as f32, (item_top + item[3] + GAP) as f32))
+    Some((x as f32, (bar_bottom + GAP) as f32))
 }
 
 pub fn toggle_window(s: &mut State, h: &AppHandle<State>) {
@@ -214,14 +225,19 @@ mod mac {
         /// Where a `size` window goes under the status item; see [`super::popover_origin`].
         pub fn popover_origin(&self, size: (f32, f32)) -> Option<(f32, f32)> {
             let mtm = MainThreadMarker::new()?;
-            let window = self.icon.ns_status_item()?.button(mtm)?.window()?;
+            let button = self.icon.ns_status_item()?.button(mtm)?;
+            let window = button.window()?;
             let primary = NSScreen::screens(mtm).firstObject()?.frame().size.height;
             let rect =
                 |r: objc2_foundation::NSRect| [r.origin.x, r.origin.y, r.size.width, r.size.height];
+            // Use the button's screen rect rather than `window.frame()`: on macOS 26/27
+            // `NSStatusBarWindow` extends above and below the menu bar.
+            let button_rect =
+                window.convertRectToScreen(button.convertRect_toView(button.bounds(), None));
             let display = window
                 .screen()
                 .map(|s| (rect(s.frame()), rect(s.visibleFrame())));
-            super::popover_origin(primary, rect(window.frame()), display, size)
+            super::popover_origin(primary, rect(button_rect), display, size)
         }
     }
 }
@@ -347,6 +363,32 @@ mod tests {
     }
 
     #[test]
+    fn popover_sits_under_taller_macos27_menu_bar_and_overhanging_window() {
+        // 2560x1440 with a 30 pt menu bar and 67 pt bottom dock.
+        let frame = [0.0, 0.0, 2560.0, 1440.0];
+        let visible = [0.0, 67.0, 2560.0, 1343.0];
+        // The 22 pt status bar button sits inside the 30 pt menu bar: the popover keeps GAP
+        // below the menu bar itself (30 + 6 = 36), not just below the button (25 + 6 = 31).
+        let button = [2095.0, 1415.0, 46.0, 22.0];
+        assert_eq!(
+            popover_origin(frame[3], button, Some((frame, visible)), SIZE),
+            Some((2095.0 + 23.0 - 170.0, 36.0))
+        );
+        // Even if given an NSStatusBarWindow whose top extends above the display (1406 + 39 =
+        // 1445 > 1440), the item is still recognized as in the menu bar.
+        let overhanging_win = [2095.0, 1406.0, 46.0, 39.0];
+        assert_eq!(
+            popover_origin(frame[3], overhanging_win, Some((frame, visible)), SIZE),
+            Some((2095.0 + 23.0 - 170.0, 40.0))
+        );
+        // Auto-hidden menu bar: visibleFrame covers the full height, so y follows the button.
+        assert_eq!(
+            popover_origin(frame[3], button, Some((frame, frame)), SIZE),
+            Some((2095.0 + 23.0 - 170.0, 31.0))
+        );
+    }
+
+    #[test]
     fn an_item_without_a_place_gives_no_position() {
         // Zero-sized, or parked away from its display's menu bar.
         let display = Some((PRIMARY, visible(PRIMARY)));
@@ -355,7 +397,15 @@ mod tests {
             None
         );
         assert_eq!(
+            popover_origin(982.0, [10.0, 958.0, 30.0, 0.0], display, SIZE),
+            None
+        );
+        assert_eq!(
             popover_origin(982.0, [10.0, 0.0, 30.0, 24.0], display, SIZE),
+            None
+        );
+        assert_eq!(
+            popover_origin(982.0, [10.0, 1000.0, 30.0, 24.0], display, SIZE),
             None
         );
         // No display known: judged against the primary's top, and not clamped.

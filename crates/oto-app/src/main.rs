@@ -491,6 +491,16 @@ fn on_focus(s: &mut State, focused: bool, tx: &mut Tx) {
     }
 }
 
+/// Reopening Oto while it already runs in the menu bar (Spotlight, Finder, Applications,
+/// `open`) shows the popover under the status item.
+fn on_reopen(s: &mut State, _has_visible_windows: bool, _tx: &mut Tx) -> bool {
+    let Some(h) = HANDLE.get() else {
+        return false;
+    };
+    tray::show_window(s, h);
+    true
+}
+
 #[cfg(target_os = "macos")]
 fn window_options() -> rune::ConfiguredWindowOptions {
     rune::WindowOptions {
@@ -518,6 +528,7 @@ fn main() {
         .windowless()
         .fit_content_height()
         .on_focus(on_focus)
+        .on_reopen(on_reopen)
         .on_quit(|s, _| s.shutdown());
     #[cfg(target_os = "macos")]
     {
