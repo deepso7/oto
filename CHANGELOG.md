@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.4](https://github.com/deepso7/oto/compare/v0.0.3...v0.0.4) - 2026-11-26
+
+### Added
+
+- add the Oto logo as the app icon and menu-bar glyph ([#13](https://github.com/deepso7/oto/pull/13))
+
+### Fixed
+
+- anchor macOS tray popover under menu bar and show on reopen ([#11](https://github.com/deepso7/oto/pull/11))
+
 ## [0.0.3](https://github.com/deepso7/oto/compare/v0.0.2...v0.0.3) - 2026-11-24
 
 ### Added
