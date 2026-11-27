@@ -17,6 +17,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use sha2::{Digest as _, Sha256};
 use zip::{CompressionMethod, ZipArchive};
@@ -26,6 +27,12 @@ use crate::{hex, is_sha256_hex};
 
 /// The single top-level directory an update archive holds.
 pub const APP_DIR: &str = "Oto.app";
+/// Error returned by cancellable archive operations when the caller's cancel flag is set.
+pub const CANCELLED: &str = "cancelled";
+
+fn is_cancelled(cancel: Option<&AtomicBool>) -> bool {
+    cancel.is_some_and(|c| c.load(Ordering::Acquire))
+}
 
 const S_IFMT: u32 = 0o170_000;
 const S_IFREG: u32 = 0o100_000;
@@ -63,16 +70,23 @@ struct Planned {
 /// Streams `path` through SHA-256. Returns the lowercase hex digest and the byte count.
 pub fn sha256_file(path: &Path) -> Result<(String, u64), String> {
     let mut f = File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    sha256_reader(&mut f, u64::MAX).map_err(|e| format!("{}: {e}", path.display()))
+    sha256_reader(&mut f, u64::MAX, None).map_err(|e| format!("{}: {e}", path.display()))
 }
 
-/// Hashes at most `cap + 1` bytes of `r`.
-fn sha256_reader(r: &mut impl Read, cap: u64) -> io::Result<(String, u64)> {
+/// Hashes at most `cap + 1` bytes of `r`, stopping early if `cancel` is set.
+fn sha256_reader(
+    r: &mut impl Read,
+    cap: u64,
+    cancel: Option<&AtomicBool>,
+) -> io::Result<(String, u64)> {
     let mut hasher = Sha256::new();
     let mut buf = vec![0u8; 64 * 1024];
     let mut total = 0u64;
     let mut r = r.take(cap.saturating_add(1));
     loop {
+        if is_cancelled(cancel) {
+            return Err(io::Error::new(io::ErrorKind::Interrupted, CANCELLED));
+        }
         let n = match r.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => n,
@@ -92,7 +106,11 @@ fn open_verified_archive(
     zip_path: &Path,
     expected_sha256: &str,
     expected_size: u64,
+    cancel: Option<&AtomicBool>,
 ) -> Result<File, String> {
+    if is_cancelled(cancel) {
+        return Err(CANCELLED.into());
+    }
     let expected_sha256 = expected_sha256.to_ascii_lowercase();
     if !is_sha256_hex(&expected_sha256) {
         return Err(format!(
@@ -117,8 +135,13 @@ fn open_verified_archive(
             meta.len()
         ));
     }
-    let (digest, read) =
-        sha256_reader(&mut file, expected_size).map_err(|e| format!("reading the archive: {e}"))?;
+    let (digest, read) = sha256_reader(&mut file, expected_size, cancel).map_err(|e| {
+        if is_cancelled(cancel) {
+            CANCELLED.to_owned()
+        } else {
+            format!("reading the archive: {e}")
+        }
+    })?;
     if read != expected_size {
         return Err(format!("archive is {read} bytes, expected {expected_size}"));
     }
@@ -149,7 +172,35 @@ pub fn inspect_verified_zip_uncompressed_total(
     expected_sha256: &str,
     expected_size: u64,
 ) -> Result<u64, String> {
-    let file = open_verified_archive(zip_path, expected_sha256, expected_size)?;
+    inspect_verified_zip_uncompressed_total_inner(zip_path, expected_sha256, expected_size, None)
+}
+
+/// Like [`inspect_verified_zip_uncompressed_total`], stopping early with [`CANCELLED`] if `cancel`
+/// is set.
+pub fn inspect_verified_zip_uncompressed_total_cancellable(
+    zip_path: &Path,
+    expected_sha256: &str,
+    expected_size: u64,
+    cancel: &AtomicBool,
+) -> Result<u64, String> {
+    inspect_verified_zip_uncompressed_total_inner(
+        zip_path,
+        expected_sha256,
+        expected_size,
+        Some(cancel),
+    )
+}
+
+fn inspect_verified_zip_uncompressed_total_inner(
+    zip_path: &Path,
+    expected_sha256: &str,
+    expected_size: u64,
+    cancel: Option<&AtomicBool>,
+) -> Result<u64, String> {
+    let file = open_verified_archive(zip_path, expected_sha256, expected_size, cancel)?;
+    if is_cancelled(cancel) {
+        return Err(CANCELLED.into());
+    }
     let mut archive =
         ZipArchive::new(file).map_err(|e| format!("not a readable ZIP archive: {e}"))?;
     let plan = scan(&mut archive, Limits::DEFAULT)?;
@@ -171,6 +222,26 @@ pub fn extract_verified_zip(
         expected_sha256,
         expected_size,
         Limits::DEFAULT,
+        None,
+    )
+}
+
+/// Like [`extract_verified_zip`], stopping early with [`CANCELLED`] if `cancel` is set during
+/// hashing or extraction.
+pub fn extract_verified_zip_cancellable(
+    zip_path: &Path,
+    dest_dir: &Path,
+    expected_sha256: &str,
+    expected_size: u64,
+    cancel: &AtomicBool,
+) -> Result<PathBuf, String> {
+    extract_verified_zip_with(
+        zip_path,
+        dest_dir,
+        expected_sha256,
+        expected_size,
+        Limits::DEFAULT,
+        Some(cancel),
     )
 }
 
@@ -180,13 +251,17 @@ pub(crate) fn extract_verified_zip_with(
     expected_sha256: &str,
     expected_size: u64,
     limits: Limits,
+    cancel: Option<&AtomicBool>,
 ) -> Result<PathBuf, String> {
     check_empty_dir(dest_dir)?;
     // One open file for hashing and extracting, so the bytes checked are the bytes unpacked.
-    let file = open_verified_archive(zip_path, expected_sha256, expected_size)?;
+    let file = open_verified_archive(zip_path, expected_sha256, expected_size, cancel)?;
+    if is_cancelled(cancel) {
+        return Err(CANCELLED.into());
+    }
     let mut archive =
         ZipArchive::new(file).map_err(|e| format!("not a readable ZIP archive: {e}"))?;
-    extract_archive(&mut archive, dest_dir, limits)
+    extract_archive(&mut archive, dest_dir, limits, cancel)
 }
 
 fn check_empty_dir(dir: &Path) -> Result<(), String> {
@@ -390,14 +465,27 @@ fn mkdir(path: &Path) -> io::Result<()> {
 
 /// Copies at most `remaining` bytes from `r` into `w`, counting what is actually read rather
 /// than trusting any header. Fails as soon as `remaining` would be exceeded.
+#[cfg(test)]
 pub(crate) fn copy_capped(
     r: &mut impl Read,
     w: &mut impl Write,
     remaining: u64,
 ) -> Result<u64, String> {
+    copy_capped_cancellable(r, w, remaining, None)
+}
+
+fn copy_capped_cancellable(
+    r: &mut impl Read,
+    w: &mut impl Write,
+    remaining: u64,
+    cancel: Option<&AtomicBool>,
+) -> Result<u64, String> {
     let mut buf = vec![0u8; 64 * 1024];
     let mut written = 0u64;
     loop {
+        if is_cancelled(cancel) {
+            return Err(CANCELLED.into());
+        }
         let n = match r.read(&mut buf) {
             Ok(0) => return Ok(written),
             Ok(n) => n,
@@ -420,10 +508,14 @@ fn extract_archive<R: Read + Seek>(
     archive: &mut ZipArchive<R>,
     dest: &Path,
     limits: Limits,
+    cancel: Option<&AtomicBool>,
 ) -> Result<PathBuf, String> {
     let plan = scan(archive, limits)?;
     let mut total = 0u64;
     for p in &plan {
+        if is_cancelled(cancel) {
+            return Err(CANCELLED.into());
+        }
         let shown = p.components.join("/");
         let mut path = dest.to_path_buf();
         for (i, c) in p.components.iter().enumerate() {
@@ -448,8 +540,14 @@ fn extract_archive<R: Read + Seek>(
                     .by_index(p.index)
                     .map_err(|e| format!("entry '{shown}': {e}"))?;
                 let budget = (limits.extracted_bytes - total).min(p.declared_size);
-                let n = copy_capped(&mut entry, &mut out, budget)
-                    .map_err(|e| format!("entry '{shown}': {e}"))?;
+                let n =
+                    copy_capped_cancellable(&mut entry, &mut out, budget, cancel).map_err(|e| {
+                        if e == CANCELLED {
+                            e
+                        } else {
+                            format!("entry '{shown}': {e}")
+                        }
+                    })?;
                 if n != p.declared_size {
                     return Err(format!(
                         "entry '{shown}' unpacked to {n} bytes, but its header says {}",
@@ -553,7 +651,7 @@ mod tests {
         let dest = t.0.join("out");
         fs::create_dir(&dest).unwrap();
         let (sha, size) = sha256_file(&zip).unwrap();
-        let r = extract_verified_zip_with(&zip, &dest, &sha, size, limits);
+        let r = extract_verified_zip_with(&zip, &dest, &sha, size, limits, None);
         (t, r)
     }
 
@@ -631,6 +729,27 @@ mod tests {
         assert!(err.contains("SHA-256"), "{err}");
         fs::write(&zip, build(&[E::File("x", b"", 0o644)])).unwrap();
         assert!(inspect_zip_uncompressed_total(&zip).is_err());
+    }
+
+    #[test]
+    fn cancellable_inspect_and_extract_stop_when_cancelled() {
+        let t = TempDir::new();
+        let zip = t.0.join("u.zip");
+        fs::write(&zip, build(&app())).unwrap();
+        let (sha, size) = sha256_file(&zip).unwrap();
+        let dest = t.0.join("out");
+        fs::create_dir(&dest).unwrap();
+        let cancel = AtomicBool::new(true);
+        assert_eq!(
+            inspect_verified_zip_uncompressed_total_cancellable(&zip, &sha, size, &cancel)
+                .unwrap_err(),
+            CANCELLED
+        );
+        assert_eq!(
+            extract_verified_zip_cancellable(&zip, &dest, &sha, size, &cancel).unwrap_err(),
+            CANCELLED
+        );
+        assert!(fs::read_dir(&dest).unwrap().next().is_none());
     }
 
     #[test]

@@ -468,6 +468,19 @@ fn update_banner(s: &State, p: &Paint) -> Option<El> {
             vec![("update-action", "Download\u{2026}".into(), start, true)],
             Some(|s| s.dismiss_update()),
         ),
+        UpdateState::Failed(msg) => banner(
+            p,
+            ("update", &p.k.c.danger, false),
+            "Couldn\u{2019}t update Oto.",
+            Some(msg.clone()),
+            vec![(
+                "update-retry",
+                "Try Again".into(),
+                |s| s.check_for_updates(true),
+                true,
+            )],
+            Some(|s| s.dismiss_update()),
+        ),
         _ => return None,
     })
 }
@@ -2169,6 +2182,29 @@ mod tests {
         assert!(rt2.find("error").is_some());
         assert!(rt2.find("restart").is_some());
         assert!(rt2.find("next").is_none());
+    }
+
+    #[test]
+    fn update_failures_show_retry_and_dismiss_on_the_main_page() {
+        static CHECKS: AtomicUsize = AtomicUsize::new(0);
+        let mut s = updatable();
+        s.hooks.check_update = |_| {
+            CHECKS.fetch_add(1, Ordering::Relaxed);
+        };
+        s.update = UpdateState::Failed("Download interrupted.".into());
+        let mut rt = runtime(s);
+        assert!(rt.find("update").is_some());
+        assert!(rt.find("update-detail").is_some());
+        assert!(rt.find("update-retry").is_some());
+        assert!(rt.find("update-dismiss").is_some());
+        click(&mut rt, "update-retry");
+        assert_eq!(CHECKS.load(Ordering::Relaxed), 1);
+
+        rt.update(|s, _| s.update = UpdateState::Failed("Download interrupted.".into()));
+        rt.frame(1.0 / 60.0);
+        click(&mut rt, "update-dismiss");
+        assert_eq!(rt.state.update, UpdateState::Idle);
+        assert!(rt.find("update").is_none());
     }
 
     #[test]

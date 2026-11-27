@@ -162,9 +162,22 @@ fn announce(engine: &Engine, h: &AppHandle<State>, meter: &Meter, restarted: boo
     });
 }
 
+/// Commits an update candidate and clears its one-time token from `opts` so any future engine
+/// restart in this process starts as a normal instance rather than retrying a deleted transaction.
+fn commit_candidate_opts(
+    opts: &mut EngineOptions,
+    commit: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
+    let r = commit();
+    if r.is_ok() {
+        opts.update_candidate = None;
+    }
+    r
+}
+
 fn run(
     mut settings: Settings,
-    opts: EngineOptions,
+    mut opts: EngineOptions,
     requests: Receiver<Request>,
     h: AppHandle<State>,
     meter: Meter,
@@ -216,7 +229,7 @@ fn run(
                 }
             }
             Ok(Request::CommitCandidate(ack)) => {
-                let r = engine.commit_candidate();
+                let r = commit_candidate_opts(&mut opts, || engine.commit_candidate());
                 if let Err(e) = &r {
                     let e = e.clone();
                     h.update(move |s, _| s.on_event(Event::Error(e)));
@@ -276,6 +289,23 @@ mod tests {
     use super::*;
     use std::cell::Cell;
     use std::sync::mpsc::sync_channel;
+
+    #[test]
+    fn committing_a_candidate_clears_its_token_for_future_restarts() {
+        let token = oto_engine::update_state::CandidateToken::new(
+            oto_engine::update_state::Nonce::parse("cand1").unwrap(),
+        );
+        let mut opts = EngineOptions {
+            update_candidate: Some(token.clone()),
+            ..EngineOptions::default()
+        };
+        // A failed commit keeps the token untouched.
+        assert!(commit_candidate_opts(&mut opts, || Err("still waiting".into())).is_err());
+        assert_eq!(opts.update_candidate, Some(token));
+        // A successful commit clears it so later restarts start as a normal engine.
+        assert!(commit_candidate_opts(&mut opts, || Ok(())).is_ok());
+        assert_eq!(opts.update_candidate, None);
+    }
 
     /// A fake engine: `restore` is what its teardown returns; `id` tells instances apart.
     struct Fake {

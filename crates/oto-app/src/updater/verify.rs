@@ -504,18 +504,44 @@ pub fn download_and_verify_in(
         cancel,
         on_progress,
     )?;
-    let total = oto_sign::inspect_verified_zip_uncompressed_total(&part, &info.sha256, info.size)
-        .map_err(|e| format!("The update archive is invalid: {e}"))?;
+    let check_cancel = || {
+        if cancel.load(std::sync::atomic::Ordering::Acquire) {
+            Err(super::http::CANCELLED.to_owned())
+        } else {
+            Ok(())
+        }
+    };
+    let map_archive_err = |e: String| {
+        if e == oto_sign::extract::CANCELLED {
+            super::http::CANCELLED.to_owned()
+        } else {
+            format!("The update archive is invalid: {e}")
+        }
+    };
+    check_cancel()?;
+    let total = oto_sign::inspect_verified_zip_uncompressed_total_cancellable(
+        &part,
+        &info.sha256,
+        info.size,
+        cancel,
+    )
+    .map_err(map_archive_err)?;
+    check_cancel()?;
     need_space(&work, total, "to unpack the update")?;
     need_space(target_dir, total, "next to Oto")?;
     let dir = work.join(format!("{}-app", info.version));
     private_dir(&dir)?;
-    let app = oto_sign::extract_verified_zip(&part, &dir, &info.sha256, info.size)
-        .map_err(|e| format!("The update archive is invalid: {e}"))?;
+    let app =
+        oto_sign::extract_verified_zip_cancellable(&part, &dir, &info.sha256, info.size, cancel)
+            .map_err(map_archive_err)?;
     let _ = std::fs::remove_file(&part);
+    check_cancel()?;
     check_bundle_info(&app, &info.version, current_version)?;
+    check_cancel()?;
     checks.signatures(&app)?;
+    check_cancel()?;
     checks.gatekeeper(&app)?;
+    check_cancel()?;
     Ok(StagedUpdate {
         info: info.clone(),
         cached_app_path: app,
@@ -1061,6 +1087,48 @@ pub(crate) mod tests {
         )
         .unwrap_err();
         assert_eq!(e, crate::updater::http::CANCELLED);
+    }
+
+    #[test]
+    fn cancelling_during_verification_stops_before_extract_and_checks() {
+        struct PanicChecks;
+        impl BundleChecks for PanicChecks {
+            fn signatures(&self, _: &Path) -> Result<(), String> {
+                panic!("signature check must not run after cancel");
+            }
+            fn gatekeeper(&self, _: &Path) -> Result<(), String> {
+                panic!("gatekeeper check must not run after cancel");
+            }
+        }
+        let tmp = Tmp::new("cancel-verify");
+        let cache = tmp.0.join("updates");
+        let zip = app_zip(&info_plist("dev.oto.app", "oto-app", "0.9.0"));
+        let info = info_for(&zip, "0.9.0");
+        let t = FakeTransport::default();
+        t.serve(&info.asset_url, zip);
+        let cancel = AtomicBool::new(false);
+        let e = download_and_verify_in(
+            &t,
+            &info,
+            "0.8.0",
+            &cache,
+            &cache,
+            &PanicChecks,
+            &cancel,
+            &mut |got, total| {
+                // Cancel as soon as the download completes and transitions into verification.
+                if got >= total {
+                    cancel.store(true, std::sync::atomic::Ordering::Release);
+                }
+            },
+        )
+        .unwrap_err();
+        assert_eq!(e, crate::updater::http::CANCELLED);
+        assert!(
+            work_entries(&cache).is_empty(),
+            "{:?}",
+            work_entries(&cache)
+        );
     }
 
     #[test]

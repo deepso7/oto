@@ -19,8 +19,9 @@ pub use envelope::{
     SignatureEntry, SignedEnvelope, TrustedKey, VerifyError, sign_envelope, verify_envelope,
 };
 pub use extract::{
-    extract_verified_zip, inspect_verified_zip_uncompressed_total, inspect_zip_uncompressed_total,
-    sha256_file,
+    extract_verified_zip, extract_verified_zip_cancellable,
+    inspect_verified_zip_uncompressed_total, inspect_verified_zip_uncompressed_total_cancellable,
+    inspect_zip_uncompressed_total, sha256_file,
 };
 pub use manifest::{PlatformAsset, UpdateManifest};
 pub use semver::{OsVersion, SemVer};

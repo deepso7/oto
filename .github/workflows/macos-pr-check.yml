@@ -10,10 +10,15 @@ name: macOS PR check
 on:
   pull_request:
     paths:
+      - Cargo.toml
+      - Cargo.lock
+      - crates/oto-app/**
+      - crates/oto-engine/**
+      - crates/oto-cli/**
+      - crates/oto-sign/**
       - scripts/macos/**
       - packaging/macos/**
       - driver/macos/**
-      - crates/oto-sign/**
       - .github/workflows/macos-*.yml
 
 permissions:
@@ -95,8 +100,13 @@ jobs:
           shared-key: macos-pr-check
           save-if: false
 
-      - name: Test oto-sign
-        run: cargo test --locked -p oto-sign
+      - name: Run macOS driver helper and Rust tests
+        run: |
+          make -C driver/macos test
+          cargo test --locked -p oto-sign
+          cargo test --locked -p oto-engine --lib
+          cargo test --locked -p oto-app --bin oto-app
+          cargo test --locked -p oto-cli
 
       - name: Build an ad-hoc signed Oto.app
         # The release's feature set; host architecture only (no Developer ID, so UNIVERSAL=0).

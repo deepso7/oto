@@ -766,41 +766,53 @@ impl PreparedUpdate {
         let staging = parent.join(format!("{STAGING_PREFIX}{nonce}"));
         let helper_path = paths.update_helper(&nonce);
         let helper_tmp = paths.dir.join(format!(".update-helper-{nonce}.tmp"));
-        let cleanup = || {
-            let _ = rec::remove_path(&staging);
-            let _ = rec::remove_path(&helper_tmp);
-            let _ = rec::remove_path(&helper_path);
+
+        // Serialize staging + helper preparation under `.helper-prep.lock` until the helper
+        // replies ready (holding `updating.lock` with a journal referencing `staging`). Any crash
+        // before that releases this lock so startup cleanup reclaims both `.Oto-update-<nonce>`
+        // and `.update-helper-<nonce>.tmp`.
+        let _prep_lock = open_helper_prep_lock(paths)
+            .and_then(|f| f.lock().map(|()| f))
+            .map_err(|e| format!("Couldn't prepare the updater: {e}"))?;
+
+        struct PrepCleanup<'a> {
+            paths: [&'a Path; 3],
+            disarmed: bool,
+        }
+        impl Drop for PrepCleanup<'_> {
+            fn drop(&mut self) {
+                if !self.disarmed {
+                    for p in self.paths {
+                        let _ = rec::remove_path(p);
+                    }
+                }
+            }
+        }
+        let mut guard = PrepCleanup {
+            paths: [&staging, &helper_tmp, &helper_path],
+            disarmed: false,
         };
 
         clone_tree(&staged.cached_app_path, &staging)
             .map_err(|e| format!("Couldn't copy the update next to Oto: {e}"))?;
-        if let Err(e) = ops.verify_staged(&staging, &new_version, current_version) {
-            cleanup();
-            return Err(e);
-        }
+        ops.verify_staged(&staging, &new_version, current_version)?;
         let _ = rec::remove_path(&staged.cache_dir);
 
         // Copy to a hidden temp path first, set mode and refresh mtime (macOS fs::copy preserves
-        // the source binary's old mtime), then rename into place. Serialized under a persistent
-        // `.helper-prep.lock` with startup cleanup so an active temp is never reclaimed mid-copy,
-        // while a crash leftover temp is reclaimed once the lock releases.
-        let copied = fs::create_dir_all(&paths.dir).and_then(|()| {
-            let prep_lock = open_helper_prep_lock(paths)?;
-            prep_lock.lock()?;
-            let _ = rec::remove_path(&helper_tmp);
-            let _ = rec::remove_path(&helper_path);
-            fs::copy(helper_exe, &helper_tmp)?;
-            set_mode(&helper_tmp, 0o700)?;
-            fs::OpenOptions::new()
-                .write(true)
-                .open(&helper_tmp)
-                .and_then(|f| f.set_modified(std::time::SystemTime::now()))?;
-            fs::rename(&helper_tmp, &helper_path)
-        });
-        if let Err(e) = copied {
-            cleanup();
-            return Err(format!("Couldn't prepare the updater: {e}"));
-        }
+        // the source binary's old mtime), then rename into place.
+        fs::create_dir_all(&paths.dir)
+            .and_then(|()| {
+                let _ = rec::remove_path(&helper_tmp);
+                let _ = rec::remove_path(&helper_path);
+                fs::copy(helper_exe, &helper_tmp)?;
+                set_mode(&helper_tmp, 0o700)?;
+                fs::OpenOptions::new()
+                    .write(true)
+                    .open(&helper_tmp)
+                    .and_then(|f| f.set_modified(std::time::SystemTime::now()))?;
+                fs::rename(&helper_tmp, &helper_path)
+            })
+            .map_err(|e| format!("Couldn't prepare the updater: {e}"))?;
 
         let (commit_rx, commit_tx) = pipe().map_err(|e| e.to_string())?;
         let (ready_rx, ready_tx) = pipe().map_err(|e| e.to_string())?;
@@ -814,20 +826,18 @@ impl PreparedUpdate {
             commit_fd: commit_rx.as_raw_fd(),
             ready_fd: ready_tx.as_raw_fd(),
         };
-        if let Err(e) = spawn(&helper_path, &args, commit_rx, ready_tx) {
-            cleanup();
-            return Err(e);
-        }
+        spawn(&helper_path, &args, commit_rx, ready_tx)?;
         let mut ready = File::from(ready_rx);
         match read_byte(&mut ready, Some(HELPER_READY_TIMEOUT)) {
             Ok(Some(b'R')) => {}
             _ => {
                 // The helper failed (another update runs, or a stale one couldn't be cleared).
                 drop(commit_tx);
-                cleanup();
                 return Err("The updater couldn't start. Try again later.".into());
             }
         }
+        guard.disarmed = true;
+        drop(guard);
         Ok(Self {
             nonce,
             target: target.to_path_buf(),
@@ -1163,6 +1173,7 @@ fn commit(
     tx.phase = TxPhase::Committed;
     if let Err(e) = us::write_tx(paths, &tx) {
         ops.log(&format!("couldn't record the commit: {e}"));
+        return HelperOutcome::RecoveryNeeded(e.to_string());
     }
     if let Err(e) = us::write_tx_state(paths, &tx.nonce, TxControlState::Committed) {
         // The journal says committed: recovery publishes it later.
@@ -1444,7 +1455,8 @@ pub fn startup_recovery(exe: &Path) -> RecoveryOutcome {
         },
     );
     if out == RecoveryOutcome::NoTransaction || out == RecoveryOutcome::Resolved {
-        cleanup_stale_files(&paths);
+        let app_dir = driver::app_bundle(exe).and_then(|b| b.parent().map(Path::to_path_buf));
+        cleanup_stale_files_in(&paths, app_dir.as_deref());
         if let Some(cache) = verify::updates_cache_dir() {
             verify::reclaim_abandoned_work_dirs(&cache);
         }
@@ -1484,13 +1496,18 @@ fn open_helper_prep_lock(paths: &UpdatePaths) -> io::Result<File> {
 
 /// Removes leftovers of finished transactions: helper copies, state and ack files of other
 /// transactions older than ten minutes (so a starting helper or a candidate reading its
-/// `committed` is never raced), plus any crashed `.update-helper-<nonce>.tmp` files when no
-/// helper copy is in flight. Only while holding `updating.lock`.
+/// `committed` is never raced), plus any crashed `.update-helper-<nonce>.tmp` files (and
+/// abandoned `.Oto-update-<nonce>` staging copies when `app_dir` is given) when no helper
+/// preparation is in flight. Only while holding `updating.lock`.
 pub fn cleanup_stale_files(paths: &UpdatePaths) {
-    cleanup_stale_files_with(paths, STALE_AGE);
+    cleanup_stale_files_with(paths, None, STALE_AGE);
 }
 
-fn cleanup_stale_files_with(paths: &UpdatePaths, max_age: Duration) {
+fn cleanup_stale_files_in(paths: &UpdatePaths, app_dir: Option<&Path>) {
+    cleanup_stale_files_with(paths, app_dir, STALE_AGE);
+}
+
+fn cleanup_stale_files_with(paths: &UpdatePaths, app_dir: Option<&Path>, max_age: Duration) {
     let Ok(Some(_lock)) = UpdatingLock::try_acquire(paths) else {
         return;
     };
@@ -1498,46 +1515,63 @@ fn cleanup_stale_files_with(paths: &UpdatePaths, max_age: Duration) {
         .ok()
         .and_then(|f| f.try_lock().ok().map(|()| f));
     let current = us::read_tx(paths).ok().flatten().map(|tx| tx.nonce);
-    let Ok(rd) = fs::read_dir(&paths.dir) else {
-        return;
-    };
-    for e in rd.flatten() {
-        let Some(name) = e.file_name().to_str().map(str::to_owned) else {
-            continue;
-        };
-        if let Some(n) = name
-            .strip_prefix(".update-helper-")
-            .and_then(|r| r.strip_suffix(".tmp"))
-        {
-            if prep_lock.is_some() && Nonce::parse(n).is_ok() {
+    if let Ok(rd) = fs::read_dir(&paths.dir) {
+        for e in rd.flatten() {
+            let Some(name) = e.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            if let Some(n) = name
+                .strip_prefix(".update-helper-")
+                .and_then(|r| r.strip_suffix(".tmp"))
+            {
+                if prep_lock.is_some() && Nonce::parse(n).is_ok() {
+                    let _ = rec::remove_path(&e.path());
+                }
+                continue;
+            }
+            let nonce = name
+                .strip_prefix("update-helper-")
+                .or_else(|| {
+                    name.strip_prefix("tx-")
+                        .and_then(|r| r.strip_suffix("-state"))
+                })
+                .or_else(|| {
+                    name.strip_prefix("ack-")
+                        .and_then(|r| r.strip_suffix("-started").or(r.strip_suffix("-ready")))
+                });
+            let Some(n) = nonce else {
+                continue;
+            };
+            let Ok(n) = Nonce::parse(n) else { continue };
+            if current.as_ref() == Some(&n) {
+                continue;
+            }
+            let old = e
+                .metadata()
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|m| m.elapsed().ok())
+                .is_some_and(|age| age > max_age);
+            if old {
                 let _ = rec::remove_path(&e.path());
             }
-            continue;
         }
-        let nonce = name
-            .strip_prefix("update-helper-")
-            .or_else(|| {
-                name.strip_prefix("tx-")
-                    .and_then(|r| r.strip_suffix("-state"))
-            })
-            .or_else(|| {
-                name.strip_prefix("ack-")
-                    .and_then(|r| r.strip_suffix("-started").or(r.strip_suffix("-ready")))
-            });
-        let Some(n) = nonce else {
-            continue;
-        };
-        let Ok(n) = Nonce::parse(n) else { continue };
-        if current.as_ref() == Some(&n) {
-            continue;
-        }
-        let old = e
-            .metadata()
-            .and_then(|m| m.modified())
-            .ok()
-            .and_then(|m| m.elapsed().ok())
-            .is_some_and(|age| age > max_age);
-        if old {
+    }
+    if prep_lock.is_some()
+        && let Some(dir) = app_dir
+        && let Ok(rd) = fs::read_dir(dir)
+    {
+        for e in rd.flatten() {
+            let Some(name) = e.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            let Some(n) = name.strip_prefix(STAGING_PREFIX) else {
+                continue;
+            };
+            let Ok(n) = Nonce::parse(n) else { continue };
+            if current.as_ref() == Some(&n) {
+                continue;
+            }
             let _ = rec::remove_path(&e.path());
         }
     }
@@ -2704,7 +2738,7 @@ mod tests {
         // Once past the age threshold, unreferenced helper and state files are removed while the
         // current transaction's files stay.
         std::thread::sleep(Duration::from_millis(10));
-        cleanup_stale_files_with(&w.paths, Duration::ZERO);
+        cleanup_stale_files_with(&w.paths, None, Duration::ZERO);
         assert!(w.paths.update_helper(&cur).exists());
         assert!(w.paths.tx_state(&cur).exists());
         assert!(!w.paths.update_helper(&old).exists());
@@ -2713,8 +2747,53 @@ mod tests {
         fs::write(w.paths.update_helper(&old), "h").unwrap();
         std::thread::sleep(Duration::from_millis(10));
         let held = UpdatingLock::try_acquire(&w.paths).unwrap().unwrap();
-        cleanup_stale_files_with(&w.paths, Duration::ZERO);
+        cleanup_stale_files_with(&w.paths, None, Duration::ZERO);
         assert!(w.paths.update_helper(&old).exists());
         drop(held);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_commit_journal_write_never_publishes_committed() {
+        let w = World::new();
+        let n = Nonce::parse("failcommit").unwrap();
+        let tx = verifying(&w, &n);
+        let lock = UpdatingLock::try_acquire(&w.paths).unwrap().unwrap();
+        // Make the state directory read-only so writing update-tx.json fails.
+        set_mode(&w.paths.dir, 0o500).unwrap();
+        let out = commit(&w.paths, lock, &Fake::default(), tx.clone());
+        set_mode(&w.paths.dir, 0o700).unwrap();
+        assert!(
+            matches!(out, HelperOutcome::RecoveryNeeded(_)),
+            "failed journal write must not publish committed: {out:?}"
+        );
+        assert_eq!(
+            us::read_tx_state(&w.paths, &n),
+            Some(TxControlState::Active)
+        );
+        assert!(tx.staging_path.exists());
+    }
+
+    #[test]
+    fn abandoned_staging_copies_are_reclaimed_only_when_prep_lock_is_free() {
+        let w = World::new();
+        let cur = Nonce::parse("cur").unwrap();
+        let cur_tx = verifying(&w, &cur);
+        let app_dir = w.target.parent().unwrap();
+        let crashed = app_dir.join(format!("{STAGING_PREFIX}crashed2"));
+        bundle(&crashed, "1.2.0");
+
+        // While a helper preparation holds .helper-prep.lock, abandoned staging copies stay.
+        let prep_lock = open_helper_prep_lock(&w.paths).unwrap();
+        prep_lock.lock().unwrap();
+        cleanup_stale_files_in(&w.paths, Some(app_dir));
+        assert!(crashed.exists());
+        assert!(cur_tx.staging_path.exists());
+        drop(prep_lock);
+
+        // Once released, startup cleanup removes the abandoned copy while keeping the active tx's.
+        cleanup_stale_files_in(&w.paths, Some(app_dir));
+        assert!(!crashed.exists(), "abandoned staging copy reclaimed");
+        assert!(cur_tx.staging_path.exists(), "current tx staging kept");
     }
 }
