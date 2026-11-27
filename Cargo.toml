@@ -1,6 +1,12 @@
 [workspace]
 resolver = "3"
-members = ["crates/oto-dsp", "crates/oto-engine", "crates/oto-cli", "crates/oto-app"]
+members = [
+    "crates/oto-dsp",
+    "crates/oto-engine",
+    "crates/oto-cli",
+    "crates/oto-app",
+    "crates/oto-sign",
+]
 # The UI pulls in the whole GPU stack; keep plain `cargo build/test` fast.
 default-members = ["crates/oto-dsp", "crates/oto-engine", "crates/oto-cli"]
 
@@ -15,6 +21,8 @@ publish = false
 # Without default features, so each crate opts in to `dfn3` itself and forwards it.
 oto-dsp = { path = "crates/oto-dsp", default-features = false }
 oto-engine = { path = "crates/oto-engine", default-features = false }
+# Update envelope signing and the bounded ZIP extractor, shared by oto-app and release CI.
+oto-sign = { path = "crates/oto-sign" }
 # Rune is pre-release: always pin a rev of `dev` and bump deliberately.
 rune = { git = "https://github.com/anomalyco/rune", rev = "70eff81165e9854834a75f17753edb6c96ab2ab7" }
 rune-kit = { git = "https://github.com/anomalyco/rune", rev = "70eff81165e9854834a75f17753edb6c96ab2ab7" }

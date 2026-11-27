@@ -1,75 +1,143 @@
-# Builds the signed, notarized macOS DMG for an existing GitHub release and attaches it.
-# Called by release-plz after it tags vX.Y.Z and creates the release; can also be run by hand
-# (Actions → macOS release → Run workflow) to rebuild or backfill a release.
-# On pull requests that touch the release pipeline it does a build-only run: it signs and
-# notarizes the DMG for the PR's code and keeps it as a workflow artifact, but uploads nothing
-# to a release. Fork PRs are skipped, since they get no secrets.
-# Secrets and setup: packaging/macos/README.md, "Releasing from CI".
+# Builds, verifies and publishes a macOS release for a tag release-plz just made.
+#
+# release-plz (release-plz.yml, on push to main) tags vX.Y.Z, creates a DRAFT release, and calls
+# this workflow. Because it is called from a push to main, github.ref is refs/heads/main, not
+# the tag. Manual recovery runs against main too:
+#   gh workflow run macos-release.yml --ref main -f tag=vX.Y.Z
+#
+#   validate-tag   (no secrets) the tag is vX.Y.Z, on main's history, and matches Cargo.toml
+#   check-release  (no secrets) is the release still a draft?
+#   dmg            (release environment, drafts only) build, sign, notarize and round-trip
+#                  check the DMG, the update zip and the unsigned manifest, from exactly the
+#                  verified commit
+#   publish        (release environment, one at a time across all tags) re-check the tag and
+#                  draft state, sign update.json, upload and verify every asset, publish
+#                  (latest only if newest), update the Homebrew tap. For an already-published
+#                  release it uploads nothing, re-verifies, and reconciles the tap.
+#
+# Pull requests are checked by macos-pr-check.yml (no secrets). Setup and recovery:
+# packaging/macos/README.md, "Releasing from CI".
 name: macOS release
 
 on:
   workflow_call:
     inputs:
-      tag: { type: string, required: true }   # e.g. v0.1.0; the GitHub release already exists
+      tag: { type: string, required: true }   # e.g. v0.1.0; the (draft) GitHub release exists
   workflow_dispatch:
     inputs:
-      tag: { type: string, required: true }   # manual re-run / backfill for an existing release
-  pull_request:
-    paths:
-      - .github/workflows/macos-release.yml
-      - scripts/macos/**
-      - packaging/macos/**
-      - driver/macos/**
+      tag: { type: string, required: true }   # re-run / recover a release; dispatch on main
 
-permissions:
-  contents: write
+permissions: {}
 
-concurrency:
-  group: macos-release-${{ inputs.tag || github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+defaults:
+  run:
+    shell: bash
 
 jobs:
-  dmg:
-    name: Build and upload DMG (${{ inputs.tag || 'build only' }})
-    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
-    runs-on: macos-26
-    timeout-minutes: 120
+  validate-tag:
+    name: Validate ${{ inputs.tag }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      sha: ${{ steps.resolve.outputs.sha }}
+      version: ${{ steps.resolve.outputs.version }}
     env:
       TAG: ${{ inputs.tag }}
-      GH_TOKEN: ${{ github.token }}
     steps:
-      - name: Check the tag and its release
-        if: ${{ inputs.tag != '' }}
+      - name: Check the ref and the tag's form
         run: |
+          if [ "$GITHUB_REF" != refs/heads/main ]; then
+            echo "::error::run this on main (gh workflow run macos-release.yml --ref main -f tag=$TAG), not $GITHUB_REF"
+            exit 1
+          fi
           if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             echo "::error::tag '$TAG' is not of the form vX.Y.Z"
             exit 1
           fi
-          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json tagName,isDraft > /dev/null || {
-            echo "::error::there is no GitHub release for $TAG; create it first"
-            exit 1
-          }
 
       - uses: actions/checkout@v7
         with:
-          ref: ${{ inputs.tag && format('refs/tags/{0}', inputs.tag) || '' }}
+          fetch-depth: 0
           persist-credentials: false
 
-      - name: Check the tag matches the workspace version
+      - name: Resolve the tag and check it is on main
+        id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          version="$(awk '/^\[workspace\.package\]/ { p = 1; next } /^\[/ { p = 0 }
-              p && $1 == "version" { gsub(/"/, "", $3); print $3; exit }' Cargo.toml)"
-          if [ -n "$TAG" ] && [ "v$version" != "$TAG" ]; then
-            echo "::error file=Cargo.toml::tag $TAG does not match the workspace version in Cargo.toml (${version:-none found}, expected ${TAG#v})"
+          remote="https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git fetch --no-tags --force "$remote" \
+            "+refs/heads/main:refs/remotes/origin/main" "+refs/tags/$TAG:refs/tags/$TAG"
+          TAG_SHA="$(git rev-parse "refs/tags/$TAG^{commit}")"
+          MAIN_SHA="$(git rev-parse refs/remotes/origin/main)"
+          if ! git merge-base --is-ancestor "$TAG_SHA" "$MAIN_SHA"; then
+            echo "::error::$TAG ($TAG_SHA) is not on main ($MAIN_SHA)"
+            exit 1
+          fi
+          version="$(git show "$TAG_SHA:Cargo.toml" | awk '/^\[workspace\.package\]/ { p = 1; next } /^\[/ { p = 0 }
+              p && $1 == "version" { gsub(/"/, "", $3); print $3; exit }')"
+          if [ "v$version" != "$TAG" ]; then
+            echo "::error::$TAG does not match the workspace version in Cargo.toml at $TAG_SHA (${version:-none found})"
             exit 1
           fi
           # The build scripts come from the tag, so tags older than this pipeline can't be built.
-          if [ ! -f scripts/macos/ci-keychain.sh ]; then
-            echo "::error::$TAG predates scripts/macos/ci-keychain.sh and can't be built in CI"
+          if ! git cat-file -e "$TAG_SHA:crates/oto-sign/Cargo.toml" 2>/dev/null; then
+            echo "::error::$TAG predates crates/oto-sign and the draft-release pipeline"
             exit 1
           fi
-          echo "VERSION=$version" >> "$GITHUB_ENV"
-          echo "Building Oto $version from $(git rev-parse HEAD)"
+          echo "sha=$TAG_SHA" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "$TAG → $TAG_SHA (on main at $MAIN_SHA), version $version"
+
+  check-release:
+    name: Check the release of ${{ inputs.tag }}
+    needs: validate-tag
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # GITHUB_TOKEN only sees draft releases with write access
+    outputs:
+      is_draft: ${{ steps.state.outputs.is_draft }}
+    steps:
+      - name: Read the draft state
+        id: state
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          if ! is_draft="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)"; then
+            echo "::error::there is no GitHub release for $TAG; create it with: gh release create $TAG --draft --verify-tag, then re-run on main"
+            exit 1
+          fi
+          echo "is_draft=$is_draft" >> "$GITHUB_OUTPUT"
+          echo "$TAG draft: $is_draft"
+
+  dmg:
+    name: Build ${{ inputs.tag }}
+    needs: [validate-tag, check-release]
+    if: ${{ needs.check-release.outputs.is_draft == 'true' }}
+    runs-on: macos-26
+    timeout-minutes: 120
+    environment: release
+    permissions:
+      contents: read
+    concurrency:
+      group: macos-release-build-${{ inputs.tag }}
+      cancel-in-progress: false
+    env:
+      VERSION: ${{ needs.validate-tag.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.validate-tag.outputs.sha }}
+          persist-credentials: false
+
+      - name: Check the checkout
+        env:
+          SHA: ${{ needs.validate-tag.outputs.sha }}
+        run: |
+          [ "$(git rev-parse HEAD)" = "$SHA" ] || { echo "::error::checked out $(git rev-parse HEAD), expected $SHA"; exit 1; }
+          echo "Building Oto $VERSION from $SHA"
 
       - name: Install the Rust toolchain
         run: |
@@ -96,32 +164,76 @@ jobs:
           SIGN_ID: "${{ vars.MACOS_SIGN_ID || 'Developer ID Application: Deepanshu Singh (T9DPKXJBUS)' }}"
         run: scripts/macos/ci-keychain.sh setup
 
-      # SIGN_ID, NOTARY_PROFILE and NOTARY_KEYCHAIN come from the previous step.
-      - name: Build, sign and notarize
+      # SIGN_ID, NOTARY_PROFILE and NOTARY_KEYCHAIN come from the previous step. Writes the DMG,
+      # the update zip, their .sha256 files and update-payload.json to target/dist.
+      - name: Build, sign, notarize and round-trip check
         run: scripts/macos/release.sh
 
-      - name: Upload the DMG as a workflow artifact
-        if: ${{ !cancelled() }}
+      - name: Upload the release files as a workflow artifact
         uses: actions/upload-artifact@v7
         with:
-          name: Oto-${{ env.VERSION }}-dmg
+          name: oto-release-${{ inputs.tag }}
           path: |
-            target/dist/Oto-*.dmg
-            target/dist/Oto-*.dmg.sha256
-          if-no-files-found: ignore
+            target/dist/Oto-${{ env.VERSION }}.dmg
+            target/dist/Oto-${{ env.VERSION }}.dmg.sha256
+            target/dist/Oto-${{ env.VERSION }}-macos.zip
+            target/dist/Oto-${{ env.VERSION }}-macos.zip.sha256
+            target/dist/update-payload.json
+          if-no-files-found: error
           retention-days: 7
           overwrite: true
-
-      - name: Attach the DMG to the release
-        if: ${{ inputs.tag != '' }}
-        run: |
-          dmg="target/dist/Oto-$VERSION.dmg"
-          gh release upload "$TAG" "$dmg" "$dmg.sha256" --clobber --repo "$GITHUB_REPOSITORY"
-          echo "Attached $(basename "$dmg") to $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/tag/$TAG"
-          cat "$dmg.sha256"
 
       - name: Remove signing credentials
         if: ${{ always() }}
         run: |
           # Absent if the job failed before checkout, in which case there's nothing to clean.
           if [ -f scripts/macos/ci-keychain.sh ]; then scripts/macos/ci-keychain.sh cleanup; fi
+
+  publish:
+    name: Publish ${{ inputs.tag }}
+    needs: [validate-tag, check-release, dmg]
+    # Runs after a successful build (draft) and also when the build was skipped because the
+    # release is already published, to re-verify it and reconcile the Homebrew tap.
+    if: ${{ always() && needs.validate-tag.result == 'success' && needs.check-release.result == 'success' && (needs.dmg.result == 'success' || needs.dmg.result == 'skipped') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: release
+    permissions:
+      contents: write # upload assets, publish the release
+    # One publish at a time across all tags, never cancelled, so "latest" only moves forward.
+    concurrency:
+      group: oto-release-publish
+      cancel-in-progress: false
+    env:
+      TAG: ${{ inputs.tag }}
+      SHA: ${{ needs.validate-tag.outputs.sha }}
+      DMG_RESULT: ${{ needs.dmg.result }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.validate-tag.outputs.sha }}
+          persist-credentials: false
+
+      - name: Build oto-sign
+        run: |
+          rustup toolchain install   # the one pinned in rust-toolchain.toml
+          cargo build --release --locked -p oto-sign
+          echo "OTO_SIGN=$PWD/target/release/oto-sign" >> "$GITHUB_ENV"
+
+      # Only after a build; an already-published release is checked from GitHub itself.
+      - name: Download the build
+        if: ${{ needs.dmg.result == 'success' }}
+        uses: actions/download-artifact@v8
+        with:
+          name: oto-release-${{ inputs.tag }}
+          path: ${{ runner.temp }}/artifacts
+
+      - name: Sign, upload, verify, publish and update the tap
+        env:
+          OTO_UPDATE_SIGNING_KEY: ${{ secrets.OTO_UPDATE_SIGNING_KEY }}
+          OTO_UPDATE_VERIFY_PUBKEYS: ${{ vars.OTO_UPDATE_VERIFY_PUBKEYS }}
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          HOMEBREW_TAP: ${{ vars.HOMEBREW_TAP || 'deepso7/homebrew-oto' }}
+          ARTIFACTS: ${{ runner.temp }}/artifacts
+        run: scripts/macos/publish-release.sh

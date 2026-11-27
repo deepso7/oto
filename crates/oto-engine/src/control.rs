@@ -4,6 +4,7 @@
 //! OS) plus a periodic tick, so the state machine is testable with a fake [`Platform`].
 
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant};
@@ -12,11 +13,23 @@ use oto_dsp::{Chain, Model};
 
 use crate::pipeline::{STOP_FADE_DONE, STOP_FADE_REQUESTED, Shared, encode_model};
 use crate::platform::{HalEvent, Platform};
-use crate::{Command, Event, Settings, Tier};
+use crate::{Command, DriverStatus, Event, Settings, Tier};
 
 pub(crate) enum Msg {
     Cmd(Command),
     Hal(HalEvent),
+    /// Re-evaluate now (an update candidate just committed).
+    Reconcile,
+}
+
+/// What the loaded driver allows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Gate {
+    Ok,
+    Missing,
+    Incompatible(u32),
+    /// Could not tell (transient): keep running streams, start none, report nothing new.
+    Unknown,
 }
 
 /// What the engine should be doing.
@@ -138,7 +151,13 @@ pub(crate) struct Control<P: Platform> {
     shared: Arc<Shared>,
     events: Sender<Event>,
     clients: bool,
-    driver_reported_missing: bool,
+    /// The driver problem last reported: missing ([`Event::Error`]) or incompatible
+    /// ([`Event::DriverIncompatible`]).
+    driver_problem: Option<Gate>,
+    /// The oldest loaded driver revision streams run with.
+    min_driver: u32,
+    /// An uncommitted update candidate: never open streams.
+    inert: Arc<AtomicBool>,
     running: Option<RunKey>,
     last_error: Option<String>,
     /// An error was reported and `Event::Recovered` has not been sent since.
@@ -181,7 +200,9 @@ impl<P: Platform> Control<P> {
             shared,
             events,
             clients: false,
-            driver_reported_missing: false,
+            driver_problem: None,
+            min_driver: crate::MIN_COMPATIBLE_DRIVER_VERSION,
+            inert: Arc::new(AtomicBool::new(false)),
             running: None,
             last_error: None,
             fault: false,
@@ -209,6 +230,18 @@ impl<P: Platform> Control<P> {
     /// Runs `f` on each poll while waiting for the output to fade before Voice Isolation loads.
     pub(crate) fn with_mute_wait(mut self, f: Box<dyn FnMut()>) -> Self {
         self.mute_wait = Some(f);
+        self
+    }
+
+    /// The oldest driver revision to run streams with (0: any loaded driver).
+    pub fn with_min_driver(mut self, min: u32) -> Self {
+        self.min_driver = min;
+        self
+    }
+
+    /// While `inert` is set, no streams open whatever the clients do.
+    pub fn with_inert(mut self, inert: Arc<AtomicBool>) -> Self {
+        self.inert = inert;
         self
     }
 
@@ -298,7 +331,7 @@ impl<P: Platform> Control<P> {
                 self.retry_at = None;
                 self.emit(Event::DevicesChanged);
             }
-            Msg::Hal(HalEvent::MicClients) => {}
+            Msg::Hal(HalEvent::MicClients) | Msg::Reconcile => {}
             Msg::Hal(HalEvent::StreamDevice) => {
                 // A running device died or changed format: rebuild on the next reconcile.
                 if self.running.is_some() {
@@ -468,23 +501,76 @@ impl<P: Platform> Control<P> {
         }
     }
 
+    fn driver_gate(&self) -> Gate {
+        match self.p.driver_status() {
+            DriverStatus::Absent => Gate::Missing,
+            DriverStatus::Unknown => Gate::Unknown,
+            DriverStatus::Loaded(rev) if !crate::driver_compatible(rev, self.min_driver) => {
+                Gate::Incompatible(rev)
+            }
+            DriverStatus::Loaded(_) => Gate::Ok,
+        }
+    }
+
     pub fn reconcile(&mut self) {
-        let driver = self.p.driver_installed();
-        if !driver && !self.driver_reported_missing {
-            self.emit(Event::Error(
-                "Oto driver is not installed: Oto Microphone is not available".into(),
-            ));
+        let gate = self.driver_gate();
+        // A transient Unknown (e.g. coreaudiod restarting) neither stops nor reopens running
+        // streams, and leaves client/error state untouched until the driver can be queried again;
+        // the next reconcile (device-list change or tick) asks again. Still honor Voice
+        // Isolation's fail-closed invariant so a non-isolating or bypassed stream cannot leak
+        // unisolated audio while reopening is deferred.
+        if gate == Gate::Unknown {
+            let requested = (self.tier_model)(self.settings.tier);
+            if let Some(running) = &self.running {
+                if !self.settings.enabled {
+                    self.ran_bypassed = true;
+                    self.shared.denoise.store(false, Relaxed);
+                    self.shared.mute_output.store(false, Release);
+                } else if requested.is_isolating()
+                    && (!running.model.is_isolating() || self.ran_bypassed)
+                {
+                    self.mute_output();
+                } else if !requested.is_isolating() {
+                    self.shared.denoise.store(true, Relaxed);
+                    self.shared.mute_output.store(false, Release);
+                }
+            }
+            return;
         }
-        if !driver && !self.driver_reported_missing {
-            self.fault = true;
+        let driver = gate == Gate::Ok;
+        let problem = (!driver).then_some(gate);
+        if problem != self.driver_problem {
+            match problem {
+                Some(Gate::Incompatible(rev)) => {
+                    self.emit(Event::DriverIncompatible {
+                        loaded: rev,
+                        min_required: self.min_driver,
+                    });
+                    self.fault = true;
+                }
+                Some(_) => {
+                    self.emit(Event::Error(
+                        "Oto driver is not installed: Oto Microphone is not available".into(),
+                    ));
+                    self.fault = true;
+                }
+                None => {}
+            }
+            self.driver_problem = problem;
         }
-        self.driver_reported_missing = !driver;
-        let clients = driver && (self.force_clients || self.p.clients_active());
+        // Client activity is independent of driver compatibility: a call on a legacy driver must
+        // still look active so the UI does not install or uninstall mid-call.
+        let clients = gate != Gate::Missing && (self.force_clients || self.p.clients_active());
         if clients != self.clients {
             self.clients = clients;
             self.emit(Event::ClientsActive(clients));
         }
-        let mode = decide(self.settings.enabled, clients, driver);
+        let mut mode = decide(self.settings.enabled, clients, driver);
+        if self.inert.load(Acquire) {
+            // An update candidate before its commit: the old app may still be finishing, so
+            // touch no device. Apps waiting on Oto Microphone are served after the commit.
+            mode = Mode::Idle;
+        }
         let requested = (self.tier_model)(self.settings.tier);
         if self.degraded == Some(Degraded::Load)
             && (self.failed != Some(requested) || !self.settings.enabled)
@@ -502,7 +588,7 @@ impl<P: Platform> Control<P> {
         if mode == Mode::Idle {
             self.stop();
             self.retry_at = None;
-            if driver {
+            if gate == Gate::Ok {
                 // Nothing needs to run and nothing is missing: any earlier error is moot.
                 self.recovered();
             }
@@ -520,6 +606,7 @@ impl<P: Platform> Control<P> {
         }
         if self.running.as_ref() == Some(&key) {
             if !(mode == Mode::Denoise && key.model.is_isolating() && self.ran_bypassed) {
+                self.shared.mute_output.store(false, Release);
                 return;
             }
             // Voice Isolation is back on mid-call, but the worker and the rings still hold
@@ -574,6 +661,7 @@ impl<P: Platform> Control<P> {
             }
         };
         if self.running.as_ref() == Some(&key) {
+            self.shared.mute_output.store(false, Release);
             return;
         }
         self.stop();
@@ -617,6 +705,8 @@ mod tests {
     #[derive(Default)]
     struct Fake {
         driver: bool,
+        /// Overrides `driver` when set.
+        status: Option<DriverStatus>,
         clients: bool,
         inputs: Vec<&'static str>,
         default: Option<&'static str>,
@@ -627,8 +717,12 @@ mod tests {
     }
 
     impl Platform for Fake {
-        fn driver_installed(&self) -> bool {
-            self.driver
+        fn driver_status(&self) -> DriverStatus {
+            self.status.unwrap_or(if self.driver {
+                DriverStatus::Loaded(crate::BUNDLED_DRIVER_VERSION)
+            } else {
+                DriverStatus::Absent
+            })
         }
         fn clients_active(&self) -> bool {
             self.clients
@@ -739,6 +833,177 @@ mod tests {
         let ev: Vec<_> = rx.try_iter().collect();
         assert_eq!(ev.len(), 1);
         assert!(matches!(ev[0], Event::Error(_)));
+    }
+
+    #[test]
+    fn incompatible_driver_refuses_streams_with_one_event() {
+        let (c, rx) = ctl(
+            Fake {
+                clients: true,
+                status: Some(DriverStatus::Loaded(1)),
+                ..fake()
+            },
+            true,
+        );
+        let mut c = c.with_min_driver(2);
+        c.reconcile();
+        c.reconcile();
+        assert!(!c.p.live);
+        let ev: Vec<_> = rx.try_iter().collect();
+        assert_eq!(
+            ev,
+            [
+                Event::DriverIncompatible {
+                    loaded: 1,
+                    min_required: 2
+                },
+                Event::ClientsActive(true),
+            ]
+        );
+        // Client activity continues to be tracked even while incompatible, without opening streams.
+        c.p.clients = false;
+        c.reconcile();
+        assert!(!c.p.live);
+        assert_eq!(
+            rx.try_iter().collect::<Vec<_>>(),
+            [Event::ClientsActive(false)]
+        );
+        c.p.clients = true;
+        c.reconcile();
+        assert!(!c.p.live);
+        assert_eq!(
+            rx.try_iter().collect::<Vec<_>>(),
+            [Event::ClientsActive(true)]
+        );
+        // The driver is updated (and coreaudiod restarted): streams start.
+        c.p.status = Some(DriverStatus::Loaded(2));
+        c.handle(Msg::Hal(HalEvent::DeviceList));
+        c.reconcile();
+        assert!(c.p.live);
+        // Nothing records any more and the driver is fine: the problem is over.
+        c.p.clients = false;
+        c.reconcile();
+        assert!(rx.try_iter().any(|e| e == Event::Recovered));
+    }
+
+    #[test]
+    fn legacy_driver_is_incompatible() {
+        let (mut c, rx) = ctl(
+            Fake {
+                clients: true,
+                status: Some(DriverStatus::Loaded(0)),
+                ..fake()
+            },
+            true,
+        );
+        c.reconcile();
+        c.reconcile();
+        assert!(!c.p.live);
+        let ev: Vec<_> = rx.try_iter().collect();
+        assert_eq!(
+            ev,
+            [
+                Event::DriverIncompatible {
+                    loaded: 0,
+                    min_required: crate::MIN_COMPATIBLE_DRIVER_VERSION
+                },
+                Event::ClientsActive(true),
+            ]
+        );
+    }
+
+    #[test]
+    fn unknown_driver_at_start_waits_without_an_error() {
+        let (mut c, rx) = ctl(
+            Fake {
+                clients: true,
+                status: Some(DriverStatus::Unknown),
+                ..fake()
+            },
+            true,
+        );
+        c.reconcile();
+        c.reconcile();
+        assert!(!c.p.live, "no streams on an unknown driver");
+        assert!(
+            !rx.try_iter().any(|e| matches!(e, Event::Error(_))),
+            "Unknown is not reported as missing or incompatible"
+        );
+        // coreaudiod finished loading: the device-list change retries.
+        c.p.status = None;
+        c.handle(Msg::Hal(HalEvent::DeviceList));
+        c.reconcile();
+        assert!(c.p.live);
+    }
+
+    #[test]
+    fn transient_unknown_keeps_running_streams() {
+        let (mut c, rx) = ctl(
+            Fake {
+                clients: true,
+                ..fake()
+            },
+            true,
+        );
+        c.reconcile();
+        assert!(c.p.live);
+        let _ = rx.try_iter().count();
+        // While Unknown, transient HAL errors (clients_active returning false) or settings changes
+        // must neither stop nor reopen running streams until driver status is known again.
+        c.p.status = Some(DriverStatus::Unknown);
+        c.p.clients = false;
+        c.handle(Msg::Cmd(Command::SetInputDevice(Some("usb".into()))));
+        c.reconcile();
+        c.reconcile();
+        assert!(c.p.live, "not torn down on a transient Unknown");
+        assert_eq!(c.p.stops, 0);
+        assert_eq!(c.p.started, ["builtin"], "not reopened while Unknown");
+        assert!(
+            rx.try_iter().next().is_none(),
+            "no error or ClientsActive(false) while Unknown"
+        );
+        // Restore clients for the next phase.
+        c.p.clients = true;
+        // A missing driver still reported earlier stays reported through Unknown (no repeat).
+        c.p.status = Some(DriverStatus::Absent);
+        c.reconcile();
+        assert!(!c.p.live);
+        c.p.status = Some(DriverStatus::Unknown);
+        c.reconcile();
+        c.p.status = Some(DriverStatus::Absent);
+        c.reconcile();
+        let errors = rx
+            .try_iter()
+            .filter(|e| matches!(e, Event::Error(_)))
+            .count();
+        assert_eq!(errors, 1);
+    }
+
+    #[test]
+    fn inert_candidate_opens_no_streams_until_committed() {
+        let inert = Arc::new(AtomicBool::new(true));
+        let (c, rx) = ctl(
+            Fake {
+                clients: true,
+                ..fake()
+            },
+            true,
+        );
+        let mut c = c.with_inert(inert.clone());
+        c.reconcile();
+        c.handle(Msg::Hal(HalEvent::MicClients));
+        c.reconcile();
+        c.tick(Instant::now());
+        c.reconcile();
+        assert!(!c.p.live, "an inert candidate never opens streams");
+        assert!(c.p.started.is_empty());
+        assert!(!rx.try_iter().any(|e| matches!(e, Event::Error(_))));
+        // Commit: the waiting client is served at once.
+        inert.store(false, Release);
+        c.handle(Msg::Reconcile);
+        c.reconcile();
+        assert!(c.p.live);
+        assert_eq!(c.p.started, ["builtin"]);
     }
 
     #[test]
@@ -951,8 +1216,8 @@ mod tests {
         /// A device that takes longer than the stall limit to open.
         struct Slow(Fake);
         impl Platform for Slow {
-            fn driver_installed(&self) -> bool {
-                self.0.driver_installed()
+            fn driver_status(&self) -> DriverStatus {
+                self.0.driver_status()
             }
             fn clients_active(&self) -> bool {
                 self.0.clients_active()
@@ -1267,6 +1532,143 @@ mod tests {
     }
 
     #[test]
+    fn voice_isolation_during_unknown_mutes_non_isolating_and_bypassed_streams() {
+        let (mut c, _rx) = ctl(
+            Fake {
+                clients: true,
+                ..fake()
+            },
+            true,
+        );
+        c.tier_model = isolate_tiers;
+        c.loader = Box::new(loads_anything);
+        // Simulate a live output callback confirming the mute fade so streams stay running
+        // (matching real audio callbacks instead of falling back to stop()).
+        let sh = c.shared.clone();
+        c.mute_wait = Some(Box::new(move || sh.mute_silent.store(true, Release)));
+        c.settings.tier = Tier::Light;
+        c.reconcile();
+        assert_eq!(running_model(&c), Some(Model::RNNoise));
+        assert!(!c.shared.mute_output.load(Relaxed));
+
+        // Selecting Voice Isolation while driver status is Unknown must mute the non-isolating
+        // stream immediately without reopening streams.
+        c.p.status = Some(DriverStatus::Unknown);
+        c.handle(Msg::Cmd(Command::SetTier(Tier::Isolate)));
+        c.reconcile();
+        assert!(c.p.live, "stream stays running while muted");
+        assert!(
+            c.shared.mute_output.load(Relaxed),
+            "fail closed while Unknown"
+        );
+        assert_eq!(c.p.started.len(), 1, "reopen deferred while Unknown");
+
+        // Switching back to Light during Unknown clears the transition mute without reopening.
+        c.handle(Msg::Cmd(Command::SetTier(Tier::Light)));
+        c.reconcile();
+        assert!(
+            !c.shared.mute_output.load(Relaxed),
+            "leaving Voice Isolation during Unknown unmutes the running stream"
+        );
+        assert_eq!(c.p.started.len(), 1);
+
+        // Selecting Voice Isolation then disabling processing (bypass) during Unknown also clears
+        // the transition mute.
+        c.handle(Msg::Cmd(Command::SetTier(Tier::Isolate)));
+        c.reconcile();
+        assert!(c.shared.mute_output.load(Relaxed));
+        c.handle(Msg::Cmd(Command::SetEnabled(false)));
+        c.reconcile();
+        assert!(!c.shared.mute_output.load(Relaxed));
+        assert!(!c.shared.denoise.load(Relaxed));
+        assert_eq!(c.p.started.len(), 1);
+
+        // Even if the driver returns while matching the already-running Light stream after a
+        // transition mute, the matching-stream early return must clear mute_output.
+        c.handle(Msg::Cmd(Command::SetEnabled(true)));
+        c.reconcile();
+        assert!(c.shared.mute_output.load(Relaxed));
+        c.handle(Msg::Cmd(Command::SetTier(Tier::Light)));
+        c.p.status = None;
+        c.reconcile();
+        assert!(!c.shared.mute_output.load(Relaxed));
+        assert_eq!(c.p.started.len(), 1, "no needless stream rebuild for Light");
+
+        // Now select Voice Isolation during Unknown and let the driver return: rebuilds to
+        // Nearfield and unmutes.
+        c.p.status = Some(DriverStatus::Unknown);
+        c.handle(Msg::Cmd(Command::SetTier(Tier::Isolate)));
+        c.reconcile();
+        assert!(c.shared.mute_output.load(Relaxed));
+        c.p.status = None;
+        c.reconcile();
+        assert_eq!(running_model(&c), Some(Model::Nearfield));
+        assert!(!c.shared.mute_output.load(Relaxed));
+        assert_eq!(c.p.started.len(), 2);
+
+        // Bypassing then re-enabling Voice Isolation during Unknown must also fail closed until
+        // the driver returns and streams can be rebuilt cleanly.
+        c.p.status = Some(DriverStatus::Unknown);
+        c.handle(Msg::Cmd(Command::SetEnabled(false)));
+        c.reconcile();
+        assert!(!c.shared.denoise.load(Relaxed));
+        assert!(!c.shared.mute_output.load(Relaxed));
+        c.handle(Msg::Cmd(Command::SetEnabled(true)));
+        c.reconcile();
+        assert!(
+            c.shared.mute_output.load(Relaxed),
+            "re-enabling bypassed Voice Isolation during Unknown must mute"
+        );
+        assert_eq!(c.p.started.len(), 2, "still deferred while Unknown");
+
+        c.p.status = None;
+        c.reconcile();
+        assert_eq!(c.p.started.len(), 3, "rebuilt once driver status is known");
+        assert!(!c.shared.mute_output.load(Relaxed));
+    }
+
+    #[test]
+    fn fallback_to_running_stream_after_unknown_mute_unmutes() {
+        let (mut c, _rx) = ctl(
+            Fake {
+                clients: true,
+                ..fake()
+            },
+            true,
+        );
+        c.tier_model = |t| match t {
+            Tier::Isolate => Model::Nearfield,
+            Tier::Standard => Model::DeepFilterNet3,
+            _ => Model::RNNoise,
+        };
+        c.loader = Box::new(|m| match m {
+            Model::DeepFilterNet3 => Err("dfn3 unavailable".into()),
+            _ => Chain::with_model(Model::RNNoise),
+        });
+        let sh = c.shared.clone();
+        c.mute_wait = Some(Box::new(move || sh.mute_silent.store(true, Release)));
+        c.settings.tier = Tier::Light;
+        c.reconcile();
+        assert_eq!(running_model(&c), Some(Model::RNNoise));
+
+        // Mute via Isolate during Unknown, then recover while selecting Standard whose model fails
+        // to load and falls back to the already-running RNNoise stream: must unmute.
+        c.p.status = Some(DriverStatus::Unknown);
+        c.handle(Msg::Cmd(Command::SetTier(Tier::Isolate)));
+        c.reconcile();
+        assert!(c.shared.mute_output.load(Relaxed));
+        c.handle(Msg::Cmd(Command::SetTier(Tier::Standard)));
+        c.p.status = None;
+        c.reconcile();
+        assert_eq!(running_model(&c), Some(Model::RNNoise));
+        assert_eq!(c.p.started.len(), 1, "kept running fallback stream");
+        assert!(
+            !c.shared.mute_output.load(Relaxed),
+            "post-load matching-stream fallback must clear transition mute"
+        );
+    }
+
+    #[test]
     fn voice_isolation_starvation_is_reported_degraded_then_recovered() {
         let (mut c, rx) = ctl(
             Fake {
@@ -1393,8 +1795,8 @@ mod tests {
     }
 
     impl Platform for Sim {
-        fn driver_installed(&self) -> bool {
-            true
+        fn driver_status(&self) -> crate::DriverStatus {
+            crate::DriverStatus::Loaded(crate::BUNDLED_DRIVER_VERSION)
         }
         fn clients_active(&self) -> bool {
             true

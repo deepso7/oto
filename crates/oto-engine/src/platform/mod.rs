@@ -8,8 +8,8 @@ use std::sync::Arc;
 
 use oto_dsp::Chain;
 
-use crate::InputDevice;
 use crate::pipeline::Shared;
+use crate::{DriverStatus, InputDevice};
 
 /// OS notifications the control thread reacts to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -25,7 +25,8 @@ pub(crate) enum HalEvent {
 
 /// Device-level operations, owned by the control thread. Not `Send`: create it on that thread.
 pub(crate) trait Platform {
-    fn driver_installed(&self) -> bool;
+    /// Whether the Oto HAL driver is loaded, and which revision ([`DriverStatus`]).
+    fn driver_status(&self) -> DriverStatus;
     /// Whether any app records from Oto Microphone.
     fn clients_active(&self) -> bool;
     #[allow(dead_code)]

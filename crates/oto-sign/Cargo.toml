@@ -1,0 +1,27 @@
+[package]
+name = "oto-sign"
+description = "Signed update envelopes and the bounded update-archive extractor shared by oto-app and release CI"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "oto-sign"
+path = "src/main.rs"
+
+[dependencies]
+base64 = "0.22"
+# Default features are `fast` + `zeroize`: no RNG, no batch verification, no PKCS#8/PEM.
+ed25519-dalek = "3"
+# Only for `keygen`.
+getrandom = "0.4"
+lexopt = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.11"
+# Stored + Deflate (flate2/zlib-rs) only: no bzip2, zstd, lzma, AES or zopfli.
+zip = { version = "9", default-features = false, features = ["deflate-flate2-zlib-rs"] }

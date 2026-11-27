@@ -7,9 +7,9 @@ use std::sync::mpsc::Sender;
 use oto_dsp::Chain;
 
 use super::{Platform, Uids};
-use crate::InputDevice;
 use crate::control::Msg;
 use crate::pipeline::Shared;
+use crate::{DriverStatus, InputDevice};
 
 const UNSUPPORTED: &str = "no audio backend for this platform yet";
 
@@ -22,8 +22,8 @@ impl Unsupported {
 }
 
 impl Platform for Unsupported {
-    fn driver_installed(&self) -> bool {
-        false
+    fn driver_status(&self) -> DriverStatus {
+        DriverStatus::Absent
     }
     fn clients_active(&self) -> bool {
         false
@@ -46,11 +46,17 @@ pub(crate) type Backend = Unsupported;
 pub fn input_devices(_uids: &Uids) -> Vec<InputDevice> {
     Vec::new()
 }
-pub fn driver_installed(_uids: &Uids) -> bool {
-    false
+pub fn driver_status(_uids: &Uids) -> DriverStatus {
+    DriverStatus::Absent
 }
-pub fn default_input_uid() -> Option<String> {
-    None
+pub fn default_input_uid() -> Result<Option<String>, String> {
+    Ok(None)
+}
+pub fn is_oto_mic_active_checked(_uids: &Uids) -> Result<Option<bool>, String> {
+    Ok(None)
+}
+pub fn any_audio_active_checked() -> Result<bool, String> {
+    Ok(false)
 }
 pub fn set_default_input(_uid: &str) -> Result<(), String> {
     Err(UNSUPPORTED.into())
@@ -107,4 +113,8 @@ impl Player {
     {
         Err(UNSUPPORTED.into())
     }
+}
+
+pub(crate) fn os_error(e: String) -> String {
+    e
 }

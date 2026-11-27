@@ -17,6 +17,7 @@ A plan describes one piece of work before it is built. Plans live in [`plans/`](
 |---|---|---|
 | 0001 | [DeepFilterNet3 as the default model](plans/0001-deepfilternet3-default.md) | Implemented |
 | 0002 | [End-to-end roadmap: evaluation, Linux, Voice Isolation, our own model](plans/0002-e2e-roadmap.md) | Accepted (Phase 1 Track A in progress) |
+| 0003 | [End-to-end app and driver update flow](plans/0003-app-updates.md) | Implemented (pending release key & live E2E) |
 
 Model provenance (sources, hashes, licences, what may ship) is machine-readable in [`MODELS.toml`](../MODELS.toml). Training and evaluation datasets are classified in the [training-data audit](training-data-audit.md); the evaluation harness is in [`tools/eval/`](../tools/eval/README.md).
 

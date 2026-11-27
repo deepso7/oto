@@ -31,5 +31,18 @@ changelog_path = "./CHANGELOG.md"
 name = "oto-app"
 git_tag_enable = true
 git_release_enable = true
+# The release starts as a draft; macos-release.yml attaches the DMG, the update zip and the
+# signed update.json, verifies them, and only then publishes it (so /releases/latest never
+# points at a release without its assets).
+git_release_draft = true
 changelog_update = true
 changelog_include = ["oto-dsp", "oto-engine", "oto-cli"]
+
+# The release-side signing tool: shares the workspace version but is never tagged, released
+# or listed in the changelog on its own.
+[[package]]
+name = "oto-sign"
+release = false
+git_tag_enable = false
+git_release_enable = false
+changelog_update = false

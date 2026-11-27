@@ -1,0 +1,142 @@
+# Checks pull requests that touch the macOS release pipeline, with no secrets and read-only
+# access (fork PRs included):
+# - the driver revision guard: changes to the HAL driver need a DRIVER_VERSION bump;
+# - oto-sign's tests (update envelope signing and the update extractor);
+# - an ad-hoc signed Oto.app from scripts/macos/bundle.sh, zipped the way release.sh zips it
+#   and unpacked again with the updater's own extractor (oto-sign extract-verify).
+# Releases themselves: macos-release.yml.
+name: macOS PR check
+
+on:
+  pull_request:
+    paths:
+      - Cargo.toml
+      - Cargo.lock
+      - crates/oto-app/**
+      - crates/oto-engine/**
+      - crates/oto-cli/**
+      - crates/oto-sign/**
+      - scripts/macos/**
+      - packaging/macos/**
+      - driver/macos/**
+      - .github/workflows/macos-*.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macos-pr-check-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  driver-version:
+    name: Driver revision bumped
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      # Every shipped driver build must carry a distinct revision: the app decides whether to
+      # offer a driver upgrade by comparing them. Compared with the last release tag on the
+      # PR's base (what users have), and never allowed to go down relative to the base branch.
+      - name: Check DRIVER_VERSION
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          rev_at() {   # revision at a commit; 0 before DRIVER_VERSION existed (v0.0.1–v0.0.3)
+            local v
+            v="$(git show "$1:driver/macos/DRIVER_VERSION" 2>/dev/null | tr -d '[:space:]')"
+            echo "${v:-0}"
+          }
+          head_rev="$(rev_at HEAD)"
+          if [[ ! "$head_rev" =~ ^[1-9][0-9]*$ ]]; then
+            echo "::error file=driver/macos/DRIVER_VERSION::DRIVER_VERSION must be a positive integer (got '$head_rev')"
+            exit 1
+          fi
+          base_rev="$(rev_at "$BASE_SHA")"
+          if [ "$head_rev" -lt "$base_rev" ]; then
+            echo "::error file=driver/macos/DRIVER_VERSION::DRIVER_VERSION went down: $base_rev on the base branch, $head_rev here"
+            exit 1
+          fi
+          tag="$(git describe --tags --abbrev=0 --match 'v[0-9]*.[0-9]*.[0-9]*' "$BASE_SHA" 2>/dev/null || true)"
+          ref="${tag:-$(git merge-base "$BASE_SHA" HEAD)}"
+          changed="$(git diff --name-only "$ref" HEAD -- driver/macos/src driver/macos/Info.plist driver/macos/Makefile)"
+          if [ -z "$changed" ]; then
+            echo "No driver changes since ${tag:-the base}; DRIVER_VERSION $head_rev."
+            exit 0
+          fi
+          ref_rev="$(rev_at "$ref")"
+          echo "Driver files changed since ${tag:-the base} (revision $ref_rev):"
+          echo "$changed"
+          if [ "$head_rev" -le "$ref_rev" ]; then
+            echo "::error file=driver/macos/DRIVER_VERSION::the driver changed since ${tag:-the base} but DRIVER_VERSION is still $head_rev; bump it to $((ref_rev + 1))"
+            exit 1
+          fi
+          echo "DRIVER_VERSION $ref_rev → $head_rev."
+
+  bundle:
+    name: Bundle and update round trip
+    runs-on: macos-26
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install the Rust toolchain
+        run: |
+          rustup toolchain install   # the one pinned in rust-toolchain.toml
+          rustc --version
+          xcodebuild -version
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: macos-pr-check
+          save-if: false
+
+      - name: Run macOS driver helper and Rust tests
+        run: |
+          make -C driver/macos test
+          cargo test --locked -p oto-sign
+          # Run engine/app/cli unit tests without heavy ML model features (the release build
+          # step below compiles dfn3,onnx) and serialize engine tests so realtime audio-callback
+          # timing tests are not starved by parallel threads on a 3-vCPU VM.
+          cargo test --locked --no-default-features -p oto-engine --lib -- --test-threads=1
+          cargo test --locked --no-default-features -p oto-app --bin oto-app
+          cargo test --locked --no-default-features -p oto-cli
+
+      - name: Build an ad-hoc signed Oto.app
+        # The release's feature set; host architecture only (no Developer ID, so UNIVERSAL=0).
+        run: OTO_FEATURES=dfn3,onnx scripts/macos/bundle.sh
+
+      - name: Zip and unpack with the updater's extractor
+        run: |
+          app=target/bundle/Oto.app
+          work="$RUNNER_TEMP/roundtrip"
+          mkdir -p "$work"
+          zip="$work/Oto-macos.zip"
+          ditto -c -k --keepParent --norsrc --noextattr "$app" "$zip"
+          sha="$(shasum -a 256 "$zip" | cut -d ' ' -f 1)"
+          size="$(stat -f %z "$zip")"
+          cargo build --release --locked -p oto-sign
+          out="$(target/release/oto-sign extract-verify --zip "$zip" --dest "$work/out" \
+            --expected-sha256 "$sha" --expected-size "$size")"
+          [ "$out" = "$work/out/Oto.app" ] || { echo "::error::extract-verify returned '$out'"; exit 1; }
+          codesign --verify --deep --strict --verbose=2 "$out"
+          codesign --verify --strict "$out/Contents/Resources/OtoMicrophone.driver"
+          codesign --verify --strict "$out/Contents/Helpers/oto-hal-helper"
+          want="$(tr -d '[:space:]' < driver/macos/DRIVER_VERSION)"
+          got="$(plutil -extract OtoDriverVersion raw "$out/Contents/Resources/OtoMicrophone.driver/Contents/Info.plist")"
+          [ "$got" = "$want" ] || { echo "::error::bundled driver is revision '$got', DRIVER_VERSION is $want"; exit 1; }
+          plutil -extract LSMinimumSystemVersion raw "$out/Contents/Info.plist"
+          target/release/oto-sign make-payload --version "$(plutil -extract CFBundleShortVersionString raw "$out/Contents/Info.plist")" \
+            --zip "$zip" --driver-version "$want" --min-driver-version 1 \
+            --min-os "$(plutil -extract LSMinimumSystemVersion raw "$out/Contents/Info.plist")" \
+            --out "$work/update-payload.json"
+          echo "Round trip OK: $(du -sh "$out" | cut -f 1) unpacked from $size bytes"

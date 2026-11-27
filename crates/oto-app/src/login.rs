@@ -30,6 +30,8 @@ pub fn is_available() -> bool {
 }
 
 #[cfg(target_os = "macos")]
+pub(crate) use macos::registrable_bundle;
+#[cfg(target_os = "macos")]
 pub use macos::{set, status};
 
 #[cfg(target_os = "macos")]
@@ -43,7 +45,7 @@ mod macos {
     /// The app bundle `exe` (a resolved path) can be registered as, if any. Gatekeeper runs a
     /// quarantined app from a random read-only "translocated" path that is gone after it
     /// quits, so that doesn't count.
-    pub(super) fn registrable_bundle(exe: &Path) -> Option<PathBuf> {
+    pub(crate) fn registrable_bundle(exe: &Path) -> Option<PathBuf> {
         let translocated = exe
             .components()
             .any(|c| c.as_os_str() == "AppTranslocation");

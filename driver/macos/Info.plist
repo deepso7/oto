@@ -14,11 +14,14 @@
 	<string>OtoMicrophone</string>
 	<key>CFBundlePackageType</key>
 	<string>BNDL</string>
-	<!-- Both versions are replaced with the workspace version (Cargo.toml) by the Makefile. -->
+	<!-- The driver revision: all three are replaced from DRIVER_VERSION by the Makefile. Drivers
+	     without OtoDriverVersion (v0.0.1 to v0.0.3) are revision 0. -->
+	<key>OtoDriverVersion</key>
+	<integer>0</integer>
 	<key>CFBundleShortVersionString</key>
-	<string>0.0.0</string>
+	<string>0</string>
 	<key>CFBundleVersion</key>
-	<string>0.0.0</string>
+	<string>0</string>
 	<key>CFBundleSupportedPlatforms</key>
 	<array>
 		<string>MacOSX</string>

@@ -50,6 +50,10 @@ USAGE:
         inference errors, load failure, mode-switch preload) at every strength and count raw
         mic samples that leak to the output. Exits 1 on any leak or fallback. --json prints
         the report `tools/eval/eval.py --fault-report` checks.
+    oto recover-update
+        Finish or undo an app update that was interrupted (e.g. the Mac lost power mid-update),
+        and reopen Oto if it rolled back. Safe to run any time; does nothing if no update was
+        interrupted.
     oto --version | --help
 
 --tier takes standard (DeepFilterNet3, the default), light (RNNoise, the app's Low CPU
@@ -91,6 +95,7 @@ enum Cmd {
     Bench,
     Process,
     FaultCheck,
+    RecoverUpdate,
 }
 
 impl Cmd {
@@ -103,6 +108,7 @@ impl Cmd {
             "bench" => Cmd::Bench,
             "process" => Cmd::Process,
             "fault-check" => Cmd::FaultCheck,
+            "recover-update" => Cmd::RecoverUpdate,
             _ => return None,
         })
     }
@@ -116,6 +122,7 @@ impl Cmd {
             Cmd::Bench => "bench",
             Cmd::Process => "process",
             Cmd::FaultCheck => "fault-check",
+            Cmd::RecoverUpdate => "recover-update",
         }
     }
 
@@ -174,7 +181,7 @@ impl Cmd {
             Cmd::Bench => &BENCH,
             Cmd::Process => &PROCESS,
             Cmd::FaultCheck => &["json"],
-            Cmd::Devices | Cmd::Status => &[],
+            Cmd::Devices | Cmd::Status | Cmd::RecoverUpdate => &[],
         }
     }
 }
@@ -423,6 +430,7 @@ fn main() {
         Cmd::Bench => bench(args),
         Cmd::Process => process(args),
         Cmd::FaultCheck => fault_check(args),
+        Cmd::RecoverUpdate => recover_update(),
     };
     if let Err(e) = result {
         eprintln!("oto: {e}");
@@ -459,8 +467,43 @@ fn start_error(e: String) -> String {
         "Oto is already running (the app, or another `oto run`). Quit it first: two engines \
          would both feed Oto Microphone."
             .into()
+    } else if e == oto_engine::UPDATING {
+        "Oto is being updated. Wait for the update to finish (about a minute), or run \
+         `oto recover-update` if an update was interrupted."
+            .into()
     } else {
         e
+    }
+}
+
+/// `oto recover-update`: the same recovery the app runs at launch (see
+/// `oto_engine::update_recovery`), for when the app can't be opened.
+fn recover_update() -> Result<(), String> {
+    use oto_engine::update_recovery::{RecoveryMode, SystemOps, recover};
+    let paths = oto_engine::UpdatePaths::default_location()
+        .ok_or("couldn't find Oto's state directory (no home directory)")?;
+    let msg = recover_message(recover(&paths, &SystemOps, &RecoveryMode::Manual))?;
+    println!("{msg}");
+    Ok(())
+}
+
+fn recover_message(out: oto_engine::update_recovery::RecoveryOutcome) -> Result<String, String> {
+    use oto_engine::update_recovery::RecoveryOutcome as R;
+    match out {
+        R::NoTransaction => Ok("No interrupted update.".into()),
+        R::Resolved => Ok("The interrupted update was cleaned up.".into()),
+        R::Relaunched => Ok("The previous version of Oto was put back and reopened.".into()),
+        R::HelperRunning => Err("An update is in progress right now. Wait for it to finish \
+                                 (about a minute), then try again."
+            .into()),
+        R::Deferred(why) => Err(format!(
+            "The interrupted update can't be resolved yet: {why}. Quit Oto (Force Quit if it \
+             hangs) and try again."
+        )),
+        R::RelaunchFailed(e) => Err(format!(
+            "The previous version of Oto was put back, but couldn't be reopened ({e}). Open Oto \
+             yourself."
+        )),
     }
 }
 
@@ -524,6 +567,13 @@ fn run(a: Args) -> Result<(), String> {
                 Event::ClientsActive(false) => println!("no app is recording; idle"),
                 Event::DevicesChanged => println!("devices changed"),
                 Event::Error(e) => println!("error: {e}"),
+                Event::DriverIncompatible {
+                    loaded,
+                    min_required,
+                } => println!(
+                    "error: {} (needs revision {min_required} or later)",
+                    oto_engine::incompatible_driver_message(loaded)
+                ),
                 Event::Degraded(e) => println!("degraded: {e}"),
                 Event::Recovered => println!("recovered"),
                 Event::DegradedCleared => println!("degraded cleared"),
@@ -619,8 +669,19 @@ fn status() -> Result<(), String> {
     let s = oto_engine::status();
     println!(
         "driver installed: {}",
-        if s.driver_installed { "yes" } else { "no" }
+        if s.driver.is_loaded() { "yes" } else { "no" }
     );
+    match s.driver {
+        oto_engine::DriverStatus::Loaded(rev) if s.driver.is_compatible() => {
+            println!("driver revision: {rev}")
+        }
+        oto_engine::DriverStatus::Loaded(rev) => println!(
+            "driver revision: {rev} (too old: needs {} or later)",
+            oto_engine::MIN_COMPATIBLE_DRIVER_VERSION
+        ),
+        oto_engine::DriverStatus::Unknown => println!("driver revision: unknown"),
+        oto_engine::DriverStatus::Absent => {}
+    }
     let show = |label: &str, d: &Option<oto_engine::DeviceStatus>| match d {
         Some(d) => println!(
             "{label}: {} ({} Hz, {} ch){}",
@@ -646,8 +707,12 @@ fn status() -> Result<(), String> {
             d.id
         );
     }
-    if !s.driver_installed {
-        return Err("the Oto driver is not installed".into());
+    match s.driver {
+        oto_engine::DriverStatus::Loaded(rev) if !s.driver.is_compatible() => {
+            return Err(oto_engine::incompatible_driver_message(rev));
+        }
+        oto_engine::DriverStatus::Loaded(_) => {}
+        _ => return Err("the Oto driver is not installed".into()),
     }
     Ok(())
 }
@@ -822,6 +887,9 @@ impl Incidents {
     fn note(&mut self, e: Event) {
         match e {
             Event::Error(e) => self.errors.push(e),
+            Event::DriverIncompatible { loaded, .. } => self
+                .errors
+                .push(oto_engine::incompatible_driver_message(loaded)),
             Event::Degraded(e) => self.errors.push(format!("degraded: {e}")),
             Event::ModelFallback {
                 requested,
@@ -1503,5 +1571,33 @@ mod tests {
     fn already_running_gets_its_own_message() {
         assert!(start_error(oto_engine::ALREADY_RUNNING.into()).contains("Quit it first"));
         assert_eq!(start_error("boom".into()), "boom");
+    }
+
+    #[test]
+    fn updating_points_at_recover_update() {
+        let m = start_error(oto_engine::UPDATING.into());
+        assert!(m.contains("being updated"), "{m}");
+        assert!(m.contains("oto recover-update"), "{m}");
+    }
+
+    #[test]
+    fn recover_update_takes_no_flags_and_reports_outcomes() {
+        use oto_engine::update_recovery::RecoveryOutcome as R;
+        assert_eq!(args("recover-update").unwrap().0, Cmd::RecoverUpdate);
+        assert!(args("recover-update --json").is_err());
+        assert!(recover_message(R::NoTransaction).is_ok());
+        assert!(recover_message(R::Resolved).is_ok());
+        assert!(recover_message(R::Relaunched).is_ok());
+        assert!(recover_message(R::HelperRunning).is_err());
+        assert!(
+            recover_message(R::Deferred("x".into()))
+                .unwrap_err()
+                .contains("x")
+        );
+        assert!(
+            recover_message(R::RelaunchFailed("y".into()))
+                .unwrap_err()
+                .contains("y")
+        );
     }
 }
