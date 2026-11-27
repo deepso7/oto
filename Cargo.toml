@@ -11,7 +11,7 @@ members = [
 default-members = ["crates/oto-dsp", "crates/oto-engine", "crates/oto-cli"]
 
 [workspace.package]
-version = "0.0.5"
+version = "0.0.6"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 # Not on crates.io (oto-app needs git-only crates); releases are GitHub releases (release-plz.toml).
