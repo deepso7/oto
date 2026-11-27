@@ -2012,6 +2012,42 @@ mod tests {
     }
 
     #[test]
+    fn strength_pills_work_from_the_keyboard() {
+        use rune::{Key, KeyEvent, Mods};
+        let press = |rt: &mut Runtime<State>, key: Key| {
+            rt.key(KeyEvent {
+                key,
+                mods: Mods::default(),
+            });
+            rt.frame(1.0 / 60.0);
+        };
+        let focus = |rt: &Runtime<State>| {
+            rt.elements()
+                .into_iter()
+                .find(|e| e.focused)
+                .map(|e| e.path)
+                .unwrap_or_default()
+        };
+        let mut rt = runtime(installed());
+        // Tab reaches the group at its selected segment (Balanced).
+        for _ in 0..30 {
+            if focus(&rt).contains("strength-row") {
+                break;
+            }
+            press(&mut rt, Key::Tab);
+        }
+        assert!(focus(&rt).ends_with("segment1"), "focus: {}", focus(&rt));
+        // An arrow moves within the group; Space picks.
+        press(&mut rt, Key::Right);
+        assert!(focus(&rt).ends_with("segment2"), "focus: {}", focus(&rt));
+        press(&mut rt, Key::Text(" ".into()));
+        assert_eq!(rt.state.prefs.strength, Strength::Strong);
+        // Tab leaves the group rather than walking its segments.
+        press(&mut rt, Key::Tab);
+        assert!(!focus(&rt).contains("strength-row"), "focus: {}", focus(&rt));
+    }
+
+    #[test]
     fn onboarding_shows_without_the_driver_and_skips() {
         let mut rt = runtime(State::new(Prefs::default(), false));
         assert!(rt.find("onboarding").is_some());
