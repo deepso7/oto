@@ -420,8 +420,8 @@ impl SimState {
 }
 
 impl Platform for Sim {
-    fn driver_installed(&self) -> bool {
-        true
+    fn driver_status(&self) -> crate::DriverStatus {
+        crate::DriverStatus::Loaded(crate::BUNDLED_DRIVER_VERSION)
     }
     fn clients_active(&self) -> bool {
         true

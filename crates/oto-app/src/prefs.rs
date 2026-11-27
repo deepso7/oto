@@ -28,6 +28,13 @@ pub struct Prefs {
     pub system_microphone: bool,
     /// Setup was finished (or wasn't needed), so it isn't shown again while the driver is in.
     pub onboarded: bool,
+    /// Look for a new version in the background (20 s after launch, then once a day).
+    pub check_for_updates: bool,
+    /// "Skip This Version": background checks don't offer this version again. A manual check
+    /// still does.
+    pub skipped_version: Option<String>,
+    /// When the last successful update check finished, in seconds since the Unix epoch.
+    pub last_update_check: Option<u64>,
 }
 
 impl Default for Prefs {
@@ -42,6 +49,9 @@ impl Default for Prefs {
             start_at_login: false,
             system_microphone: false,
             onboarded: false,
+            check_for_updates: true,
+            skipped_version: None,
+            last_update_check: None,
         }
     }
 }
@@ -77,6 +87,7 @@ impl Prefs {
         flag("start_at_login", &mut p.start_at_login);
         flag("system_microphone", &mut p.system_microphone);
         flag("onboarded", &mut p.onboarded);
+        flag("check_for_updates", &mut p.check_for_updates);
         let mut string = |key: &str, into: &mut Option<String>| match table.get(key) {
             Some(toml::Value::String(s)) => *into = Some(s.clone()),
             Some(v) => bad(key, v),
@@ -84,6 +95,12 @@ impl Prefs {
         };
         string("input_device", &mut p.input_device);
         string("input_device_name", &mut p.input_device_name);
+        string("skipped_version", &mut p.skipped_version);
+        match table.get("last_update_check") {
+            Some(toml::Value::Integer(i)) if *i >= 0 => p.last_update_check = Some(*i as u64),
+            Some(v) => bad("last_update_check", v),
+            None => {}
+        }
         if let Some(v) = table.get("strength") {
             match v.as_str() {
                 Some("light") => p.strength = Strength::Light,
@@ -200,6 +217,9 @@ mod tests {
             start_at_login: true,
             system_microphone: true,
             onboarded: true,
+            check_for_updates: false,
+            skipped_version: Some("0.1.0".into()),
+            last_update_check: Some(1_790_000_000),
         };
         let src = p.to_toml();
         assert!(src.contains("strength = \"strong\""), "{src}");
@@ -282,6 +302,43 @@ mod tests {
             }
         );
         assert_eq!(warnings, ["start_at_login = \"yes\"", "tier = \"huge\""]);
+    }
+
+    #[test]
+    fn update_preferences_default_and_survive_bad_values() {
+        let d = Prefs::default();
+        assert!(d.check_for_updates);
+        assert_eq!((d.skipped_version, d.last_update_check), (None, None));
+        // Files from before updates existed check for updates.
+        let (p, w) = Prefs::parse("enabled = false\n");
+        assert!(p.check_for_updates && w.is_empty());
+        let (p, w) = Prefs::parse(
+            "check_for_updates = \"no\"\nskipped_version = 3\nlast_update_check = -5\n\
+             onboarded = true\n",
+        );
+        assert_eq!(
+            p,
+            Prefs {
+                onboarded: true,
+                ..Prefs::default()
+            }
+        );
+        assert_eq!(
+            w,
+            [
+                "check_for_updates = \"no\"",
+                "skipped_version = 3",
+                "last_update_check = -5"
+            ]
+        );
+        let (p, w) = Prefs::parse(
+            "check_for_updates = false\nskipped_version = \"1.2.3\"\nlast_update_check = 42\n",
+        );
+        assert!(w.is_empty());
+        assert!(!p.check_for_updates);
+        assert_eq!(p.skipped_version.as_deref(), Some("1.2.3"));
+        assert_eq!(p.last_update_check, Some(42));
+        assert_eq!(Prefs::parse(&p.to_toml()), (p, Vec::new()));
     }
 
     #[test]

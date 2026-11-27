@@ -12,8 +12,11 @@ use rune_kit::{
 use crate::meter::{BAR_H, BAR_W};
 use crate::permission::Mic;
 use crate::state::{
-    EngineState, HEAR_TEST, HearTest, Install, MODES, Open, Page, STRENGTHS, State,
+    DRIVER_PAUSE, DriverUiState, EngineState, HEAR_TEST, HearTest, Install, MODES, Open, Page,
+    STRENGTHS, State, UpdateState, install_mode_note, openable_url, update_driver_note,
 };
+use crate::updater::apply::InstallMode;
+use crate::updater::verify::UNRECOGNIZED_KEY_MESSAGE;
 
 pub const WIDTH: f32 = 340.0;
 const PAD: f32 = 16.0;
@@ -303,6 +306,226 @@ fn notice(p: &Paint, key: &str, c: &StateColors, msg: &str, action: Option<Actio
         );
     }
     r
+}
+
+/// A banner button: its key, label, action and whether it can be pressed now.
+type BannerButton = (&'static str, String, fn(&mut State), bool);
+
+/// A notice with a title line, an optional detail, a row of buttons and an optional dismiss:
+/// the update and driver banners.
+fn banner(
+    p: &Paint,
+    (key, c, urgent): (&str, &StateColors, bool),
+    msg: &str,
+    detail: Option<String>,
+    buttons: Vec<BannerButton>,
+    dismiss: Option<fn(&mut State)>,
+) -> El {
+    let mut head = row().w_full().gap(8.0).items_start().child(
+        text(msg.to_owned())
+            .key(format!("{key}-message"))
+            .font(LABEL)
+            .color(c.fg)
+            .wrap()
+            .grow(1.0)
+            .shrink(),
+    );
+    if let Some(f) = dismiss {
+        head = head.child(
+            IconButton::new(p.k.glyph.close)
+                .variant(IconButtonVariant::GhostMuted)
+                .control_size(ControlSize::Small)
+                .label("Dismiss")
+                .on_press(f)
+                .build(&p.k)
+                .key(format!("{key}-dismiss")),
+        );
+    }
+    let mut b = col()
+        .key(key)
+        .role(if urgent { "alert" } else { "status" })
+        .w_full()
+        .pl(12.0)
+        .pr(8.0)
+        .py(8.0)
+        .gap(6.0)
+        .radius(8.0)
+        .fill(c.bg)
+        .border(p.hair, c.border)
+        .child(head);
+    if let Some(d) = detail {
+        b = b.child(
+            text(d)
+                .key(format!("{key}-detail"))
+                .font(CAPTION)
+                .color(c.fg)
+                .wrap()
+                .w_full(),
+        );
+    }
+    if !buttons.is_empty() {
+        let mut r = row().key(format!("{key}-actions")).w_full().gap(8.0);
+        for (k, label, f, enabled) in buttons {
+            r = r.child(
+                Button::new(label)
+                    .control_size(ControlSize::Small)
+                    .disabled(!enabled)
+                    .on_press(f)
+                    .build(&p.k)
+                    .key(k),
+            );
+        }
+        b = b.child(r);
+    }
+    b
+}
+
+/// Notes joined into one detail line; `None` when there are none.
+fn notes<'a>(parts: impl IntoIterator<Item = Option<&'a str>>) -> Option<String> {
+    let v: Vec<&str> = parts.into_iter().flatten().collect();
+    (!v.is_empty()).then(|| v.join(" "))
+}
+
+/// The app update banner on the main page: an offer, its download, the restart, or a neutral
+/// note when the update couldn't be verified.
+fn update_banner(s: &State, p: &Paint) -> Option<El> {
+    let c = &p.k.c.info;
+    let self_updatable = matches!(s.install_mode, InstallMode::SelfUpdatable { .. });
+    let start: fn(&mut State) = |s| s.start_update();
+    let cancel: fn(&mut State) = |s| s.cancel_update();
+    Some(match &s.update {
+        UpdateState::Available(info) => {
+            let mode_note = (!self_updatable)
+                .then(|| install_mode_note(&s.install_mode))
+                .flatten();
+            let label = if self_updatable {
+                "Update\u{2026}"
+            } else {
+                "Download\u{2026}"
+            };
+            banner(
+                p,
+                ("update", c, false),
+                &format!("Oto {} is available.", info.version),
+                notes([update_driver_note(info, s.loaded_driver()), mode_note]),
+                vec![
+                    ("update-action", label.into(), start, !s.candidate_pending),
+                    (
+                        "update-skip",
+                        "Skip This Version".into(),
+                        |s| s.skip_update(),
+                        true,
+                    ),
+                ],
+                Some(|s| s.dismiss_update()),
+            )
+        }
+        UpdateState::Downloading { info, pct } => banner(
+            p,
+            ("update", c, false),
+            &format!("Downloading Oto {}\u{2026} {pct}%", info.version),
+            None,
+            vec![("update-cancel", "Cancel".into(), cancel, true)],
+            None,
+        ),
+        UpdateState::Verifying(info) => banner(
+            p,
+            ("update", c, false),
+            &format!("Verifying Oto {}\u{2026}", info.version),
+            None,
+            vec![("update-cancel", "Cancel".into(), cancel, true)],
+            None,
+        ),
+        UpdateState::Ready(staged) => {
+            let blocked = s.apply_blocked();
+            banner(
+                p,
+                ("update", c, false),
+                &format!("Oto {} is ready to install.", staged.info.version),
+                notes([blocked, update_driver_note(&staged.info, s.loaded_driver())]),
+                vec![(
+                    "update-action",
+                    "Restart to Update".into(),
+                    |s| s.restart_to_update(),
+                    blocked.is_none(),
+                )],
+                None,
+            )
+        }
+        UpdateState::Applying => banner(
+            p,
+            ("update", c, false),
+            "Restarting to update\u{2026}",
+            None,
+            Vec::new(),
+            None,
+        ),
+        UpdateState::UnrecognizedKey { .. } => banner(
+            p,
+            ("update", &p.k.c.info, false),
+            UNRECOGNIZED_KEY_MESSAGE,
+            None,
+            vec![("update-action", "Download\u{2026}".into(), start, true)],
+            Some(|s| s.dismiss_update()),
+        ),
+        _ => return None,
+    })
+}
+
+/// The driver banners of the state table: an update to offer (urgent when the loaded driver is
+/// too old), or a restart to finish one.
+fn driver_banner(s: &State, p: &Paint) -> Option<El> {
+    let ui = s.driver_ui();
+    if ui == DriverUiState::UpdateNeedsReboot {
+        return Some(notice(
+            p,
+            "driver-restart",
+            &p.k.c.info,
+            "Restart your Mac to finish updating the audio driver.",
+            None,
+        ));
+    }
+    if !ui.offers_update() {
+        return None;
+    }
+    let blocked = s.install_blocked();
+    let outcome = match &s.install {
+        Install::Failed(m) | Install::Notice(m) => Some(m.as_str()),
+        _ => None,
+    };
+    let (key, c, urgent, msg) = if ui == DriverUiState::Incompatible {
+        (
+            "driver-incompatible",
+            &p.k.c.warning,
+            true,
+            "Oto\u{2019}s audio driver is too old for this version of Oto, so Oto Microphone is off until you update it.",
+        )
+    } else {
+        (
+            "driver-update",
+            &p.k.c.info,
+            false,
+            "Audio driver update available. Asks for your password; audio will pause briefly in all apps.",
+        )
+    };
+    let label = if s.install == Install::Running {
+        "Updating\u{2026}"
+    } else {
+        "Update Driver\u{2026}"
+    };
+    Some(banner(
+        p,
+        (key, c, urgent),
+        msg,
+        notes([outcome, blocked]),
+        vec![(
+            "driver-update-action",
+            label.into(),
+            |s| s.start_install(),
+            !s.install.busy() && blocked.is_none(),
+        )],
+        None,
+    ))
 }
 
 /// Microphone access, when Oto doesn't have it: without it macOS feeds Oto silence.
@@ -654,6 +877,12 @@ fn main_page(s: &State, p: &Paint, layer: &mut Vec<El>) -> El {
     } else if let Some(n) = mic_notice(s, p) {
         page = page.child(n);
     }
+    if let Some(b) = driver_banner(s, p) {
+        page = page.child(b);
+    }
+    if let Some(b) = update_banner(s, p) {
+        page = page.child(b);
+    }
     if on && let Some(msg) = &s.degraded {
         page = page.child(degraded_banner(
             p,
@@ -880,32 +1109,76 @@ fn settings_page(s: &State, p: &Paint, layer: &mut Vec<El>) -> El {
         );
 
     let busy = s.install.busy();
-    let install = Button::new(match (&s.install, s.driver_installed || s.driver_on_disk) {
-        (Install::Running, _) => "Installing\u{2026}",
-        (_, true) => "Reinstall\u{2026}",
-        (_, false) => "Install\u{2026}",
-    })
-    .disabled(busy)
-    .on_press(|s: &mut State| s.start_install())
-    .build(&p.k)
-    .key("install");
-    let mut driver = card(p, "driver").child(field_row(
-        p,
-        "driver-row",
-        match (s.driver_installed, s.driver_on_disk) {
-            (true, _) => "Audio driver installed",
-            (false, true) => "Audio driver needs a restart",
-            (false, false) => "Audio driver not installed",
-        },
-        install,
-    ));
+    let blocked = s.install_blocked();
+    let ui = s.driver_ui();
+    let present = s.driver_installed || s.driver_on_disk;
+    let (driver_label, driver_about) = match ui {
+        DriverUiState::NotInstalled => ("Audio driver not installed", None),
+        DriverUiState::InstalledNeedsReboot => ("Audio driver needs a restart", None),
+        DriverUiState::UpToDate | DriverUiState::NewerLoaded => ("Audio driver installed", None),
+        DriverUiState::OnDiskOutdatedOrMissing => (
+            "Audio driver needs repair",
+            Some(
+                "The copy on disk is missing or outdated. Reinstall to keep Oto Microphone after a restart.",
+            ),
+        ),
+        DriverUiState::UpdateAvailable => ("Audio driver update available", None),
+        DriverUiState::Incompatible => ("Audio driver needs an update", None),
+        DriverUiState::UpdateNeedsReboot => (
+            "Audio driver update needs a restart",
+            Some("Restart your Mac to finish updating the audio driver."),
+        ),
+        DriverUiState::RemovedNeedsReboot => (
+            "Audio driver removed",
+            Some("Restart your Mac to finish removing the driver."),
+        ),
+        DriverUiState::Unknown if present => ("Audio driver installed", None),
+        DriverUiState::Unknown => ("Audio driver not installed", None),
+    };
+    let driver_row = if s.newer_driver_present() {
+        row().key("driver-row").w_full().h(40.0).center_y().child(
+            text(driver_label)
+                .key("label")
+                .font(BODY)
+                .color(p.t.text)
+                .shrink(),
+        )
+    } else {
+        let install = Button::new(match &s.install {
+            Install::Running if ui.offers_update() => "Updating\u{2026}",
+            Install::Running => "Installing\u{2026}",
+            _ if ui.offers_update() => "Update\u{2026}",
+            _ if present => "Reinstall\u{2026}",
+            _ => "Install\u{2026}",
+        })
+        .disabled(busy || blocked.is_some())
+        .on_press(|s: &mut State| s.start_install())
+        .build(&p.k)
+        .key("install");
+        field_row(p, "driver-row", driver_label, install)
+    };
+    let mut driver = card(p, "driver").child(driver_row);
+    // An install's own result says what's left to do.
+    let about = if matches!(s.install, Install::Notice(_)) {
+        None
+    } else {
+        driver_about
+    };
+    driver = driver.child(
+        caption(
+            p,
+            "driver-about",
+            notes([about, blocked.or(Some(DRIVER_PAUSE))]).unwrap_or_default(),
+        )
+        .pb(8.0),
+    );
     if s.driver_installed || s.driver_on_disk {
         let uninstall = Button::new(if s.install == Install::Removing {
             "Removing\u{2026}"
         } else {
             "Uninstall\u{2026}"
         })
-        .disabled(busy)
+        .disabled(busy || blocked.is_some())
         .on_press(|s: &mut State| s.start_uninstall())
         .build(&p.k)
         .key("uninstall");
@@ -949,6 +1222,7 @@ fn settings_page(s: &State, p: &Paint, layer: &mut Vec<El>) -> El {
         .child(header(p, "Settings", Some(back), None))
         .children(models_card(s, p, layer))
         .child(general)
+        .child(updates_card(s, p))
         .child(driver);
     if let Some(e) = &s.error {
         page = page.child(error_banner(p, e, |s| s.dismiss_error()));
@@ -959,13 +1233,7 @@ fn settings_page(s: &State, p: &Paint, layer: &mut Vec<El>) -> El {
             .w_full()
             .pl(4.0)
             .center_y()
-            .justify_between()
-            .child(
-                text(concat!("Oto ", env!("CARGO_PKG_VERSION")))
-                    .key("version")
-                    .font(CAPTION)
-                    .color(p.t.text_secondary),
-            )
+            .justify_end()
             .child(
                 Button::new("Quit Oto")
                     .variant(ButtonVariant::Ghost)
@@ -977,6 +1245,112 @@ fn settings_page(s: &State, p: &Paint, layer: &mut Vec<El>) -> El {
                     .key("quit"),
             ),
     )
+}
+
+/// Settings' Updates card: automatic checks, the version with the one button that moves the
+/// update on, what's happening, and the release notes.
+fn updates_card(s: &State, p: &Paint) -> El {
+    let auto = small_switch(
+        p,
+        "auto-update",
+        "Check for updates automatically",
+        s.prefs.check_for_updates,
+        !s.candidate_pending,
+        |s| s.set_check_for_updates(!s.prefs.check_for_updates),
+    );
+    let self_updatable = matches!(s.install_mode, InstallMode::SelfUpdatable { .. });
+    let noop: fn(&mut State) = |_| {};
+    let (label, action, enabled): (&str, fn(&mut State), bool) = match &s.update {
+        UpdateState::Checking { .. } => ("Checking\u{2026}", noop, false),
+        UpdateState::Available(_) if self_updatable => {
+            ("Update\u{2026}", |s| s.start_update(), !s.candidate_pending)
+        }
+        UpdateState::Available(_) | UpdateState::UnrecognizedKey { .. } => {
+            ("Download\u{2026}", |s| s.start_update(), true)
+        }
+        UpdateState::Downloading { .. } | UpdateState::Verifying(_) => {
+            ("Cancel", |s| s.cancel_update(), true)
+        }
+        UpdateState::Ready(_) => (
+            "Restart to Update",
+            |s| s.restart_to_update(),
+            s.apply_blocked().is_none(),
+        ),
+        UpdateState::Applying => ("Restarting\u{2026}", noop, false),
+        _ => (
+            "Check for Updates",
+            |s| s.check_for_updates(true),
+            !s.candidate_pending,
+        ),
+    };
+    let button = Button::new(label)
+        .control_size(ControlSize::Small)
+        .disabled(!enabled)
+        .on_press(action)
+        .build(&p.k)
+        .key("update-button");
+    let mode_note = install_mode_note(&s.install_mode);
+    let status: Option<String> = match &s.update {
+        UpdateState::Idle => mode_note.map(str::to_owned),
+        UpdateState::Checking { .. } => Some("Checking\u{2026}".into()),
+        UpdateState::UpToDate => Some("Up to date".into()),
+        UpdateState::Available(i) => notes([
+            Some(format!("Oto {} is available.", i.version).as_str()),
+            (!self_updatable).then_some(mode_note).flatten(),
+        ]),
+        UpdateState::Downloading { pct, .. } => Some(format!("Downloading {pct}%\u{2026}")),
+        UpdateState::Verifying(_) => Some("Verifying\u{2026}".into()),
+        UpdateState::Ready(_) => notes([Some("Ready to install."), s.apply_blocked()]),
+        UpdateState::Applying => Some("Restarting\u{2026}".into()),
+        UpdateState::UnrecognizedKey { .. } => Some(UNRECOGNIZED_KEY_MESSAGE.into()),
+        UpdateState::IncompatibleOs { version, min_os } => {
+            Some(format!("Oto {version} needs macOS {min_os} or later."))
+        }
+        UpdateState::Failed(e) => Some(e.clone()),
+    };
+    let mut c = card(p, "updates")
+        .child(field_row(
+            p,
+            "auto-update-row",
+            "Check for updates automatically",
+            auto,
+        ))
+        .child(separator(p, "sep-updates"))
+        .child(field_row(
+            p,
+            "update-row",
+            concat!("Oto ", env!("CARGO_PKG_VERSION")),
+            button,
+        ));
+    if let Some(msg) = status {
+        let failed = matches!(s.update, UpdateState::Failed(_));
+        c = c.child(
+            text(msg)
+                .key("update-status")
+                .font(CAPTION)
+                .color(if failed {
+                    p.k.c.danger.fg
+                } else {
+                    p.t.text_secondary
+                })
+                .wrap()
+                .w_full()
+                .pb(8.0),
+        );
+    }
+    if let Some(info) = s.update.info().filter(|i| openable_url(&i.notes_url)) {
+        c = c.child(
+            row().w_full().pb(8.0).child(
+                Button::new(format!("Release Notes for {}", info.version))
+                    .variant(ButtonVariant::Ghost)
+                    .control_size(ControlSize::Small)
+                    .on_press(|s: &mut State| s.open_release_notes())
+                    .build(&p.k)
+                    .key("release-notes"),
+            ),
+        );
+    }
+    c
 }
 
 /// One setup step: a numbered badge that turns into a tick when the step is really done.
@@ -1044,7 +1418,7 @@ fn onboarding(s: &State, p: &Paint) -> El {
             } else if restart {
                 "Installed. Restart your Mac to finish."
             } else {
-                "Adds \u{201c}Oto Microphone\u{201d}. Asks for your password; sound pauses for a second."
+                "Adds \u{201c}Oto Microphone\u{201d}. Asks for your password. Audio will pause briefly in all apps (or finish on your next restart if audio is playing)."
             },
             s.driver_installed,
             None,
@@ -1077,9 +1451,13 @@ fn onboarding(s: &State, p: &Paint) -> El {
             Some(system_mic),
         ));
 
+    type NextAction = (&'static str, bool, fn(&mut State));
+    let newer_on_disk = !s.driver_installed && s.newer_driver_present();
     // The one button that moves setup on: whichever step is next.
-    let (label, enabled, next): (&str, bool, fn(&mut State)) = if !s.driver_installed {
-        (
+    let next_action: Option<NextAction> = if newer_on_disk {
+        None
+    } else if !s.driver_installed {
+        Some((
             match (&s.install, restart) {
                 (Install::Running, _) => "Installing\u{2026}",
                 (_, true) => "Install Again",
@@ -1087,13 +1465,13 @@ fn onboarding(s: &State, p: &Paint) -> El {
             },
             !s.install.busy(),
             |s| s.start_install(),
-        )
+        ))
     } else {
-        match s.mic {
+        Some(match s.mic {
             Mic::NotDetermined => ("Allow Microphone", !s.mic_requesting, |s| s.allow_mic()),
             Mic::Denied => ("Open Settings", true, |s| s.allow_mic()),
             Mic::Authorized | Mic::Restricted => ("Done", true, |s| s.leave_onboarding()),
-        }
+        })
     };
 
     let mut page = col()
@@ -1125,6 +1503,13 @@ fn onboarding(s: &State, p: &Paint) -> El {
         Install::Notice(msg) => page = page.child(notice(p, "restart", &p.k.c.info, msg, None)),
         _ => {}
     }
+    if newer_on_disk && !matches!(s.install, Install::Notice(_)) {
+        let msg = format!(
+            "A newer Oto audio driver is installed. {}",
+            crate::driver::REBOOT_MESSAGE
+        );
+        page = page.child(notice(p, "restart", &p.k.c.info, &msg, None));
+    }
     if let EngineState::Failed(msg) = &s.engine {
         page = page.child(engine_card(p, msg));
     }
@@ -1138,7 +1523,7 @@ fn onboarding(s: &State, p: &Paint) -> El {
         .pt(4.0)
         .center_y()
         .justify_between();
-    actions = if label == "Done" {
+    actions = if matches!(next_action, Some(("Done", _, _))) {
         // Nothing left to put off.
         actions.child(el().key("no-skip").a11y_hidden())
     } else {
@@ -1151,8 +1536,8 @@ fn onboarding(s: &State, p: &Paint) -> El {
                 .key("skip"),
         )
     };
-    page.child(
-        actions.child(
+    if let Some((label, enabled, next)) = next_action {
+        actions = actions.child(
             Button::new(label)
                 .variant(ButtonVariant::Contrast)
                 .control_size(ControlSize::Large)
@@ -1160,8 +1545,9 @@ fn onboarding(s: &State, p: &Paint) -> El {
                 .on_press(next)
                 .build(&p.k)
                 .key("next"),
-        ),
-    )
+        );
+    }
+    page.child(actions)
 }
 
 #[cfg(test)]
@@ -1208,7 +1594,7 @@ mod tests {
             .into_iter()
             .filter_map(|r| match r {
                 Request::Cmd(c) => Some(c),
-                Request::SystemMic(_) => None,
+                _ => None,
             })
             .collect()
     }
@@ -1290,11 +1676,11 @@ mod tests {
         click(&mut rt, "next");
         assert_eq!(INSTALLS.load(Ordering::Relaxed), 1);
         assert_eq!(rt.state.install, Install::Running);
-        let probe = crate::state::Probe {
-            driver: true,
-            on_disk: true,
-            mic: Mic::NotDetermined,
-        };
+        let probe = crate::state::Probe::new(
+            oto_engine::DriverStatus::Loaded(oto_engine::BUNDLED_DRIVER_VERSION),
+            Some(oto_engine::BUNDLED_DRIVER_VERSION),
+            Mic::NotDetermined,
+        );
         rt.update(|s, _| s.installed(crate::driver::Outcome::Installed, probe));
         rt.frame(1.0 / 60.0);
         // Step two: the permission. Setup is still up.
@@ -1547,5 +1933,255 @@ mod tests {
         assert!(rt.find("uninstall").is_none());
         click(&mut rt, "driver-missing-action");
         assert!(rt.find("onboarding").is_some());
+    }
+
+    fn offer(version: &str) -> crate::updater::verify::UpdateInfo {
+        crate::updater::verify::UpdateInfo {
+            version: version.into(),
+            notes_url: format!("https://github.com/deepso7/oto/releases/tag/v{version}"),
+            asset_url: String::new(),
+            sha256: String::new(),
+            size: 1,
+            min_os: "13.0".into(),
+            driver_version: oto_engine::BUNDLED_DRIVER_VERSION,
+            min_driver_version: oto_engine::MIN_COMPATIBLE_DRIVER_VERSION,
+            published_at: String::new(),
+        }
+    }
+
+    fn updatable() -> State {
+        let mut s = installed();
+        s.install_mode = InstallMode::SelfUpdatable {
+            bundle: "/Applications/Oto.app".into(),
+        };
+        s
+    }
+
+    #[test]
+    fn the_update_banner_downloads_skips_and_dismisses() {
+        static DOWNLOADS: AtomicUsize = AtomicUsize::new(0);
+        let mut s = updatable();
+        s.hooks.download_update = |_, _| {
+            DOWNLOADS.fetch_add(1, Ordering::Relaxed);
+        };
+        s.update = UpdateState::Available(offer("9.0.0"));
+        let mut rt = runtime(s);
+        assert!(rt.find("update").is_some());
+        click(&mut rt, "update-action");
+        assert_eq!(DOWNLOADS.load(Ordering::Relaxed), 1);
+        assert!(rt.find("update-cancel").is_some());
+        click(&mut rt, "update-cancel");
+        assert_eq!(rt.state.update, UpdateState::Available(offer("9.0.0")));
+        click(&mut rt, "update-skip");
+        assert_eq!(rt.state.prefs.skipped_version.as_deref(), Some("9.0.0"));
+        assert!(rt.find("update").is_none());
+
+        let mut s = updatable();
+        s.update = UpdateState::Available(offer("9.0.0"));
+        let mut rt = runtime(s);
+        click(&mut rt, "update-dismiss");
+        assert_eq!(rt.state.update, UpdateState::Idle);
+        assert_eq!(rt.state.prefs.skipped_version, None);
+    }
+
+    #[test]
+    fn restart_to_update_waits_for_the_call_to_end() {
+        static APPLIES: AtomicUsize = AtomicUsize::new(0);
+        let mut s = updatable();
+        s.hooks.apply_update = |_, _, _| {
+            APPLIES.fetch_add(1, Ordering::Relaxed);
+        };
+        s.update = UpdateState::Ready(crate::updater::verify::StagedUpdate::unowned(
+            offer("9.0.0"),
+            "/tmp/Oto.app".into(),
+            "/tmp".into(),
+        ));
+        s.on_event(oto_engine::Event::ClientsActive(true));
+        let mut rt = runtime(s);
+        assert!(rt.find("update-detail").is_some());
+        click(&mut rt, "update-action");
+        assert_eq!(APPLIES.load(Ordering::Relaxed), 0);
+        rt.update(|s, _| s.on_event(oto_engine::Event::ClientsActive(false)));
+        rt.frame(1.0 / 60.0);
+        click(&mut rt, "update-action");
+        assert_eq!(APPLIES.load(Ordering::Relaxed), 1);
+        assert_eq!(rt.state.update, UpdateState::Applying);
+    }
+
+    #[test]
+    fn copies_that_cant_update_themselves_offer_the_download() {
+        static OPENED: AtomicUsize = AtomicUsize::new(0);
+        let mut s = installed();
+        s.install_mode =
+            InstallMode::NotifyOnly(crate::updater::apply::NotifyReason::NotInApplications);
+        s.hooks.open_url = |u| {
+            assert!(u.starts_with("https://github.com/deepso7/oto/releases"));
+            OPENED.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        };
+        s.update = UpdateState::Available(offer("9.0.0"));
+        let mut rt = runtime(s);
+        assert!(rt.find("update-detail").is_some(), "the install-mode note");
+        click(&mut rt, "update-action");
+        assert_eq!(OPENED.load(Ordering::Relaxed), 1);
+
+        rt.update(|s, _| {
+            s.update = UpdateState::UnrecognizedKey {
+                releases_url: crate::updater::keys::RELEASES_URL.into(),
+            }
+        });
+        rt.frame(1.0 / 60.0);
+        click(&mut rt, "update-action");
+        assert_eq!(OPENED.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn the_driver_update_banner_installs_but_not_mid_call() {
+        static INSTALLS: AtomicUsize = AtomicUsize::new(0);
+        let mut s = installed();
+        s.hooks.install = || {
+            INSTALLS.fetch_add(1, Ordering::Relaxed);
+        };
+        // A legacy (pre-'otvr') driver: loaded, but too old for this build.
+        s.on_event(oto_engine::Event::DriverIncompatible {
+            loaded: 0,
+            min_required: oto_engine::MIN_COMPATIBLE_DRIVER_VERSION,
+        });
+        s.on_disk_version = Some(0);
+        assert_eq!(s.driver_ui(), crate::state::DriverUiState::Incompatible);
+        assert_eq!(s.error, None);
+        s.on_event(oto_engine::Event::ClientsActive(true));
+        let mut rt = runtime(s);
+        assert!(rt.find("driver-incompatible").is_some());
+        click(&mut rt, "driver-update-action");
+        assert_eq!(INSTALLS.load(Ordering::Relaxed), 0);
+        rt.update(|s, _| s.on_event(oto_engine::Event::ClientsActive(false)));
+        rt.frame(1.0 / 60.0);
+        click(&mut rt, "driver-update-action");
+        assert_eq!(INSTALLS.load(Ordering::Relaxed), 1);
+        assert_eq!(rt.state.install, Install::Running);
+        // Installed, but finishing on the next restart: the banner says so.
+        let p = crate::state::Probe::new(
+            oto_engine::DriverStatus::Loaded(0),
+            Some(oto_engine::BUNDLED_DRIVER_VERSION),
+            Mic::Authorized,
+        );
+        rt.update(move |s, _| s.installed(crate::driver::Outcome::InstalledNeedsReboot, p));
+        rt.frame(1.0 / 60.0);
+        assert!(rt.find("driver-restart").is_some());
+        assert!(rt.find("driver-update-action").is_none());
+    }
+
+    #[test]
+    fn the_updates_card_checks_and_shows_release_notes() {
+        static CHECKS: AtomicUsize = AtomicUsize::new(0);
+        let mut s = updatable();
+        s.page = Page::Settings;
+        s.hooks.check_update = |_| {
+            CHECKS.fetch_add(1, Ordering::Relaxed);
+        };
+        let mut rt = runtime(s);
+        assert!(rt.find("release-notes").is_none());
+        click(&mut rt, "auto-update");
+        assert!(!rt.state.prefs.check_for_updates);
+        click(&mut rt, "update-button");
+        assert_eq!(CHECKS.load(Ordering::Relaxed), 1);
+        assert!(rt.find("update-status").is_some(), "Checking…");
+        click(&mut rt, "update-button");
+        assert_eq!(CHECKS.load(Ordering::Relaxed), 1, "disabled while checking");
+        let g = rt.state.update_generation();
+        rt.update(move |s, _| {
+            s.update_checked(
+                g,
+                Ok(crate::updater::verify::CheckOutcome::Available(offer(
+                    "9.0.0",
+                ))),
+            )
+        });
+        rt.frame(1.0 / 60.0);
+        assert!(rt.find("release-notes").is_some());
+    }
+
+    #[test]
+    fn settings_hides_reinstall_when_a_newer_driver_is_loaded() {
+        let cases = [
+            (
+                oto_engine::DriverStatus::Loaded(oto_engine::BUNDLED_DRIVER_VERSION + 1),
+                None,
+            ),
+            (
+                oto_engine::DriverStatus::Loaded(oto_engine::BUNDLED_DRIVER_VERSION),
+                Some(oto_engine::BUNDLED_DRIVER_VERSION + 1),
+            ),
+            (
+                oto_engine::DriverStatus::Loaded(
+                    oto_engine::BUNDLED_DRIVER_VERSION.saturating_sub(1),
+                ),
+                Some(oto_engine::BUNDLED_DRIVER_VERSION + 1),
+            ),
+        ];
+        for (loaded, on_disk) in cases {
+            let mut s = installed();
+            s.page = Page::Settings;
+            s.probed(crate::state::Probe::new(loaded, on_disk, Mic::Authorized));
+            let rt = runtime(s);
+            assert!(rt.find("driver-row").is_some(), "{loaded:?} / {on_disk:?}");
+            assert!(
+                rt.find("install").is_none(),
+                "never offer a downgrade for {loaded:?} / {on_disk:?}"
+            );
+            assert!(rt.find("uninstall").is_some(), "{loaded:?} / {on_disk:?}");
+        }
+    }
+
+    #[test]
+    fn onboarding_shows_restart_guidance_instead_of_install_when_newer_driver_is_on_disk() {
+        let mut s = State::new(Prefs::default(), false);
+        s.probed(crate::state::Probe::new(
+            oto_engine::DriverStatus::Absent,
+            Some(oto_engine::BUNDLED_DRIVER_VERSION + 1),
+            Mic::Authorized,
+        ));
+        assert!(s.onboarding());
+        assert!(s.newer_driver_present());
+        let rt = runtime(s);
+        assert!(rt.find("onboarding").is_some());
+        assert!(rt.find("restart").is_some());
+        assert!(
+            rt.find("next").is_none(),
+            "no Install Again downgrade button"
+        );
+        assert!(rt.find("skip").is_some());
+
+        // Even when an install error arrived before the follow-up probe confirmed the newer driver
+        // on disk, both the error banner and the restart guidance show while the install button
+        // stays hidden.
+        let mut s2 = State::new(Prefs::default(), false);
+        s2.installed(
+            crate::driver::Outcome::Failed("A newer Oto audio driver is already installed.".into()),
+            crate::state::Probe::new(
+                oto_engine::DriverStatus::Absent,
+                Some(oto_engine::BUNDLED_DRIVER_VERSION + 1),
+                Mic::Authorized,
+            ),
+        );
+        let rt2 = runtime(s2);
+        assert!(rt2.find("error").is_some());
+        assert!(rt2.find("restart").is_some());
+        assert!(rt2.find("next").is_none());
+    }
+
+    #[test]
+    fn hear_the_difference_waits_for_the_update_to_commit() {
+        let mut s = installed();
+        s.candidate_pending = true;
+        s.hooks.start_hear_test = |_| panic!("blocked until the update commits");
+        let mut rt = runtime(s);
+        click(&mut rt, "hear-start");
+        assert_eq!(
+            rt.state.hear_blocked(),
+            Some(crate::state::FINISHING_UPDATE)
+        );
+        assert_eq!(rt.state.hear, HearTest::Idle);
     }
 }

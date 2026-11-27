@@ -11,7 +11,8 @@
 - **`oto-cli`**: `oto run | devices | status | latency | bench`.
 - **`oto-app`**: Rune menu-bar app with a status item via `tray-icon`, a popover, strength and device controls, meters and settings. The status line shows the running model and its latency. Onboarding has three real steps: install the driver, allow the microphone, and optionally use Oto as the system microphone. The popover has a Model picker (DeepFilterNet3, DPDFNet-2, FastEnhancer-S, RNNoise), shown only when the build has more than one model; a switch during a call fades out for 10 ms and reloads the model before stopping the streams.
 - **Driver install from the app**: the app installs only the prebuilt driver inside its own bundle (or the repo build in debug builds), checks its signature, and runs a fixed command sequence as root. It never runs a script or a build as root. Settings can uninstall it.
-- **App bundle**: `scripts/macos/bundle.sh` builds `target/bundle/Oto.app` with the microphone usage description, the driver and `THIRD_PARTY_NOTICES.md` inside. 38 MB unpacked, 22.5 MB zipped (20 MB before DeepFilterNet3); a clean release build of the app takes 231 s (160 s without `dfn3`). Start at login registers the bundle and is unavailable when running outside one.
+- **App bundle**: `scripts/macos/bundle.sh` builds `target/bundle/Oto.app` with the microphone usage description, the driver, `Contents/Helpers/oto-hal-helper`, and `THIRD_PARTY_NOTICES.md` inside. With `OTO_FEATURES=dfn3,onnx` (arm64, including the updater): 67 MB unpacked, 39 MB zipped (`ditto` → `oto-sign extract-verify` round-trip verified); a clean release build of the app takes ~212 s. Start at login registers the bundle and is unavailable when running outside one.
+- **App and driver update flow** ([plan 0003](plans/0003-app-updates.md)): decoupled HAL driver revision (`driver/macos/DRIVER_VERSION`, `'otvr'` `CFStringRef` custom property on `Oto Microphone`, engine-enforced `DriverStatus` compatibility, kernel-locked `oto-hal-helper` with atomic `renamex_np` swap and post-auth non-root `--check-audio-idle`), shared `oto-sign` crate (single Ed25519-signed envelope + bounded Rust ZIP extractor), draft-then-publish CI pipeline (`.github/workflows/macos-release.yml` + `macos-pr-check.yml`), ephemeral `NSURLSession` updater, atomic `renamex_np` bundle swap + single-writer commit/rollback + `oto recover-update`, and Rune UI/tray controls (`Updates` card, banners, driver-state notices). Pending before first live release: generating the offline Ed25519 keypair into `TRUSTED_KEYS` + GitHub `release` environment, enabling Immutable Releases + `v*` tag ruleset, wiring `deepso7/homebrew-oto`, and manual E2E runs on exported Developer ID builds.
 
 Measured on an M2 Pro running macOS 27.0.1, 11 Nov 2026:
 - **Latency** (`oto latency --no-denoise`, 48 kHz mics): DeepFilterNet3 62.6 ms on a USB mic (Elgato Wave:1) and 60.8 ms on the built-in mic; Low CPU mode 35.4 ms and 34.3 ms.
@@ -25,7 +26,7 @@ Not done yet:
 - "Hear the difference" test, and a listening comparison of the two modes with a real TV recording.
 - Which apps are using Oto Microphone (only "in use" is shown).
 - Live checks for unplug, sleep and Bluetooth mics.
-- Shortcut, updater, Linux.
+- Shortcut, Linux, and live macOS E2E verification of the updater and Homebrew tap (plus generating the offline Ed25519 update signing key).
 
 ```bash
 cargo test

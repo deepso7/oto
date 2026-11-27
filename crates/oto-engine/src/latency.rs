@@ -167,7 +167,7 @@ pub fn measure_with_stimulus(
     stimulus: Stimulus,
 ) -> Result<LatencyReport, String> {
     let uids = opts.uids();
-    if !sys::driver_installed(&uids) {
+    if !matches!(sys::driver_status(&uids), crate::DriverStatus::Loaded(_)) {
         return Err("Oto driver is not installed (Oto Microphone / Oto Sink not found)".into());
     }
     let period_s = stimulus.period_s();
@@ -225,6 +225,9 @@ pub fn measure_with_stimulus(
         for e in engine.try_events() {
             match e {
                 Event::Error(e) => errors.push(e),
+                Event::DriverIncompatible { loaded, .. } => {
+                    errors.push(crate::incompatible_driver_message(loaded))
+                }
                 Event::Degraded(e) => errors.push(format!("degraded: {e}")),
                 Event::ModelFallback {
                     requested,

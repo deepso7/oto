@@ -2,8 +2,8 @@
 //! 60 Hz and publishes bar rects through Rune `Live` values, which redraw without re-running the
 //! view. It never touches the audio callback, and sleeps while nothing would show.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 use oto_engine::Levels;
@@ -76,8 +76,9 @@ pub fn ballistics(shown_db: f32, new_db: f32, dt: f32) -> f32 {
 }
 
 /// Polls `levels` into `meter` while `visible()` and the meter is active; otherwise empties the
-/// bars once and naps.
-pub fn spawn(levels: Arc<Levels>, meter: Meter, visible: impl Fn() -> bool + Send + 'static) {
+/// bars once and naps. Ends once the engine owning `levels` is gone, so a restarted engine's
+/// meter doesn't race the old one's.
+pub fn spawn(levels: Weak<Levels>, meter: Meter, visible: impl Fn() -> bool + Send + 'static) {
     let _ = std::thread::Builder::new()
         .name("oto-meter".into())
         .spawn(move || {
@@ -85,6 +86,10 @@ pub fn spawn(levels: Arc<Levels>, meter: Meter, visible: impl Fn() -> bool + Sen
             let (mut raw, mut clean) = (FLOOR_DB, FLOOR_DB);
             let mut last = Instant::now();
             loop {
+                let Some(levels) = levels.upgrade() else {
+                    meter.show(FLOOR_DB, FLOOR_DB);
+                    return;
+                };
                 if !meter.active.load(Ordering::Relaxed) || !visible() {
                     if raw > FLOOR_DB || clean > FLOOR_DB {
                         (raw, clean) = (FLOOR_DB, FLOOR_DB);

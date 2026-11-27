@@ -19,12 +19,12 @@ use oto_dsp::Chain;
 use rtrb::RingBuffer;
 
 use super::{HalEvent, Platform, Uids};
-use crate::InputDevice;
 use crate::control::Msg;
 use crate::pipeline::{
     CaptureStage, DspSetup, DspThread, MAX_BLOCK, OutputStage, RING_CAPACITY, Shared,
     clamp_io_frames, downmix, estimate_latency_s, placement_for, scaled_io_frames, target_fill,
 };
+use crate::{DriverStatus, InputDevice};
 
 /// IO buffer we ask the mic for, in frames at 48 kHz (5.3 ms; leaves room for model inference).
 /// Scaled to the device's rate, so the duration stays the same.
@@ -119,6 +119,35 @@ fn get_string(obj: AudioObjectID, sel: u32) -> Option<String> {
     Some(out)
 }
 
+/// A CFString property with its status. `Ok(None)` if the call succeeded but returned NULL.
+/// The caller owns (and must `CFRelease`) the returned string.
+fn get_cfstring_checked(obj: AudioObjectID, sel: u32) -> Result<Option<CFStringRef>, OSStatus> {
+    let a = addr(sel, kAudioObjectPropertyScopeGlobal);
+    let mut v: CFStringRef = ptr::null();
+    let mut size = size_of::<CFStringRef>() as u32;
+    let st = unsafe {
+        AudioObjectGetPropertyData(obj, &a, 0, ptr::null(), &mut size, (&raw mut v).cast())
+    };
+    if st != 0 {
+        return Err(st);
+    }
+    Ok((!v.is_null()).then_some(v))
+}
+
+/// A CFString property as a Rust string, releasing the CFString.
+fn get_string_checked(obj: AudioObjectID, sel: u32) -> Result<Option<String>, OSStatus> {
+    Ok(get_cfstring_checked(obj, sel)?.map(|s| {
+        let out = cf_to_string(s);
+        unsafe { CFRelease(s) };
+        out
+    }))
+}
+
+fn has_property(obj: AudioObjectID, sel: u32) -> bool {
+    let a = addr(sel, kAudioObjectPropertyScopeGlobal);
+    unsafe { AudioObjectHasProperty(obj, &a) != 0 }
+}
+
 fn get_ptr(obj: AudioObjectID, sel: u32) -> Option<CFStringRef> {
     let a = addr(sel, kAudioObjectPropertyScopeGlobal);
     let mut v: CFStringRef = ptr::null();
@@ -129,8 +158,15 @@ fn get_ptr(obj: AudioObjectID, sel: u32) -> Option<CFStringRef> {
     (st == 0 && !v.is_null()).then_some(v)
 }
 
-/// Finds a device by UID, including hidden ones such as Oto Sink.
+/// Finds a device by UID, including hidden ones such as Oto Sink. Errors fold to `None`; see
+/// [`device_for_uid_checked`].
 pub fn device_for_uid(uid: &str) -> Option<AudioObjectID> {
+    device_for_uid_checked(uid).ok().flatten()
+}
+
+/// Finds a device by UID: `Ok(None)` if Core Audio has no such device, `Err` if it could not
+/// be asked (e.g. while `coreaudiod` restarts).
+pub fn device_for_uid_checked(uid: &str) -> Result<Option<AudioObjectID>, OSStatus> {
     unsafe {
         let cf = CFStringCreateWithBytes(
             ptr::null(),
@@ -140,7 +176,7 @@ pub fn device_for_uid(uid: &str) -> Option<AudioObjectID> {
             0,
         );
         if cf.is_null() {
-            return None;
+            return Err(MEM_FULL_ERR);
         }
         let a = addr(
             kAudioHardwarePropertyTranslateUIDToDevice,
@@ -157,9 +193,15 @@ pub fn device_for_uid(uid: &str) -> Option<AudioObjectID> {
             (&raw mut id).cast(),
         );
         CFRelease(cf);
-        (st == 0 && id != kAudioObjectUnknown).then_some(id)
+        if st != 0 {
+            return Err(st);
+        }
+        Ok((id != kAudioObjectUnknown).then_some(id))
     }
 }
+
+/// `memFullErr`: a CFString could not be allocated.
+const MEM_FULL_ERR: OSStatus = -108;
 
 fn uid_of(dev: AudioObjectID) -> Option<String> {
     get_string(dev, kAudioDevicePropertyDeviceUID)
@@ -196,13 +238,16 @@ unsafe fn abl_slice_mut<'a>(abl: *mut AudioBufferList) -> &'a mut [AudioBuffer] 
 }
 
 fn default_input() -> Option<AudioObjectID> {
-    get::<u32>(
+    default_input_checked().ok().flatten()
+}
+
+fn default_input_checked() -> Result<Option<AudioObjectID>, OSStatus> {
+    let d = get::<u32>(
         kAudioObjectSystemObject,
         kAudioHardwarePropertyDefaultInputDevice,
         kAudioObjectPropertyScopeGlobal,
-    )
-    .ok()
-    .filter(|&d| d != kAudioObjectUnknown)
+    )?;
+    Ok((d != kAudioObjectUnknown).then_some(d))
 }
 
 fn is_oto(uid: &str, uids: &Uids) -> bool {
@@ -219,12 +264,60 @@ fn rate_of(dev: AudioObjectID) -> f64 {
 }
 
 fn is_running_somewhere(dev: AudioObjectID) -> bool {
+    is_running_somewhere_checked(dev).unwrap_or(false)
+}
+
+fn is_running_somewhere_checked(dev: AudioObjectID) -> Result<bool, OSStatus> {
     get::<u32>(
         dev,
         kAudioDevicePropertyDeviceIsRunningSomewhere,
         kAudioObjectPropertyScopeGlobal,
     )
-    .is_ok_and(|v| v != 0)
+    .map(|v| v != 0)
+}
+
+/// Whether any app does IO on Oto Microphone: `Ok(None)` if there is no Oto Microphone.
+pub fn is_oto_mic_active_checked(uids: &Uids) -> Result<Option<bool>, OSStatus> {
+    match device_for_uid_checked(&uids.mic)? {
+        None => Ok(None),
+        Some(dev) => is_running_somewhere_checked(dev).map(Some),
+    }
+}
+
+/// Whether any Core Audio device is running somewhere (some process does IO on it). An error
+/// from any device is an error: "idle" must be certain.
+pub fn any_audio_active_checked() -> Result<bool, OSStatus> {
+    let a = addr(
+        kAudioHardwarePropertyDevices,
+        kAudioObjectPropertyScopeGlobal,
+    );
+    let mut size = 0u32;
+    let st = unsafe {
+        AudioObjectGetPropertyDataSize(kAudioObjectSystemObject, &a, 0, ptr::null(), &mut size)
+    };
+    if st != 0 {
+        return Err(st);
+    }
+    let mut ids = vec![0u32; size as usize / 4];
+    let st = unsafe {
+        AudioObjectGetPropertyData(
+            kAudioObjectSystemObject,
+            &a,
+            0,
+            ptr::null(),
+            &mut size,
+            ids.as_mut_ptr().cast(),
+        )
+    };
+    if st != 0 {
+        return Err(st);
+    }
+    ids.truncate(size as usize / 4);
+    let mut any = false;
+    for d in ids {
+        any |= is_running_somewhere_checked(d)?;
+    }
+    Ok(any)
 }
 
 /// Device + stream latency plus safety offset, in device frames.
@@ -477,12 +570,54 @@ pub fn input_devices(uids: &Uids) -> Vec<InputDevice> {
     candidates(uids).into_iter().map(|c| c.dev).collect()
 }
 
-pub fn driver_installed(uids: &Uids) -> bool {
-    device_for_uid(&uids.mic).is_some() && device_for_uid(&uids.sink).is_some()
+/// The driver's custom property `'otvr'` on Oto Microphone: its revision as a decimal
+/// CFString. Declared in the device's `kAudioObjectPropertyCustomPropertyInfoList` so it
+/// crosses the HAL's IPC boundary. Drivers older than the property (v0.0.1 to v0.0.3) do not
+/// have it and are revision 0.
+const OTO_PROPERTY_DRIVER_VERSION: u32 = u32::from_be_bytes(*b"otvr");
+
+pub fn driver_status(uids: &Uids) -> DriverStatus {
+    let (mic, sink) = match (
+        device_for_uid_checked(&uids.mic),
+        device_for_uid_checked(&uids.sink),
+    ) {
+        (Ok(m), Ok(s)) => (m, s),
+        _ => return DriverStatus::Unknown,
+    };
+    let mic = match (mic, sink) {
+        (None, None) => return DriverStatus::Absent,
+        (Some(m), Some(_)) => m,
+        // Half enumerated: coreaudiod is (re)loading plug-ins.
+        _ => return DriverStatus::Unknown,
+    };
+    if !has_property(mic, OTO_PROPERTY_DRIVER_VERSION) {
+        // Legacy driver, unless the device vanished between the two calls.
+        return match device_for_uid_checked(&uids.mic) {
+            Ok(Some(m)) if m == mic => DriverStatus::Loaded(0),
+            _ => DriverStatus::Unknown,
+        };
+    }
+    match get_string_checked(mic, OTO_PROPERTY_DRIVER_VERSION) {
+        Ok(Some(s)) => {
+            crate::parse_driver_version(&s).map_or(DriverStatus::Unknown, DriverStatus::Loaded)
+        }
+        _ => DriverStatus::Unknown,
+    }
 }
 
-pub fn default_input_uid() -> Option<String> {
-    default_input().and_then(uid_of)
+/// The system default input's UID. `Ok(None)` when there is no default input; `Err` when Core
+/// Audio could not be asked or the device has no readable UID.
+pub fn default_input_uid() -> Result<Option<String>, String> {
+    let Some(dev) = default_input_checked()
+        .map_err(|e| format!("cannot read default input: {}", status_str(e)))?
+    else {
+        return Ok(None);
+    };
+    match get_string_checked(dev, kAudioDevicePropertyDeviceUID) {
+        Ok(Some(uid)) => Ok(Some(uid)),
+        Ok(None) => Err(format!("default input {dev} has no UID")),
+        Err(e) => Err(format!("cannot read default input UID: {}", status_str(e))),
+    }
 }
 
 pub fn set_default_input(uid: &str) -> Result<(), String> {
@@ -810,8 +945,8 @@ impl Mac {
 }
 
 impl Platform for Mac {
-    fn driver_installed(&self) -> bool {
-        driver_installed(&self.uids)
+    fn driver_status(&self) -> DriverStatus {
+        driver_status(&self.uids)
     }
 
     fn clients_active(&self) -> bool {
@@ -1264,6 +1399,11 @@ impl Player {
         player._io.start("output device")?;
         Ok(player)
     }
+}
+
+/// An OSStatus as text, for errors crossing the crate's API.
+pub(crate) fn os_error(e: OSStatus) -> String {
+    status_str(e)
 }
 
 #[cfg(test)]

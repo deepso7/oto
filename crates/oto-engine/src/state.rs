@@ -7,7 +7,7 @@
 //! called from an audio callback.
 
 use std::fs::{self, File, OpenOptions, TryLockError};
-use std::io::Write;
+use std::io::{Seek, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -39,9 +39,12 @@ pub(crate) fn remembered_input(dir: &Path) -> Option<String> {
 
 /// Held for the lifetime of an [`crate::Engine`]: an exclusive advisory lock on a file in the
 /// state directory. The OS releases it when the file closes, including when the process dies,
-/// so a crash never leaves a stale lock.
+/// so a crash never leaves a stale lock. The holder's PID is written into the file
+/// ([`crate::update_state::read_lock_holder_pid`]), so update recovery can tell which process
+/// holds it. The descriptor is close-on-exec (std opens every file with `O_CLOEXEC`), so a
+/// spawned child (the update helper) never inherits the lock.
 pub(crate) struct InstanceLock {
-    _file: File,
+    file: File,
 }
 
 impl InstanceLock {
@@ -56,11 +59,20 @@ impl InstanceLock {
         let file = OpenOptions::new()
             .create(true)
             .truncate(false)
+            .read(true)
             .write(true)
             .open(dir.join(LOCK_FILE));
-        let Ok(file) = file else { return Ok(None) };
+        let Ok(mut file) = file else { return Ok(None) };
         match file.try_lock() {
-            Ok(()) => Ok(Some(Self { _file: file })),
+            Ok(()) => {
+                // Best-effort: a lock without a PID still locks.
+                let _ = file
+                    .set_len(0)
+                    .and_then(|()| file.rewind())
+                    .and_then(|()| writeln!(file, "{}", std::process::id()))
+                    .and_then(|()| file.sync_data());
+                Ok(Some(Self { file }))
+            }
             Err(TryLockError::WouldBlock) => Err(crate::ALREADY_RUNNING.into()),
             // Locks unsupported on this filesystem: nothing to enforce with.
             Err(TryLockError::Error(_)) => Ok(None),
@@ -68,11 +80,28 @@ impl InstanceLock {
     }
 }
 
+impl InstanceLock {
+    #[cfg(all(test, unix))]
+    fn raw_fd(&self) -> i32 {
+        use std::os::fd::AsRawFd;
+        self.file.as_raw_fd()
+    }
+}
+
+impl Drop for InstanceLock {
+    fn drop(&mut self) {
+        // The next holder writes its own PID; clearing ours means a stale PID is never read
+        // back while the lock is free. Best-effort, before the close releases the lock.
+        let _ = self.file.set_len(0);
+    }
+}
+
 /// The default input to put back once Oto Microphone stops being it, kept in memory and
 /// mirrored to disk so it survives a crash.
 ///
 /// The system default itself is passed in by the caller (as values or closures), which keeps
-/// this logic testable without Core Audio.
+/// this logic testable without Core Audio. Reading it can fail (Core Audio errors, e.g. while
+/// `coreaudiod` restarts): a failed read never clears or changes the saved target.
 pub(crate) struct RestoreTarget {
     /// UID of Oto Microphone.
     mic: String,
@@ -84,11 +113,15 @@ pub(crate) struct RestoreTarget {
 impl RestoreTarget {
     /// Picks up what a previous run left behind. A leftover target is adopted only while Oto
     /// Microphone is still the default (`current`); otherwise the user moved on and it is
-    /// discarded.
-    pub fn open(dir: Option<&Path>, mic: &str, current: Option<&str>) -> Self {
+    /// discarded. If the default cannot be read, the leftover is adopted: [`Self::restore`]
+    /// checks the default again before acting on it.
+    pub fn open(dir: Option<&Path>, mic: &str, current: Result<Option<String>, String>) -> Self {
         let file = dir.map(|d| d.join(RESTORE_FILE));
         let mut prev = file.as_deref().and_then(read);
-        if prev.is_some() && current != Some(mic) {
+        if prev.is_some()
+            && let Ok(current) = current
+            && current.as_deref() != Some(mic)
+        {
             prev = None;
             if let Some(f) = &file {
                 remove(f);
@@ -112,13 +145,15 @@ impl RestoreTarget {
 
     /// Make Oto Microphone the default. `current` is the default right now; `set` changes it.
     /// The target is written to disk *before* the default changes, so a crash at any point
-    /// leaves either nothing to undo or a record of how to undo it.
+    /// leaves either nothing to undo or a record of how to undo it. If `current` could not be
+    /// read, nothing changes and the error is returned.
     pub fn switch_to_oto(
         &self,
-        current: Option<String>,
+        current: Result<Option<String>, String>,
         set: impl FnOnce(&str) -> Result<(), String>,
     ) -> Result<(), String> {
         let mut prev = self.lock();
+        let current = current?;
         if current.as_deref() == Some(self.mic.as_str()) {
             // Already the default: whatever target we hold (possibly adopted) stays valid.
             return Ok(());
@@ -135,31 +170,34 @@ impl RestoreTarget {
     }
 
     /// Put the remembered default back, if Oto Microphone is still the default. Clears the
-    /// target either way, except when setting it fails (so a later attempt can retry).
+    /// target either way, except when reading the default or setting it fails (so a later
+    /// attempt can retry).
     pub fn restore(
         &self,
-        current: impl FnOnce() -> Option<String>,
+        current: impl FnOnce() -> Result<Option<String>, String>,
         set: impl FnOnce(&str) -> Result<(), String>,
     ) -> Result<(), String> {
         let mut prev = self.lock();
-        let Some(uid) = prev.take() else {
+        let Some(uid) = prev.clone() else {
             return Ok(());
         };
-        if current().as_deref() == Some(self.mic.as_str())
-            && let Err(e) = set(&uid)
-        {
-            *prev = Some(uid);
-            return Err(e);
+        if current()?.as_deref() == Some(self.mic.as_str()) {
+            set(&uid)?;
         }
+        *prev = None;
         self.store(None);
         Ok(())
     }
 
     /// The system default input changed. If it is no longer Oto Microphone, the user (or we)
-    /// picked something else and there is nothing left to restore.
-    pub fn default_changed(&self, current: impl FnOnce() -> Option<String>) {
+    /// picked something else and there is nothing left to restore. If it cannot be read, the
+    /// target is kept.
+    pub fn default_changed(&self, current: impl FnOnce() -> Result<Option<String>, String>) {
         let mut prev = self.lock();
-        if prev.is_some() && current().as_deref() != Some(self.mic.as_str()) {
+        if prev.is_some()
+            && let Ok(current) = current()
+            && current.as_deref() != Some(self.mic.as_str())
+        {
             *prev = None;
             self.store(None);
         }
@@ -243,7 +281,10 @@ pub(crate) mod tests {
         fn new(d: &str) -> Self {
             Self(RefCell::new(Some(d.to_owned())))
         }
-        fn get(&self) -> Option<String> {
+        fn get(&self) -> Result<Option<String>, String> {
+            Ok(self.0.borrow().clone())
+        }
+        fn peek(&self) -> Option<String> {
             self.0.borrow().clone()
         }
         fn set(&self, uid: &str) -> Result<(), String> {
@@ -260,10 +301,10 @@ pub(crate) mod tests {
     fn switch_persists_and_restore_clears() {
         let t = TempDir::new();
         let sys = Sys::new("builtin");
-        let r = RestoreTarget::open(Some(&t.0), MIC, sys.get().as_deref());
+        let r = RestoreTarget::open(Some(&t.0), MIC, sys.get());
         assert_eq!(r.pending(), None);
         r.switch_to_oto(sys.get(), |u| sys.set(u)).unwrap();
-        assert_eq!(sys.get().as_deref(), Some(MIC));
+        assert_eq!(sys.peek().as_deref(), Some(MIC));
         assert_eq!(r.pending().as_deref(), Some("builtin"));
         assert_eq!(on_disk(&t).as_deref(), Some("builtin"));
         // No temp file is left next to it.
@@ -274,7 +315,7 @@ pub(crate) mod tests {
         assert_eq!(on_disk(&t).as_deref(), Some("builtin"));
 
         r.restore(|| sys.get(), |u| sys.set(u)).unwrap();
-        assert_eq!(sys.get().as_deref(), Some("builtin"));
+        assert_eq!(sys.peek().as_deref(), Some("builtin"));
         assert_eq!(r.pending(), None);
         assert_eq!(on_disk(&t), None);
         // A second restore (e.g. on drop) is a no-op.
@@ -287,18 +328,18 @@ pub(crate) mod tests {
         let t = TempDir::new();
         let sys = Sys::new("usb");
         {
-            let r = RestoreTarget::open(Some(&t.0), MIC, sys.get().as_deref());
+            let r = RestoreTarget::open(Some(&t.0), MIC, sys.get());
             r.switch_to_oto(sys.get(), |u| sys.set(u)).unwrap();
             // Dropped without `restore`: SIGKILL, panic=abort, power loss.
         }
         assert_eq!(on_disk(&t).as_deref(), Some("usb"));
-        let r = RestoreTarget::open(Some(&t.0), MIC, sys.get().as_deref());
+        let r = RestoreTarget::open(Some(&t.0), MIC, sys.get());
         assert_eq!(r.pending().as_deref(), Some("usb"));
         // Oto Microphone is still the default, so `switch_to_oto` keeps the adopted target.
         r.switch_to_oto(sys.get(), |_| panic!("already default"))
             .unwrap();
         r.restore(|| sys.get(), |u| sys.set(u)).unwrap();
-        assert_eq!(sys.get().as_deref(), Some("usb"));
+        assert_eq!(sys.peek().as_deref(), Some("usb"));
         assert_eq!(on_disk(&t), None);
     }
 
@@ -307,12 +348,12 @@ pub(crate) mod tests {
         let t = TempDir::new();
         let sys = Sys::new("usb");
         {
-            let r = RestoreTarget::open(Some(&t.0), MIC, sys.get().as_deref());
+            let r = RestoreTarget::open(Some(&t.0), MIC, sys.get());
             r.switch_to_oto(sys.get(), |u| sys.set(u)).unwrap();
         }
         // After the crash the user picked another mic in System Settings.
         sys.set("airpods").unwrap();
-        let r = RestoreTarget::open(Some(&t.0), MIC, sys.get().as_deref());
+        let r = RestoreTarget::open(Some(&t.0), MIC, sys.get());
         assert_eq!(r.pending(), None);
         assert_eq!(on_disk(&t), None);
     }
@@ -321,7 +362,7 @@ pub(crate) mod tests {
     fn picking_another_default_while_running_clears_the_target() {
         let t = TempDir::new();
         let sys = Sys::new("builtin");
-        let r = RestoreTarget::open(Some(&t.0), MIC, sys.get().as_deref());
+        let r = RestoreTarget::open(Some(&t.0), MIC, sys.get());
         r.switch_to_oto(sys.get(), |u| sys.set(u)).unwrap();
         // A notification while Oto Microphone is still the default keeps it.
         r.default_changed(|| sys.get());
@@ -332,14 +373,14 @@ pub(crate) mod tests {
         assert_eq!(on_disk(&t), None);
         // Restoring now must not override the user's choice.
         r.restore(|| sys.get(), |_| panic!("must not set")).unwrap();
-        assert_eq!(sys.get().as_deref(), Some("airpods"));
+        assert_eq!(sys.peek().as_deref(), Some("airpods"));
     }
 
     #[test]
     fn restore_skips_setting_when_default_already_changed_but_still_clears() {
         let t = TempDir::new();
         let sys = Sys::new("builtin");
-        let r = RestoreTarget::open(Some(&t.0), MIC, sys.get().as_deref());
+        let r = RestoreTarget::open(Some(&t.0), MIC, sys.get());
         r.switch_to_oto(sys.get(), |u| sys.set(u)).unwrap();
         sys.set("airpods").unwrap();
         r.restore(|| sys.get(), |_| panic!("must not set")).unwrap();
@@ -350,7 +391,7 @@ pub(crate) mod tests {
     fn failures_keep_state_consistent() {
         let t = TempDir::new();
         let sys = Sys::new("builtin");
-        let r = RestoreTarget::open(Some(&t.0), MIC, sys.get().as_deref());
+        let r = RestoreTarget::open(Some(&t.0), MIC, sys.get());
         // Switching fails: nothing is left to restore.
         assert!(r.switch_to_oto(sys.get(), |_| Err("nope".into())).is_err());
         assert_eq!(r.pending(), None);
@@ -365,10 +406,86 @@ pub(crate) mod tests {
     #[test]
     fn works_in_memory_without_a_directory() {
         let sys = Sys::new("builtin");
-        let r = RestoreTarget::open(None, MIC, sys.get().as_deref());
+        let r = RestoreTarget::open(None, MIC, sys.get());
         r.switch_to_oto(sys.get(), |u| sys.set(u)).unwrap();
         r.restore(|| sys.get(), |u| sys.set(u)).unwrap();
-        assert_eq!(sys.get().as_deref(), Some("builtin"));
+        assert_eq!(sys.peek().as_deref(), Some("builtin"));
+    }
+
+    fn query_failed() -> Result<Option<String>, String> {
+        Err("Core Audio error -1".into())
+    }
+
+    #[test]
+    fn query_errors_never_erase_the_target() {
+        let t = TempDir::new();
+        let sys = Sys::new("usb");
+        let r = RestoreTarget::open(Some(&t.0), MIC, sys.get());
+        r.switch_to_oto(sys.get(), |u| sys.set(u)).unwrap();
+
+        // default_changed: a failed read keeps it.
+        r.default_changed(query_failed);
+        assert_eq!(r.pending().as_deref(), Some("usb"));
+        assert_eq!(on_disk(&t).as_deref(), Some("usb"));
+
+        // restore: a failed read keeps it, sets nothing and reports the error.
+        let e = r.restore(query_failed, |_| panic!("must not set"));
+        assert!(e.is_err());
+        assert_eq!(r.pending().as_deref(), Some("usb"));
+        assert_eq!(on_disk(&t).as_deref(), Some("usb"));
+
+        // switch_to_oto: a failed read changes nothing.
+        let e = r.switch_to_oto(query_failed(), |_| panic!("must not set"));
+        assert!(e.is_err());
+        assert_eq!(r.pending().as_deref(), Some("usb"));
+        drop(r);
+
+        // open: a failed read adopts the leftover rather than discarding it.
+        let r = RestoreTarget::open(Some(&t.0), MIC, query_failed());
+        assert_eq!(r.pending().as_deref(), Some("usb"));
+        assert_eq!(on_disk(&t).as_deref(), Some("usb"));
+        // And a later, successful restore still puts it back.
+        r.restore(|| sys.get(), |u| sys.set(u)).unwrap();
+        assert_eq!(sys.peek().as_deref(), Some("usb"));
+        assert_eq!(on_disk(&t), None);
+    }
+
+    #[test]
+    fn switch_with_a_failed_read_leaves_nothing_to_restore() {
+        let t = TempDir::new();
+        let r = RestoreTarget::open(Some(&t.0), MIC, Ok(Some("builtin".into())));
+        assert!(
+            r.switch_to_oto(query_failed(), |_| panic!("must not set"))
+                .is_err()
+        );
+        assert_eq!(r.pending(), None);
+        assert_eq!(on_disk(&t), None);
+    }
+
+    #[test]
+    fn lock_records_the_holder_pid_and_is_close_on_exec() {
+        let t = TempDir::new();
+        let paths = crate::update_state::UpdatePaths::new(&t.0);
+        assert_eq!(crate::update_state::read_lock_holder_pid(&paths), None);
+        let lock = InstanceLock::acquire(Some(&t.0)).unwrap().unwrap();
+        assert_eq!(
+            crate::update_state::read_lock_holder_pid(&paths),
+            Some(std::process::id())
+        );
+        #[cfg(unix)]
+        {
+            unsafe extern "C" {
+                fn fcntl(fd: i32, cmd: i32, ...) -> i32;
+            }
+            const F_GETFD: i32 = 1;
+            const FD_CLOEXEC: i32 = 1;
+            let flags = unsafe { fcntl(lock.raw_fd(), F_GETFD) };
+            assert!(flags >= 0);
+            assert_ne!(flags & FD_CLOEXEC, 0, "engine.lock must be O_CLOEXEC");
+        }
+        drop(lock);
+        // Released: no stale PID is left behind.
+        assert_eq!(crate::update_state::read_lock_holder_pid(&paths), None);
     }
 
     #[test]

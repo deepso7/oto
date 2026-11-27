@@ -3,7 +3,8 @@
 # On every push to main:
 # - release-pr opens or updates a PR that bumps the workspace version and CHANGELOG.md.
 # - release does nothing until that PR is merged (`release_always = false`). Then it tags
-#   `v<version>` and creates the GitHub release, and `macos` attaches the notarized DMG.
+#   `v<version>` and creates a draft GitHub release (`git_release_draft = true`), and `macos`
+#   builds, signs, notarizes, verifies, uploads the DMG/zip/signed manifest, and publishes it.
 #
 # Uses GITHUB_TOKEN. Tags it pushes don't trigger other workflows, which is why the DMG build
 # is called from here instead of running on tag push. The release PR needs Settings →

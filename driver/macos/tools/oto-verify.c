@@ -12,8 +12,14 @@
 //        - how quickly the mic goes silent after the sink is stopped, and that it stays silent
 //   Exits non-zero if any check fails.
 //
+//   3. The mic declares the custom property 'otvr' (driver revision) in
+//      kAudioObjectPropertyCustomPropertyInfoList as a CFString, and it round-trips through the
+//      HAL to this process and parses as the revision this tool was built with (DRIVER_VERSION).
+//
 // Usage: oto-verify [-b buffer_frames]   (default 512; applies to both devices)
+//        oto-verify --check-version      only the device and 'otvr' checks, no loopback
 
+#include <CoreAudio/AudioServerPlugIn.h> // AudioServerPlugInCustomPropertyInfo
 #include <CoreAudio/CoreAudio.h>
 #include <CoreFoundation/CoreFoundation.h>
 #include <mach/mach_time.h>
@@ -128,19 +134,77 @@ static void get_str(AudioObjectID o, AudioObjectPropertySelector sel, char* buf,
     }
 }
 
+#ifndef OTO_DRIVER_VERSION
+#error "OTO_DRIVER_VERSION must be defined (see driver/macos/Makefile)"
+#endif
+#define kOtoPropertyDriverVersion 0x6f747672u // 'otvr'
+
 static int fails = 0;
 static void check(bool ok, const char* what) {
     printf("  [%s] %s\n", ok ? "PASS" : "FAIL", what);
     if (!ok) fails++;
 }
 
+// The 'otvr' round trip: declared in the mic's custom property list as a CFString with no
+// qualifier, readable, not settable, and equal to the revision this tool was built with.
+static void check_version(AudioObjectID mic) {
+    printf("\nDriver revision ('otvr'):\n");
+    AudioObjectPropertyAddress cust = {kAudioObjectPropertyCustomPropertyInfoList, kAudioObjectPropertyScopeGlobal,
+                                       kAudioObjectPropertyElementMain};
+    UInt32 size = 0;
+    bool declared = false;
+    if (AudioObjectGetPropertyDataSize(mic, &cust, 0, NULL, &size) == noErr && size > 0) {
+        UInt32 n = size / sizeof(AudioServerPlugInCustomPropertyInfo);
+        AudioServerPlugInCustomPropertyInfo* info = calloc(n ? n : 1, sizeof *info);
+        if (info && AudioObjectGetPropertyData(mic, &cust, 0, NULL, &size, info) == noErr) {
+            n = size / sizeof *info;
+            for (UInt32 i = 0; i < n; i++)
+                if (info[i].mSelector == kOtoPropertyDriverVersion &&
+                    info[i].mPropertyDataType == kAudioServerPlugInCustomPropertyDataTypeCFString &&
+                    info[i].mQualifierDataType == kAudioServerPlugInCustomPropertyDataTypeNone)
+                    declared = true;
+        }
+        free(info);
+    }
+    check(declared, "'otvr' is declared in the custom property list as a CFString");
+
+    AudioObjectPropertyAddress v = {kOtoPropertyDriverVersion, kAudioObjectPropertyScopeGlobal,
+                                    kAudioObjectPropertyElementMain};
+    check(AudioObjectHasProperty(mic, &v), "Oto Microphone has 'otvr'");
+    Boolean settable = true;
+    check(AudioObjectIsPropertySettable(mic, &v, &settable) == noErr && !settable, "'otvr' is not settable");
+    CFStringRef s = NULL;
+    size = sizeof s;
+    char buf[64] = "";
+    OSStatus st = AudioObjectGetPropertyData(mic, &v, 0, NULL, &size, &s);
+    if (st == noErr && s) {
+        CFStringGetCString(s, buf, sizeof buf, kCFStringEncodingUTF8);
+        CFRelease(s);
+    }
+    char* end = NULL;
+    unsigned long rev = strtoul(buf, &end, 10);
+    bool parsed = buf[0] && end && *end == 0;
+    printf("         status=%d value=\"%s\" built=%d\n", (int)st, buf, OTO_DRIVER_VERSION);
+    check(parsed, "'otvr' parses as an integer");
+    check(parsed && rev == (unsigned long)OTO_DRIVER_VERSION, "'otvr' matches DRIVER_VERSION");
+}
+
 int main(int argc, char** argv) {
     UInt32 bufFrames = 512;
+    bool versionOnly = false;
+    for (int i = 1; i < argc; i++) {
+        if (!strcmp(argv[i], "--check-version")) {
+            versionOnly = true;
+            for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+            argc--;
+            i--;
+        }
+    }
     int opt;
     while ((opt = getopt(argc, argv, "b:")) != -1) {
         if (opt == 'b') bufFrames = (UInt32)atoi(optarg);
         else {
-            fprintf(stderr, "usage: %s [-b buffer_frames]\n", argv[0]);
+            fprintf(stderr, "usage: %s [-b buffer_frames] [--check-version]\n", argv[0]);
             return 2;
         }
     }
@@ -184,6 +248,11 @@ int main(int argc, char** argv) {
     if (!mic || !sink) {
         printf("\nRESULT: FAIL (devices missing)\n");
         return 1;
+    }
+    check_version(mic);
+    if (versionOnly) {
+        printf("\nRESULT: %s\n", fails ? "FAIL" : "PASS");
+        return fails ? 1 : 0;
     }
 
     // ---- 2. loopback

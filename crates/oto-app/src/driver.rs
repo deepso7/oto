@@ -2,8 +2,14 @@
 //!
 //! The app never runs a script or a build as root. It installs the prebuilt, signed
 //! `OtoMicrophone.driver` that ships inside `Oto.app`, with a fixed command sequence passed
-//! inline to `osascript … with administrator privileges` (the system's password prompt). The only
-//! thing that varies in that command is the source path, which is shell-quoted.
+//! inline to `osascript … with administrator privileges` (the system's password prompt). The
+//! only things that vary in that command are paths, code requirements and the invoking user id,
+//! all shell-quoted.
+//!
+//! The privileged step copies the bundled `oto-hal-helper` into a root-owned staging folder,
+//! verifies its signature there and runs that copy, which takes the kernel lock on the HAL
+//! folder, swaps the driver in atomically and restarts `coreaudiod` only if no audio is playing
+//! (asking as the invoking user); otherwise it reports `OTO_RESULT=reboot`.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -13,6 +19,12 @@ use std::time::{Duration, Instant};
 pub const BUNDLE_NAME: &str = "OtoMicrophone.driver";
 /// `CFBundleIdentifier` of the driver (driver/macos/Info.plist), also its signing identifier.
 const BUNDLE_ID: &str = "dev.oto.driver";
+/// The signing identifier of `oto-hal-helper`.
+pub(crate) const HELPER_ID: &str = "dev.oto.hal-helper";
+/// The helper's file name, in `Oto.app/Contents/Helpers` and in `driver/macos/build`.
+pub(crate) const HELPER_NAME: &str = "oto-hal-helper";
+/// `CFBundleIdentifier` of the app.
+pub(crate) const APP_ID: &str = "dev.oto.app";
 /// `CFBundleExecutable` of the driver.
 const EXECUTABLE: &str = "OtoMicrophone";
 /// Where Core Audio loads HAL plug-ins from.
@@ -24,7 +36,7 @@ pub const REBOOT_MESSAGE: &str = "Restart your Mac to finish.";
 /// The Developer ID team the driver must be signed by, baked in by `scripts/macos/bundle.sh`
 /// for Developer ID builds. Without it (ad-hoc and local builds) only the signature's validity
 /// and identifier are checked.
-const TEAM_ID: Option<&str> = option_env!("OTO_TEAM_ID");
+pub(crate) const TEAM_ID: Option<&str> = option_env!("OTO_TEAM_ID");
 const _: () = {
     if let Some(team) = TEAM_ID {
         let b = team.as_bytes();
@@ -109,21 +121,74 @@ pub fn find_source() -> Option<PathBuf> {
         .find_map(|p| p.canonicalize().ok().filter(|p| p.is_dir()))
 }
 
+/// Every place `oto-hal-helper` may be taken from, like [`candidates`]:
+/// `Oto.app/Contents/Helpers/oto-hal-helper`, and in debug builds the one built in the source
+/// tree.
+pub fn helper_candidates(exe: Option<&Path>, debug_build: bool) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    if let Some(app) = exe.and_then(app_bundle) {
+        out.push(app.join("Contents/Helpers").join(HELPER_NAME));
+    }
+    if debug_build {
+        out.push(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../driver/macos/build")
+                .join(HELPER_NAME),
+        );
+    }
+    out
+}
+
+/// The `oto-hal-helper` this build runs as root (after the root step re-verifies it).
+pub fn find_helper() -> Option<PathBuf> {
+    let exe = std::env::current_exe().and_then(|p| p.canonicalize()).ok();
+    helper_candidates(exe.as_deref(), cfg!(debug_assertions))
+        .into_iter()
+        .find_map(|p| p.canonicalize().ok().filter(|p| p.is_file()))
+}
+
 // ---------------------------------------------------------------------------------------------
 // Checking the source before asking for a password
 
-/// The code requirement the driver has to satisfy: our identifier and, when the build knows its
-/// team, a Developer ID signature from that team.
-fn requirement(team: Option<&str>) -> String {
+/// The code requirement code signed as `bundle_id` has to satisfy: that identifier and, when the
+/// build knows its team, a **Developer ID Application** signature from that team (the Developer
+/// ID intermediate `1.2.840.113635.100.6.2.6` and leaf `1.2.840.113635.100.6.1.13` OIDs exclude
+/// Apple Development and Mac App Store certificates of the same team). Ad-hoc and local builds
+/// only pin the identifier.
+pub(crate) fn requirement_for(bundle_id: &str, team: Option<&str>) -> String {
     match team {
         Some(team) => format!(
-            "identifier \"{BUNDLE_ID}\" and anchor apple generic and certificate leaf[subject.OU] = \"{team}\""
+            "identifier \"{bundle_id}\" and anchor apple generic and \
+             certificate 1[field.1.2.840.113635.100.6.2.6] exists and \
+             certificate leaf[field.1.2.840.113635.100.6.1.13] exists and \
+             certificate leaf[subject.OU] = \"{team}\""
         ),
-        None => format!("identifier \"{BUNDLE_ID}\""),
+        None => format!("identifier \"{bundle_id}\""),
     }
 }
 
-fn plist_value(plist: &Path, key: &str) -> Option<String> {
+/// The requirement for the driver bundle.
+fn requirement(team: Option<&str>) -> String {
+    requirement_for(BUNDLE_ID, team)
+}
+
+/// The requirement for the driver bundle this build trusts.
+pub(crate) fn driver_requirement() -> String {
+    requirement(TEAM_ID)
+}
+
+/// The requirement every copy of `Oto.app` (and its update) must meet.
+pub(crate) fn app_requirement() -> String {
+    requirement_for(APP_ID, TEAM_ID)
+}
+
+/// The requirement for `oto-hal-helper`.
+pub(crate) fn helper_requirement() -> String {
+    requirement_for(HELPER_ID, TEAM_ID)
+}
+
+/// One string value from a property list (any format).
+pub(crate) fn plist_value(plist: &Path, key: &str) -> Option<String> {
     let out = Command::new("/usr/bin/plutil")
         .args(["-extract", key, "raw", "-o", "-"])
         .arg(plist)
@@ -137,7 +202,7 @@ fn plist_value(plist: &Path, key: &str) -> Option<String> {
 /// Checks that `source` is our driver bundle with a valid signature. This runs unprivileged and
 /// is for a clear error before the password prompt; the privileged step checks the signature
 /// again on its own root-owned copy, which is the check that counts.
-fn validate_with(source: &Path, requirement: &str) -> Result<(), String> {
+pub(crate) fn validate_with(source: &Path, requirement: &str) -> Result<(), String> {
     let broken = |what: &str| format!("The driver in this copy of Oto is damaged ({what}).");
     let meta = std::fs::symlink_metadata(source)
         .map_err(|_| "This copy of Oto doesn't include the driver.".to_owned())?;
@@ -171,50 +236,137 @@ fn validate_with(source: &Path, requirement: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Checks that `helper` is a regular file validly signed with `requirement`. Unprivileged, for a
+/// clear error before the prompt; the root step checks its own root-owned copy again.
+pub(crate) fn validate_helper(helper: &Path, requirement: &str) -> Result<(), String> {
+    let broken = "The installer helper in this copy of Oto is damaged.".to_owned();
+    let is_file = std::fs::symlink_metadata(helper).is_ok_and(|m| m.is_file());
+    if !is_file {
+        return Err("This copy of Oto doesn't include the installer helper.".into());
+    }
+    let verified = Command::new("/usr/bin/codesign")
+        .args(["--verify", "--strict"])
+        .arg(format!("-R={requirement}"))
+        .arg(helper)
+        .output()
+        .map_err(|e| format!("Couldn't run codesign: {e}"))?;
+    if !verified.status.success() {
+        return Err(broken);
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------------------------
+// Driver revisions on disk
+
+/// The installed driver's `Info.plist`.
+fn installed_plist() -> PathBuf {
+    Path::new(HAL_DIR)
+        .join(BUNDLE_NAME)
+        .join("Contents/Info.plist")
+}
+
+/// `OtoDriverVersion` from a driver's `Info.plist`: `None` if the file can't be read, `Some(0)`
+/// for drivers from before the key existed (v0.0.1 to v0.0.3).
+pub fn bundle_version(plist: &Path) -> Option<u32> {
+    if !plist.is_file() {
+        return None;
+    }
+    Some(
+        plist_value(plist, "OtoDriverVersion")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0),
+    )
+}
+
+/// The revision of the driver in the HAL plug-in folder (whether or not Core Audio loaded it):
+/// `None` if no driver is installed, `Some(0)` for a legacy or unreadable one.
+pub fn on_disk_version() -> Option<u32> {
+    if !bundle_present() {
+        return None;
+    }
+    Some(bundle_version(&installed_plist()).unwrap_or(0))
+}
+
+/// Whether any audio device is in use right now (`Err` if Core Audio couldn't say). Callers
+/// warn before the password prompt that audio will pause, or that the install will finish on
+/// the next restart; the privileged step checks again right before restarting `coreaudiod`.
+/// Blocks briefly: call it off the UI thread.
+pub fn audio_busy() -> Result<bool, String> {
+    oto_engine::Engine::any_audio_active_checked()
+}
+
+/// The real user id of this process, which the privileged step runs `--check-audio-idle` as.
+fn invoking_uid() -> u32 {
+    #[cfg(unix)]
+    {
+        // SAFETY: getuid has no preconditions and cannot fail.
+        unsafe { libc::getuid() }
+    }
+    #[cfg(not(unix))]
+    {
+        0
+    }
+}
+
 // ---------------------------------------------------------------------------------------------
 // The privileged commands
 
-/// Stage a root-owned copy next to the destination, verify it, then swap it in with renames so
-/// coreaudiod never sees a half-copied bundle; on failure the old driver is put back. Reads
-/// `SRC`, `DEST_DIR`, `NAME` and `REQ`. A failed coreaudiod restart is not an error: it prints
-/// `OTO_RESULT=reboot`. (`launchctl kickstart` is refused under SIP; `killall` is what works.)
+/// Copy `oto-hal-helper` and the driver into a fresh root-owned staging folder, verify both
+/// signatures there (as root, on the copies that will be used), then let the staged helper
+/// install: it takes the kernel lock on the HAL folder, swaps the driver in with
+/// `renamex_np(RENAME_SWAP)` (so it is never missing), and restarts coreaudiod only if the
+/// invoking user's audio is idle, printing `OTO_RESULT=restarted` or `OTO_RESULT=reboot`. Reads
+/// `SRC`, `HELPER`, `DEST_DIR`, `NAME`, `REQ`, `HELPER_REQ` and `INVOKING_UID`.
 const INSTALL_BODY: &str = r#"set -u
 PATH=/usr/bin:/bin:/usr/sbin:/sbin
 umask 022
-DEST="$DEST_DIR/$NAME"
-STAGE="$DEST_DIR/.$NAME.staging-$$"
-OLD="$DEST_DIR/.$NAME.old-$$"
-fail() { rm -rf "$STAGE"; echo "$1" >&2; exit 1; }
+STAGE_DIR=""
+cleanup() { if [ -n "$STAGE_DIR" ]; then rm -rf "$STAGE_DIR"; fi; }
+fail() { cleanup; echo "$1" >&2; exit 1; }
+STAGE_DIR="$(mktemp -d /private/tmp/oto-driver-install.XXXXXX)" || fail "Couldn't create a staging folder."
+STAGE_HELPER="$STAGE_DIR/oto-hal-helper"
+STAGE_DRIVER="$STAGE_DIR/$NAME"
+cp "$HELPER" "$STAGE_HELPER" || fail "Couldn't copy the installer helper."
+cp -R "$SRC" "$STAGE_DRIVER" || fail "Couldn't copy the driver into $STAGE_DIR."
+chown -R root:wheel "$STAGE_DIR" || fail "Couldn't set the driver's owner."
+chmod -R ug-s,go-w "$STAGE_DIR" || fail "Couldn't set the driver's permissions."
+chmod 0755 "$STAGE_DIR" "$STAGE_HELPER" || fail "Couldn't set the installer helper's permissions."
+xattr -dr com.apple.quarantine "$STAGE_DIR" 2>/dev/null
+codesign --verify --strict -R="$HELPER_REQ" "$STAGE_HELPER" 2>/dev/null || fail "The installer helper's code signature isn't valid, so nothing was installed."
+codesign --verify --strict -R="$REQ" "$STAGE_DRIVER" 2>/dev/null || fail "The driver's code signature isn't valid, so it was not installed."
 mkdir -p "$DEST_DIR" || fail "Couldn't create $DEST_DIR."
-rm -rf "$DEST_DIR/.$NAME".staging-* "$DEST_DIR/.$NAME".old-*
-cp -R "$SRC" "$STAGE" || fail "Couldn't copy the driver into $DEST_DIR."
-chown -R root:wheel "$STAGE" || fail "Couldn't set the driver's owner."
-chmod -R ug-s,go-w "$STAGE" || fail "Couldn't set the driver's permissions."
-xattr -dr com.apple.quarantine "$STAGE" 2>/dev/null
-codesign --verify --strict -R="$REQ" "$STAGE" 2>/dev/null || fail "The driver's code signature isn't valid, so it was not installed."
-HAD_OLD=0
-if [ -e "$DEST" ] || [ -L "$DEST" ]; then
-  mv "$DEST" "$OLD" || fail "Couldn't replace the installed driver."
-  HAD_OLD=1
-fi
-if ! mv "$STAGE" "$DEST"; then
-  if [ "$HAD_OLD" = 1 ]; then mv "$OLD" "$DEST"; fi
-  fail "Couldn't move the driver into place."
-fi
-rm -rf "$OLD"
-if killall coreaudiod 2>/dev/null; then echo OTO_RESULT=restarted; else echo OTO_RESULT=reboot; fi
+"$STAGE_HELPER" install "$STAGE_DRIVER" "$DEST_DIR" "$NAME" "$INVOKING_UID"
+RC=$?
+cleanup
+case "$RC" in
+  0) ;;
+  3) echo "A newer Oto audio driver is already installed." >&2; exit 1 ;;
+  *) echo "Couldn't install the driver; the installed one (if any) is unchanged." >&2; exit 1 ;;
+esac
 "#;
 
-/// Remove the bundle (renamed away first, so it leaves in one step) and restart coreaudiod.
-/// Reads `DEST_DIR` and `NAME`.
+/// Stage and verify `oto-hal-helper` as for install, then let it remove the driver (renamed
+/// away first, so it leaves in one step) and restart coreaudiod if audio is idle. Prints
+/// `OTO_RESULT=absent` if there was nothing to remove. Reads `HELPER`, `DEST_DIR`, `NAME`,
+/// `HELPER_REQ` and `INVOKING_UID`.
 const UNINSTALL_BODY: &str = r#"set -u
 PATH=/usr/bin:/bin:/usr/sbin:/sbin
-DEST="$DEST_DIR/$NAME"
-OLD="$DEST_DIR/.$NAME.old-$$"
-if [ ! -e "$DEST" ] && [ ! -L "$DEST" ]; then echo OTO_RESULT=absent; exit 0; fi
-mv "$DEST" "$OLD" || { echo "Couldn't remove the driver." >&2; exit 1; }
-rm -rf "$OLD" "$DEST_DIR/.$NAME".staging-* "$DEST_DIR/.$NAME".old-*
-if killall coreaudiod 2>/dev/null; then echo OTO_RESULT=restarted; else echo OTO_RESULT=reboot; fi
+umask 022
+STAGE_DIR=""
+cleanup() { if [ -n "$STAGE_DIR" ]; then rm -rf "$STAGE_DIR"; fi; }
+fail() { cleanup; echo "$1" >&2; exit 1; }
+STAGE_DIR="$(mktemp -d /private/tmp/oto-driver-uninstall.XXXXXX)" || fail "Couldn't create a staging folder."
+STAGE_HELPER="$STAGE_DIR/oto-hal-helper"
+cp "$HELPER" "$STAGE_HELPER" || fail "Couldn't copy the installer helper."
+chown -R root:wheel "$STAGE_DIR" || fail "Couldn't set the installer helper's owner."
+chmod 0755 "$STAGE_DIR" "$STAGE_HELPER" || fail "Couldn't set the installer helper's permissions."
+xattr -dr com.apple.quarantine "$STAGE_DIR" 2>/dev/null
+codesign --verify --strict -R="$HELPER_REQ" "$STAGE_HELPER" 2>/dev/null || fail "The installer helper's code signature isn't valid, so nothing was removed."
+"$STAGE_HELPER" uninstall "$DEST_DIR" "$NAME" "$INVOKING_UID"
+RC=$?
+cleanup
+[ "$RC" = 0 ] || { echo "Couldn't remove the driver." >&2; exit 1; }
 "#;
 
 /// `s` as one POSIX shell word.
@@ -222,23 +374,38 @@ fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
+/// What the privileged step needs besides the fixed body: everything is shell-quoted.
+struct Params<'a> {
+    helper: &'a Path,
+    dest_dir: &'a str,
+    requirement: &'a str,
+    helper_requirement: &'a str,
+    uid: u32,
+}
+
 /// The shell command that installs `source` into `dest_dir`: variable assignments, then the
 /// fixed [`INSTALL_BODY`].
-fn install_command(source: &Path, dest_dir: &str, requirement: &str) -> String {
+fn install_command(source: &Path, p: &Params) -> String {
     format!(
-        "SRC={}; DEST_DIR={}; NAME={}; REQ={}\n{INSTALL_BODY}",
+        "SRC={}; HELPER={}; DEST_DIR={}; NAME={}; REQ={}; HELPER_REQ={}; INVOKING_UID={}\n{INSTALL_BODY}",
         shell_quote(&source.to_string_lossy()),
-        shell_quote(dest_dir),
+        shell_quote(&p.helper.to_string_lossy()),
+        shell_quote(p.dest_dir),
         shell_quote(BUNDLE_NAME),
-        shell_quote(requirement),
+        shell_quote(p.requirement),
+        shell_quote(p.helper_requirement),
+        p.uid,
     )
 }
 
-fn uninstall_command(dest_dir: &str) -> String {
+fn uninstall_command(p: &Params) -> String {
     format!(
-        "DEST_DIR={}; NAME={}\n{UNINSTALL_BODY}",
-        shell_quote(dest_dir),
+        "HELPER={}; DEST_DIR={}; NAME={}; HELPER_REQ={}; INVOKING_UID={}\n{UNINSTALL_BODY}",
+        shell_quote(&p.helper.to_string_lossy()),
+        shell_quote(p.dest_dir),
         shell_quote(BUNDLE_NAME),
+        shell_quote(p.helper_requirement),
+        p.uid,
     )
 }
 
@@ -308,13 +475,13 @@ fn parse_result(stdout: &str) -> Restart {
     }
 }
 
-/// Polls `listed` until it returns `want`; false if it never does within `timeout`.
-fn wait_until(listed: impl Fn() -> bool, want: bool, settle: Duration, timeout: Duration) -> bool {
+/// Polls `check` until it returns true; false if it never does within `timeout`.
+fn wait_until(check: impl Fn() -> bool, settle: Duration, timeout: Duration) -> bool {
     // coreaudiod was just killed: give it a moment so the old instance's answer isn't taken.
     std::thread::sleep(settle);
     let deadline = Instant::now() + timeout;
     loop {
-        if listed() == want {
+        if check() {
             return true;
         }
         if Instant::now() >= deadline {
@@ -327,33 +494,87 @@ fn wait_until(listed: impl Fn() -> bool, want: bool, settle: Duration, timeout: 
 const SETTLE: Duration = Duration::from_secs(1);
 const APPEAR_TIMEOUT: Duration = Duration::from_secs(20);
 
-/// Installs the bundled driver and waits for Core Audio to list it. Shows the system's password
-/// prompt. Blocks for up to ~20 s after the prompt: call it off the UI thread.
+/// Core Audio has loaded exactly the driver this build ships.
+fn bundled_driver_loaded() -> bool {
+    oto_engine::Engine::driver_status()
+        == oto_engine::DriverStatus::Loaded(oto_engine::BUNDLED_DRIVER_VERSION)
+}
+
+/// Core Audio has positively dropped the driver (`Unknown` is "not yet").
+fn driver_gone() -> bool {
+    oto_engine::Engine::driver_status() == oto_engine::DriverStatus::Absent
+}
+
+/// How a successful privileged install ends, given its output and a check for the loaded
+/// revision: a reboot is never waited for.
+fn install_outcome(stdout: &str, loaded: impl Fn() -> bool, settle: Duration) -> Outcome {
+    match parse_result(stdout) {
+        Restart::Restarted if wait_until(loaded, settle, APPEAR_TIMEOUT) => Outcome::Installed,
+        _ => Outcome::InstalledNeedsReboot,
+    }
+}
+
+fn uninstall_outcome(stdout: &str, gone: impl Fn() -> bool, settle: Duration) -> UninstallOutcome {
+    match parse_result(stdout) {
+        Restart::Absent => UninstallOutcome::NotInstalled,
+        Restart::Restarted if wait_until(gone, settle, APPEAR_TIMEOUT) => UninstallOutcome::Removed,
+        _ => UninstallOutcome::RemovedNeedsReboot,
+    }
+}
+
+/// Refuses to overwrite a newer driver already loaded or on disk with this build's older copy.
+/// Rechecked live before prompting for administrator privileges (and again under the HAL lock by
+/// `oto-hal-helper`).
+fn check_no_downgrade(
+    loaded: oto_engine::DriverStatus,
+    on_disk: Option<u32>,
+    bundled: u32,
+) -> Result<(), String> {
+    let newer_loaded = matches!(loaded, oto_engine::DriverStatus::Loaded(v) if v > bundled);
+    let newer_on_disk = on_disk.is_some_and(|v| v > bundled);
+    if newer_loaded || newer_on_disk {
+        return Err("A newer Oto audio driver is already installed.".into());
+    }
+    Ok(())
+}
+
+/// Installs the bundled driver and waits for Core Audio to load this build's revision. Shows
+/// the system's password prompt. Blocks for up to ~20 s after the prompt: call it off the UI
+/// thread. Ends with [`Outcome::InstalledNeedsReboot`] at once, without waiting, when audio was
+/// busy and coreaudiod was left alone.
 pub fn install() -> Outcome {
+    if let Err(e) = check_no_downgrade(
+        oto_engine::Engine::driver_status(),
+        on_disk_version(),
+        oto_engine::BUNDLED_DRIVER_VERSION,
+    ) {
+        return Outcome::Failed(e);
+    }
     let Some(source) = find_source() else {
         return Outcome::Failed("This copy of Oto doesn't include the driver.".into());
     };
+    let Some(helper) = find_helper() else {
+        return Outcome::Failed("This copy of Oto doesn't include the installer helper.".into());
+    };
     let requirement = requirement(TEAM_ID);
+    let helper_requirement = helper_requirement();
     if let Err(e) = validate_with(&source, &requirement) {
         return Outcome::Failed(e);
     }
-    match run_privileged(&install_command(&source, HAL_DIR, &requirement)) {
+    if let Err(e) = validate_helper(&helper, &helper_requirement) {
+        return Outcome::Failed(e);
+    }
+    let params = Params {
+        helper: &helper,
+        dest_dir: HAL_DIR,
+        requirement: &requirement,
+        helper_requirement: &helper_requirement,
+        uid: invoking_uid(),
+    };
+    match run_privileged(&install_command(&source, &params)) {
         Privileged::Cancelled => Outcome::Cancelled,
         Privileged::Failed(e) => Outcome::Failed(e),
-        Privileged::Done(stdout) => {
-            let loaded = parse_result(&stdout) == Restart::Restarted
-                && wait_until(
-                    oto_engine::Engine::driver_installed,
-                    true,
-                    SETTLE,
-                    APPEAR_TIMEOUT,
-                );
-            if loaded {
-                Outcome::Installed
-            } else {
-                Outcome::InstalledNeedsReboot
-            }
-        }
+        Privileged::Done(stdout) => install_outcome(&stdout, bundled_driver_loaded, SETTLE),
     }
 }
 
@@ -371,23 +592,26 @@ pub fn uninstall() -> UninstallOutcome {
     if !bundle_present() {
         return UninstallOutcome::NotInstalled;
     }
-    match run_privileged(&uninstall_command(HAL_DIR)) {
+    let Some(helper) = find_helper() else {
+        return UninstallOutcome::Failed(
+            "This copy of Oto doesn't include the installer helper.".into(),
+        );
+    };
+    let helper_requirement = helper_requirement();
+    if let Err(e) = validate_helper(&helper, &helper_requirement) {
+        return UninstallOutcome::Failed(e);
+    }
+    let params = Params {
+        helper: &helper,
+        dest_dir: HAL_DIR,
+        requirement: "",
+        helper_requirement: &helper_requirement,
+        uid: invoking_uid(),
+    };
+    match run_privileged(&uninstall_command(&params)) {
         Privileged::Cancelled => UninstallOutcome::Cancelled,
         Privileged::Failed(e) => UninstallOutcome::Failed(e),
-        Privileged::Done(stdout) => match parse_result(&stdout) {
-            Restart::Absent => UninstallOutcome::NotInstalled,
-            Restart::Restarted
-                if wait_until(
-                    oto_engine::Engine::driver_installed,
-                    false,
-                    SETTLE,
-                    APPEAR_TIMEOUT,
-                ) =>
-            {
-                UninstallOutcome::Removed
-            }
-            _ => UninstallOutcome::RemovedNeedsReboot,
-        },
+        Privileged::Done(stdout) => uninstall_outcome(&stdout, driver_gone, SETTLE),
     }
 }
 
@@ -402,12 +626,26 @@ mod tests {
             .collect()
     }
 
+    fn params<'a>(helper: &'a Path, dest_dir: &'a str, req: &'a str, hreq: &'a str) -> Params<'a> {
+        Params {
+            helper,
+            dest_dir,
+            requirement: req,
+            helper_requirement: hreq,
+            uid: 501,
+        }
+    }
+
     #[test]
     fn a_release_build_looks_only_inside_its_bundle() {
         let exe = Path::new("/Applications/Oto.app/Contents/MacOS/oto-app");
         assert_eq!(
             strings(&candidates(Some(exe), false)),
             ["/Applications/Oto.app/Contents/Resources/OtoMicrophone.driver"]
+        );
+        assert_eq!(
+            strings(&helper_candidates(Some(exe), false)),
+            ["/Applications/Oto.app/Contents/Helpers/oto-hal-helper"]
         );
     }
 
@@ -420,8 +658,13 @@ mod tests {
             "/Users/me/Downloads/Oto/Contents/MacOS/oto-app",
         ] {
             assert!(candidates(Some(Path::new(exe)), false).is_empty(), "{exe}");
+            assert!(
+                helper_candidates(Some(Path::new(exe)), false).is_empty(),
+                "{exe}"
+            );
         }
         assert!(candidates(None, false).is_empty());
+        assert!(helper_candidates(None, false).is_empty());
     }
 
     #[test]
@@ -433,11 +676,19 @@ mod tests {
             c[0].ends_with("oto-app/../../driver/macos/build/OtoMicrophone.driver"),
             "{c:?}"
         );
+        let h = strings(&helper_candidates(Some(exe), true));
+        assert_eq!(h.len(), 1, "{h:?}");
+        assert!(
+            h[0].ends_with("oto-app/../../driver/macos/build/oto-hal-helper"),
+            "{h:?}"
+        );
         // Bundled debug builds prefer the bundle.
         let exe = Path::new("/tmp/Oto.app/Contents/MacOS/oto-app");
         let c = strings(&candidates(Some(exe), true));
         assert_eq!(c.len(), 2);
         assert_eq!(c[0], "/tmp/Oto.app/Contents/Resources/OtoMicrophone.driver");
+        let h = strings(&helper_candidates(Some(exe), true));
+        assert_eq!(h[0], "/tmp/Oto.app/Contents/Helpers/oto-hal-helper");
     }
 
     #[test]
@@ -449,11 +700,14 @@ mod tests {
     #[test]
     fn the_command_quotes_an_awkward_path() {
         let src = Path::new("/Users/a b/it's \"Oto\".app/Contents/Resources/OtoMicrophone.driver");
-        let cmd = install_command(src, HAL_DIR, &requirement(None));
+        let helper = Path::new("/Users/a b/it's \"Oto\".app/Contents/Helpers/oto-hal-helper");
+        let req = requirement(None);
+        let hreq = requirement_for(HELPER_ID, None);
+        let cmd = install_command(src, &params(helper, HAL_DIR, &req, &hreq));
         let (first, body) = cmd.split_once('\n').unwrap();
         assert_eq!(
             first,
-            r#"SRC='/Users/a b/it'\''s "Oto".app/Contents/Resources/OtoMicrophone.driver'; DEST_DIR='/Library/Audio/Plug-Ins/HAL'; NAME='OtoMicrophone.driver'; REQ='identifier "dev.oto.driver"'"#
+            r#"SRC='/Users/a b/it'\''s "Oto".app/Contents/Resources/OtoMicrophone.driver'; HELPER='/Users/a b/it'\''s "Oto".app/Contents/Helpers/oto-hal-helper'; DEST_DIR='/Library/Audio/Plug-Ins/HAL'; NAME='OtoMicrophone.driver'; REQ='identifier "dev.oto.driver"'; HELPER_REQ='identifier "dev.oto.hal-helper"'; INVOKING_UID=501"#
         );
         // The rest is fixed text: nothing from the path reaches it.
         assert_eq!(body, INSTALL_BODY);
@@ -465,6 +719,14 @@ mod tests {
         ));
         assert!(script.ends_with("\" with administrator privileges"));
         assert!(!script.contains('\n'));
+
+        let cmd = uninstall_command(&params(helper, HAL_DIR, "", &hreq));
+        let (first, body) = cmd.split_once('\n').unwrap();
+        assert_eq!(
+            first,
+            r#"HELPER='/Users/a b/it'\''s "Oto".app/Contents/Helpers/oto-hal-helper'; DEST_DIR='/Library/Audio/Plug-Ins/HAL'; NAME='OtoMicrophone.driver'; HELPER_REQ='identifier "dev.oto.hal-helper"'; INVOKING_UID=501"#
+        );
+        assert_eq!(body, UNINSTALL_BODY);
     }
 
     #[test]
@@ -472,8 +734,14 @@ mod tests {
         assert_eq!(requirement(None), r#"identifier "dev.oto.driver""#);
         assert_eq!(
             requirement(Some("ABCDE12345")),
-            r#"identifier "dev.oto.driver" and anchor apple generic and certificate leaf[subject.OU] = "ABCDE12345""#
+            r#"identifier "dev.oto.driver" and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] exists and certificate leaf[field.1.2.840.113635.100.6.1.13] exists and certificate leaf[subject.OU] = "ABCDE12345""#
         );
+        assert_eq!(
+            requirement_for(HELPER_ID, Some("ABCDE12345")),
+            requirement(Some("ABCDE12345")).replace("dev.oto.driver", "dev.oto.hal-helper")
+        );
+        assert_eq!(app_requirement(), requirement_for("dev.oto.app", TEAM_ID));
+        assert_eq!(helper_requirement(), requirement_for(HELPER_ID, TEAM_ID));
     }
 
     #[test]
@@ -481,6 +749,8 @@ mod tests {
         let missing = Path::new("/nonexistent/OtoMicrophone.driver");
         let err = validate_with(missing, &requirement(None)).unwrap_err();
         assert_eq!(err, "This copy of Oto doesn't include the driver.");
+        let err = validate_helper(Path::new("/nonexistent/oto-hal-helper"), "x").unwrap_err();
+        assert!(err.contains("installer helper"), "{err}");
     }
 
     #[test]
@@ -489,6 +759,11 @@ mod tests {
         assert_eq!(parse_result("OTO_RESULT=reboot\n"), Restart::NeedsReboot);
         assert_eq!(parse_result("OTO_RESULT=absent\n"), Restart::Absent);
         assert_eq!(parse_result(""), Restart::NeedsReboot);
+        // The helper's other lines don't confuse it.
+        assert_eq!(
+            parse_result("OTO_FROM=0\nOTO_TO=1\nInstalled x\nOTO_RESULT=restarted\n"),
+            Restart::Restarted
+        );
     }
 
     #[test]
@@ -502,17 +777,96 @@ mod tests {
     #[test]
     fn waits_for_the_wanted_answer() {
         let none = Duration::ZERO;
-        assert!(wait_until(|| true, true, none, none));
-        assert!(!wait_until(|| true, false, none, none));
+        assert!(wait_until(|| true, none, none));
+        assert!(!wait_until(|| false, none, none));
+    }
+
+    #[test]
+    fn a_reboot_result_is_never_waited_for() {
+        use std::cell::Cell;
+        let asked = Cell::new(0);
+        let check = || {
+            asked.set(asked.get() + 1);
+            true
+        };
+        let out = install_outcome("OTO_RESULT=reboot\n", check, Duration::ZERO);
+        assert_eq!(out, Outcome::InstalledNeedsReboot);
+        assert_eq!(asked.get(), 0);
+        assert_eq!(
+            install_outcome("OTO_RESULT=restarted\n", check, Duration::ZERO),
+            Outcome::Installed
+        );
+        assert_eq!(asked.get(), 1);
+        assert_eq!(
+            uninstall_outcome("OTO_RESULT=reboot\n", check, Duration::ZERO),
+            UninstallOutcome::RemovedNeedsReboot
+        );
+        assert_eq!(
+            uninstall_outcome("OTO_RESULT=absent\n", check, Duration::ZERO),
+            UninstallOutcome::NotInstalled
+        );
+        assert_eq!(
+            uninstall_outcome("OTO_RESULT=restarted\n", check, Duration::ZERO),
+            UninstallOutcome::Removed
+        );
+    }
+
+    #[test]
+    fn reads_driver_revisions_from_info_plists() {
+        let dir = std::env::temp_dir().join(format!("oto-driver-plist-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let plist = |name: &str, extra: &str| {
+            let p = dir.join(name);
+            std::fs::write(
+                &p,
+                format!(
+                    r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict><key>CFBundleVersion</key><string>0.0.3</string>{extra}</dict></plist>"#
+                ),
+            )
+            .unwrap();
+            p
+        };
+        let current = plist(
+            "current.plist",
+            "<key>OtoDriverVersion</key><integer>7</integer>",
+        );
+        let legacy = plist("legacy.plist", "");
+        assert_eq!(bundle_version(&current), Some(7));
+        assert_eq!(bundle_version(&legacy), Some(0));
+        assert_eq!(bundle_version(&dir.join("missing.plist")), None);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The command sequences, run for real as the current user against a scratch directory,
-    /// with the root-only tools replaced by shell functions.
+    /// with the root-only tools replaced by shell functions and `oto-hal-helper` by a script
+    /// that installs with plain renames and reports what `FAKE_RESULT` says.
     #[cfg(unix)]
     mod sequence {
         use super::*;
 
         struct Scratch(PathBuf);
+
+        const FAKE_HELPER: &str = r#"#!/bin/sh
+echo "$0 $*" >> "$(dirname "$FAKE_LOG")/args"
+case "$1" in
+  install)
+    [ "$5" = "$FAKE_UID" ] || exit 2
+    D="$3/$4"
+    [ -n "${FAKE_RC:-}" ] && exit "$FAKE_RC"
+    rm -rf "$3/.$4.swap"
+    cp -R "$2" "$3/.$4.swap" || exit 1
+    rm -rf "$D"; mv "$3/.$4.swap" "$D" || exit 1
+    echo "OTO_RESULT=${FAKE_RESULT:-restarted}" ;;
+  uninstall)
+    D="$2/$3"
+    if [ ! -e "$D" ]; then echo OTO_RESULT=absent; exit 0; fi
+    rm -rf "$D" || exit 1
+    echo "OTO_RESULT=${FAKE_RESULT:-restarted}" ;;
+  *) exit 2 ;;
+esac
+"#;
 
         impl Scratch {
             fn new(name: &str) -> Self {
@@ -520,7 +874,17 @@ mod tests {
                     .join(format!("oto driver's test-{}-{name}", std::process::id()));
                 let _ = std::fs::remove_dir_all(&dir);
                 std::fs::create_dir_all(&dir).unwrap();
-                Self(dir.canonicalize().unwrap())
+                let s = Self(dir.canonicalize().unwrap());
+                let helper = s.helper();
+                std::fs::create_dir_all(helper.parent().unwrap()).unwrap();
+                std::fs::write(&helper, FAKE_HELPER).unwrap();
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755)).unwrap();
+                s
+            }
+
+            fn helper(&self) -> PathBuf {
+                self.0.join("bundle helper").join(HELPER_NAME)
             }
 
             /// A stand-in driver bundle whose executable holds `marker`.
@@ -554,6 +918,68 @@ mod tests {
                 names.sort();
                 names
             }
+
+            /// Staging folders left behind.
+            fn stages(&self) -> usize {
+                std::fs::read_dir(&self.0)
+                    .unwrap()
+                    .filter(|e| {
+                        e.as_ref()
+                            .unwrap()
+                            .file_name()
+                            .to_string_lossy()
+                            .starts_with("stage.")
+                    })
+                    .count()
+            }
+
+            fn install(&self, src: &Path) -> String {
+                let (req, hreq) = (requirement(None), requirement_for(HELPER_ID, None));
+                let helper = self.helper();
+                install_command(src, &params(&helper, &self.hal(), &req, &hreq))
+            }
+
+            fn uninstall(&self) -> String {
+                let hreq = requirement_for(HELPER_ID, None);
+                let helper = self.helper();
+                uninstall_command(&params(&helper, &self.hal(), "", &hreq))
+            }
+
+            /// Runs `command` with chown/xattr as no-ops, mktemp inside the scratch dir, the given
+            /// codesign results (helper, driver) and the helper's reported result.
+            fn run(
+                &self,
+                command: &str,
+                codesign: (i32, i32),
+                env: &[(&str, &str)],
+            ) -> (bool, String, String) {
+                let (h, d) = codesign;
+                let stubs = format!(
+                    "chown() {{ :; }}; xattr() {{ :; }}; \
+                     mktemp() {{ command mktemp -d {}/stage.XXXXXX; }}; \
+                     codesign() {{ case \"$*\" in *oto-hal-helper*) return {h};; *) return {d};; esac; }}\n",
+                    shell_quote(&self.0.to_string_lossy())
+                );
+                std::fs::create_dir_all(self.0.join("log")).unwrap();
+                let out = Command::new("/bin/sh")
+                    .arg("-c")
+                    .arg(format!("{stubs}{command}"))
+                    .env("FAKE_LOG", self.0.join("log/x"))
+                    .env("FAKE_UID", "501")
+                    .envs(env.iter().copied())
+                    .output()
+                    .unwrap();
+                (
+                    out.status.success(),
+                    String::from_utf8_lossy(&out.stdout).into_owned(),
+                    String::from_utf8_lossy(&out.stderr).into_owned(),
+                )
+            }
+
+            /// What the staged helper was run as.
+            fn helper_calls(&self) -> String {
+                std::fs::read_to_string(self.0.join("log/args")).unwrap_or_default()
+            }
         }
 
         impl Drop for Scratch {
@@ -562,91 +988,129 @@ mod tests {
             }
         }
 
-        /// Runs `command` with chown/xattr as no-ops and the given codesign/killall results.
-        fn run(command: &str, codesign: i32, killall: i32) -> (bool, String, String) {
-            let stubs = format!(
-                "chown() {{ :; }}; xattr() {{ :; }}; codesign() {{ return {codesign}; }}; killall() {{ return {killall}; }}\n"
-            );
-            let out = Command::new("/bin/sh")
-                .arg("-c")
-                .arg(format!("{stubs}{command}"))
-                .output()
-                .unwrap();
-            (
-                out.status.success(),
-                String::from_utf8_lossy(&out.stdout).into_owned(),
-                String::from_utf8_lossy(&out.stderr).into_owned(),
-            )
-        }
-
         #[test]
-        fn installs_fresh_then_replaces() {
+        fn installs_fresh_then_replaces_through_the_staged_helper() {
             let t = Scratch::new("fresh");
+
             let src = t.source("one");
-            let req = requirement(None);
-            let (ok, out, err) = run(&install_command(&src, &t.hal(), &req), 0, 0);
+            let (ok, out, err) = t.run(&t.install(&src), (0, 0), &[]);
             assert!(ok, "{err}");
             assert_eq!(parse_result(&out), Restart::Restarted);
             assert_eq!(t.installed().as_deref(), Some("one"));
+            // The copy in the staging folder ran, not the one in the bundle.
+            let calls = t.helper_calls();
+            assert!(calls.contains("/stage."), "{calls}");
+            assert!(calls.contains(" install "), "{calls}");
+            assert!(calls.trim_end().ends_with(" 501"), "{calls}");
 
             let src = t.source("two");
-            let (ok, _, err) = run(&install_command(&src, &t.hal(), &req), 0, 0);
+            let (ok, _, err) = t.run(&t.install(&src), (0, 0), &[]);
             assert!(ok, "{err}");
             assert_eq!(t.installed().as_deref(), Some("two"));
-            // No staging or set-aside copies are left behind.
             assert_eq!(t.listing(), [BUNDLE_NAME]);
+            assert_eq!(t.stages(), 0);
+        }
+
+        fn ready(name: &str) -> Scratch {
+            Scratch::new(name)
         }
 
         #[test]
-        fn a_failed_restart_asks_for_a_reboot() {
-            let t = Scratch::new("reboot");
+        fn busy_audio_asks_for_a_reboot() {
+            let t = ready("reboot");
             let src = t.source("one");
-            let (ok, out, _) = run(&install_command(&src, &t.hal(), &requirement(None)), 0, 1);
+            let (ok, out, _) = t.run(&t.install(&src), (0, 0), &[("FAKE_RESULT", "reboot")]);
             assert!(ok);
             assert_eq!(parse_result(&out), Restart::NeedsReboot);
             assert_eq!(t.installed().as_deref(), Some("one"));
+            assert_eq!(t.stages(), 0);
         }
 
         #[test]
-        fn a_bad_signature_leaves_the_old_driver() {
-            let t = Scratch::new("badsig");
-            let req = requirement(None);
+        fn a_bad_driver_signature_leaves_the_old_driver() {
+            let t = ready("badsig");
             let src = t.source("old");
-            assert!(run(&install_command(&src, &t.hal(), &req), 0, 0).0);
+            assert!(t.run(&t.install(&src), (0, 0), &[]).0);
 
             let src = t.source("evil");
-            let (ok, out, err) = run(&install_command(&src, &t.hal(), &req), 1, 0);
+            let (ok, out, err) = t.run(&t.install(&src), (0, 1), &[]);
             assert!(!ok);
             assert!(out.is_empty(), "{out}");
-            assert!(err.contains("signature isn't valid"), "{err}");
+            assert!(err.contains("driver's code signature isn't valid"), "{err}");
             assert_eq!(t.installed().as_deref(), Some("old"));
             assert_eq!(t.listing(), [BUNDLE_NAME]);
+            assert_eq!(t.stages(), 0);
+        }
+
+        #[test]
+        fn a_bad_helper_signature_runs_nothing() {
+            let t = ready("badhelper");
+            let src = t.source("one");
+            let (ok, _, err) = t.run(&t.install(&src), (1, 0), &[]);
+            assert!(!ok);
+            assert!(err.contains("installer helper's code signature"), "{err}");
+            assert!(t.helper_calls().is_empty());
+            assert!(t.installed().is_none());
+            let (ok, _, err) = t.run(&t.uninstall(), (1, 0), &[]);
+            assert!(!ok);
+            assert!(err.contains("nothing was removed"), "{err}");
+            assert!(t.helper_calls().is_empty());
+            assert_eq!(t.stages(), 0);
+        }
+
+        #[test]
+        fn a_failing_helper_is_reported() {
+            let t = ready("helperfail");
+            let src = t.source("one");
+            let (ok, _, err) = t.run(&t.install(&src), (0, 0), &[("FAKE_RC", "1")]);
+            assert!(!ok);
+            assert!(err.contains("Couldn't install the driver"), "{err}");
+            let (ok, _, err) = t.run(&t.install(&src), (0, 0), &[("FAKE_RC", "3")]);
+            assert!(!ok);
+            assert!(err.contains("newer"), "{err}");
+            assert_eq!(t.stages(), 0);
         }
 
         #[test]
         fn a_missing_source_fails_cleanly() {
-            let t = Scratch::new("missing");
+            let t = ready("missing");
             let src = t.0.join("nope").join(BUNDLE_NAME);
-            let (ok, _, err) = run(&install_command(&src, &t.hal(), &requirement(None)), 0, 0);
+            let (ok, _, err) = t.run(&t.install(&src), (0, 0), &[]);
             assert!(!ok);
             assert!(err.contains("Couldn't copy the driver"), "{err}");
             assert!(t.listing().is_empty(), "{:?}", t.listing());
+            assert_eq!(t.stages(), 0);
         }
 
         #[test]
         fn uninstalls() {
-            let t = Scratch::new("uninstall");
+            let t = ready("uninstall");
             let src = t.source("one");
-            assert!(run(&install_command(&src, &t.hal(), &requirement(None)), 0, 0).0);
+            assert!(t.run(&t.install(&src), (0, 0), &[]).0);
 
-            let (ok, out, err) = run(&uninstall_command(&t.hal()), 0, 1);
+            let (ok, out, err) = t.run(&t.uninstall(), (0, 0), &[("FAKE_RESULT", "reboot")]);
             assert!(ok, "{err}");
             assert_eq!(parse_result(&out), Restart::NeedsReboot);
             assert!(t.listing().is_empty(), "{:?}", t.listing());
 
-            let (ok, out, _) = run(&uninstall_command(&t.hal()), 0, 0);
+            let (ok, out, _) = t.run(&t.uninstall(), (0, 0), &[]);
             assert!(ok);
             assert_eq!(parse_result(&out), Restart::Absent);
+            assert!(t.helper_calls().contains(" uninstall "));
+            assert_eq!(t.stages(), 0);
         }
+    }
+
+    #[test]
+    fn check_no_downgrade_refuses_newer_loaded_or_on_disk() {
+        use oto_engine::DriverStatus::{Absent, Loaded, Unknown};
+        assert!(check_no_downgrade(Loaded(2), None, 1).is_err());
+        assert!(check_no_downgrade(Loaded(1), Some(2), 1).is_err());
+        assert!(check_no_downgrade(Loaded(0), Some(2), 1).is_err());
+        assert!(check_no_downgrade(Absent, Some(2), 1).is_err());
+        assert!(check_no_downgrade(Unknown, Some(2), 1).is_err());
+        assert!(check_no_downgrade(Loaded(1), Some(1), 1).is_ok());
+        assert!(check_no_downgrade(Loaded(0), Some(0), 1).is_ok());
+        assert!(check_no_downgrade(Absent, None, 1).is_ok());
     }
 }

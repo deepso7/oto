@@ -1,7 +1,7 @@
 //! The menu-bar status item. On macOS it's `tray-icon`'s `NSStatusItem`, made on Rune's main
 //! thread from an `AppHandle::update` once the event loop runs (Rune's own `Tray` has no macOS
 //! backend yet). A left click toggles the popover under the item; a right click opens the menu:
-//! the switch, Open Oto, Quit. Elsewhere there's no tray yet and the app opens a normal window.
+//! the switch, Open Oto, Check for Updates (or Update to vX.Y.Z), Quit. Elsewhere there's no tray yet and the app opens a normal window.
 
 use std::time::{Duration, Instant};
 
@@ -134,6 +134,21 @@ pub fn popover_origin(
     Some((x as f32, (bar_bottom + GAP) as f32))
 }
 
+/// The menu's update item without an offer.
+pub const CHECK_FOR_UPDATES: &str = "Check for Updates\u{2026}";
+
+/// The menu's update item: with an offer, the popover shows it; otherwise Settings opens on
+/// the Updates card and a manual check starts.
+pub fn update_item(s: &mut State, h: &AppHandle<State>) {
+    if s.update.info().is_some() {
+        s.page = crate::state::Page::Main;
+    } else {
+        s.open_settings();
+        s.check_for_updates(true);
+    }
+    show_window(s, h);
+}
+
 pub fn toggle_window(s: &mut State, h: &AppHandle<State>) {
     if h.is_visible() {
         // A hidden popover must not keep the mic or the speakers.
@@ -162,6 +177,7 @@ mod mac {
     pub struct Tray {
         icon: TrayIcon,
         toggle: CheckMenuItem,
+        update: MenuItem,
     }
 
     fn icon(on: bool) -> Icon {
@@ -175,12 +191,14 @@ mod mac {
             let toggle =
                 CheckMenuItem::with_id("toggle", "Noise Cancellation", true, enabled, None);
             let open = MenuItem::with_id("open", "Open Oto…", true, None);
+            let update = MenuItem::with_id("update", super::CHECK_FOR_UPDATES, true, None);
             let quit = MenuItem::with_id("quit", "Quit Oto", true, None);
             let menu = Menu::new();
             menu.append_items(&[
                 &toggle,
                 &PredefinedMenuItem::separator(),
                 &open,
+                &update,
                 &PredefinedMenuItem::separator(),
                 &quit,
             ])
@@ -203,6 +221,10 @@ mod mac {
                         let h2 = h.clone();
                         h.update(move |s, _| super::show_window(s, &h2));
                     }
+                    "update" => {
+                        let h2 = h.clone();
+                        h.update(move |s, _| super::update_item(s, &h2));
+                    }
                     "quit" => h.update(|s, tx| {
                         s.shutdown();
                         tx.quit();
@@ -221,12 +243,22 @@ mod mac {
                     h.update(move |s, _| super::toggle_window(s, &h2));
                 }
             }));
-            Ok(Tray { icon, toggle })
+            Ok(Tray {
+                icon,
+                toggle,
+                update,
+            })
         }
 
         pub fn set_enabled(&self, on: bool) {
             self.toggle.set_checked(on);
             let _ = self.icon.set_icon_templated(Some(icon(on)));
+        }
+
+        /// The update item's label: `None` is "Check for Updates…".
+        pub fn set_update_label(&self, label: Option<&str>) {
+            self.update
+                .set_text(label.unwrap_or(super::CHECK_FOR_UPDATES));
         }
 
         /// Where a `size` window goes under the status item; see [`super::popover_origin`].
@@ -266,6 +298,7 @@ mod other {
             Err("no tray on this platform yet".into())
         }
         pub fn set_enabled(&self, _: bool) {}
+        pub fn set_update_label(&self, _: Option<&str>) {}
         pub fn popover_origin(&self, _: (f32, f32)) -> Option<(f32, f32)> {
             None
         }

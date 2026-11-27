@@ -75,6 +75,17 @@ enum {
 #define SINK_UID "dev.oto.sink"
 #define MODEL_UID "dev.oto.loopback"
 
+// Driver revision (driver/macos/DRIVER_VERSION), passed by the Makefile. Served on the mic as the
+// custom property 'otvr' (a CFString, so it crosses the HAL's IPC boundary) for oto-engine's
+// compatibility check. Drivers built before this property existed are revision 0.
+#ifndef OTO_DRIVER_VERSION
+#error "OTO_DRIVER_VERSION must be defined (see driver/macos/Makefile)"
+#endif
+#define OTO_STR2(x) #x
+#define OTO_STR(x) OTO_STR2(x)
+#define DRIVER_VERSION_STR OTO_STR(OTO_DRIVER_VERSION)
+#define kOtoPropertyDriverVersion 0x6f747672u // 'otvr'
+
 // ---------------------------------------------------------------------------------------------
 // State
 
@@ -278,6 +289,17 @@ static OSStatus get_prop(AudioObjectID obj, const AudioObjectPropertyAddress* a,
             return noErr;
         }
         case kAudioDevicePropertyIcon: return kAudioHardwareUnknownPropertyError;
+        case kAudioObjectPropertyCustomPropertyInfoList: {
+            if (!mic) { *outSize = 0; return noErr; }
+            AudioServerPlugInCustomPropertyInfo info = {kOtoPropertyDriverVersion,
+                                                        kAudioServerPlugInCustomPropertyDataTypeCFString,
+                                                        kAudioServerPlugInCustomPropertyDataTypeNone};
+            PUT(AudioServerPlugInCustomPropertyInfo, info);
+        }
+        case kOtoPropertyDriverVersion:
+            if (!mic) return kAudioHardwareUnknownPropertyError;
+            // Immortal constant: no allocation, and the client's CFRelease is a no-op on it.
+            PUT(CFStringRef, CFSTR(DRIVER_VERSION_STR));
         }
         return kAudioHardwareUnknownPropertyError;
     }

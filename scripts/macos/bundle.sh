@@ -1,8 +1,9 @@
 #!/bin/bash
 # SPDX-License-Identifier: MIT OR Apache-2.0
 # Builds target/bundle/Oto.app: the release oto-app binary, its Info.plist, the licence and
-# third-party notice files, and the prebuilt driver the app installs
-# (Contents/Resources/OtoMicrophone.driver). See packaging/macos/README.md.
+# third-party notice files, the prebuilt driver the app installs
+# (Contents/Resources/OtoMicrophone.driver) and the helper that installs it
+# (Contents/Helpers/oto-hal-helper). See packaging/macos/README.md.
 #
 #   scripts/macos/bundle.sh                                         ad-hoc signed, for this Mac
 #   SIGN_ID="Developer ID Application: Name (TEAMID)" scripts/macos/bundle.sh
@@ -60,12 +61,16 @@ else
     TARGETS=()
 fi
 
+# The driver's revision comes only from driver/macos/DRIVER_VERSION, never from the app version,
+# so app-only releases ship a byte-identical driver.
 echo "==> Driver"
 if [ "$RELEASE" -eq 1 ]; then
-    make -C "$ROOT/driver/macos" release SIGN_ID="$SIGN_ID" VERSION="$VERSION"
+    make -C "$ROOT/driver/macos" release SIGN_ID="$SIGN_ID"
 else
-    make -C "$ROOT/driver/macos" SIGN_ID="$SIGN_ID" VERSION="$VERSION"
+    make -C "$ROOT/driver/macos" SIGN_ID="$SIGN_ID"
 fi
+HELPER="$ROOT/driver/macos/build/oto-hal-helper"
+[ -x "$HELPER" ] || die "the driver build did not produce $HELPER."
 
 export MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-12.0}"
 # OTO_FEATURES replaces the app's default cargo features, e.g. "dfn3,onnx" for a release.
@@ -110,7 +115,7 @@ fi
 echo "==> $APP"
 mkdir -p "$OUT"
 rm -rf "$OUT/Oto.app"
-mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" "$APP/Contents/Helpers"
 cp "$APP_BIN" "$APP/Contents/MacOS/oto-app"
 sed "s/@VERSION@/$VERSION/g" "$PKG/Info.plist.in" > "$APP/Contents/Info.plist"
 # The app icon: packaging/macos/AppIcon.icns, built by scripts/macos/make-icon.sh.
@@ -123,12 +128,16 @@ printf 'APPL????' > "$APP/Contents/PkgInfo"
 cp "$ROOT/LICENSE-MIT" "$ROOT/LICENSE-APACHE" "$ROOT/THIRD_PARTY_NOTICES.md" "$APP/Contents/Resources/"
 # The driver is already signed by its Makefile; cp -R keeps that signature intact.
 cp -R "$ROOT/driver/macos/build/$DRIVER" "$APP/Contents/Resources/$DRIVER"
+# Signed by the same Makefile run as the driver (identifier dev.oto.hal-helper); cp -p keeps it.
+cp -p "$HELPER" "$APP/Contents/Helpers/oto-hal-helper"
 xattr -cr "$APP"
 
-# Inside-out: the driver's signature (made above) is verified first, then the app is signed
-# around it. No --deep when signing: each piece is signed with its own options.
+# Inside-out: the driver's and the helper's signatures (made above) are verified first, then
+# the app is signed around them. No --deep when signing: each piece is signed with its own
+# options.
 echo "==> Signing"
 codesign --verify --strict "$APP/Contents/Resources/$DRIVER"
+codesign --verify --strict "$APP/Contents/Helpers/oto-hal-helper"
 if [ "$RELEASE" -eq 1 ]; then
     codesign --force --options runtime --timestamp \
         --entitlements "$PKG/Oto.entitlements" -s "$SIGN_ID" "$APP"
@@ -140,8 +149,10 @@ else
 fi
 
 codesign --verify --deep --strict --verbose=2 "$APP"
-# --deep does not descend into Resources, so check the embedded driver survived the copy.
+# --deep does not descend into Resources, so check the embedded driver survived the copy; and
+# check the helper separately too, since it runs on its own (as root) outside the app.
 codesign --verify --strict "$APP/Contents/Resources/$DRIVER"
+codesign --verify --strict "$APP/Contents/Helpers/oto-hal-helper"
 echo
 echo "Built $APP ($(du -sh "$APP" | cut -f1 | tr -d " "), version $VERSION, $(lipo -archs "$APP/Contents/MacOS/oto-app"))"
 if [ "$RELEASE" -eq 1 ]; then

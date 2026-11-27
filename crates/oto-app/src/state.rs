@@ -1,19 +1,26 @@
 //! The app's state and everything that changes it. No Rune views and no I/O beyond the hooks
 //! [`Hooks`] names, so it unit-tests without a window or an engine.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::Sender;
+use std::sync::mpsc::{Sender, SyncSender};
 
 use oto_engine::dsp::Model;
 use oto_engine::test_capture::TestRecording;
-use oto_engine::{Command, Event, InputDevice, Settings, Strength, Tier};
+use oto_engine::{
+    BUNDLED_DRIVER_VERSION, Command, DriverStatus, Event, InputDevice,
+    MIN_COMPATIBLE_DRIVER_VERSION, Settings, Strength, Tier,
+};
 
 use crate::driver::{Outcome, REBOOT_MESSAGE, UninstallOutcome};
 use crate::meter::Meter;
 use crate::permission::Mic;
 use crate::prefs::Prefs;
 use crate::tray::Tray;
+use crate::updater::apply::{InstallMode, NotifyReason, UnsupportedReason};
+use crate::updater::keys::RELEASES_URL;
+use crate::updater::verify::{CheckOutcome, StagedUpdate, UpdateInfo};
 
 /// Shows the "Hear the Difference" test: record a few seconds, then compare raw and cleaned.
 pub const HEAR_TEST: bool = true;
@@ -21,6 +28,17 @@ pub const HEAR_TEST: bool = true;
 pub const HEAR_SECONDS: f32 = 5.0;
 /// Why "Hear the Difference" can't start during a call: it opens the mic and the speakers.
 pub const HEAR_IN_CALL: &str = "End your call to run the mic test.";
+/// Why nothing that touches the audio setup runs while an update candidate waits to commit.
+pub const FINISHING_UPDATE: &str = "Finishing update\u{2026}";
+/// Why "Restart to Update" and driver changes wait during a call.
+pub const UPDATE_IN_CALL: &str = "End your call to finish updating.";
+/// What the host thread says when it can't tell whether a call is active.
+pub const CALL_CHECK_FAILED: &str =
+    "Couldn't verify whether a call is active. Try again in a moment.";
+/// What a driver install or update warns about before the password prompt.
+pub const DRIVER_PAUSE: &str = "Asks for your password. Audio will pause briefly in all apps (or finish on your next restart if audio is playing).";
+/// How long between automatic update checks, seconds.
+pub const UPDATE_INTERVAL_SECS: u64 = 24 * 60 * 60;
 
 /// The main page's two modes. Noise Cancellation runs the model picked in Settings
 /// ([`Prefs::nc_tier`]); Voice Isolation is [`Tier::Isolate`].
@@ -88,11 +106,194 @@ pub enum EngineState {
 /// What the system says right now, read off the UI thread.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Probe {
-    /// Core Audio lists Oto Microphone.
-    pub driver: bool,
-    /// The driver bundle is in the HAL plug-in folder, loaded or not.
-    pub on_disk: bool,
+    /// The driver as Core Audio sees it, with its revision.
+    pub driver_status: DriverStatus,
+    /// `OtoDriverVersion` of the driver bundle in the HAL plug-in folder, loaded or not (0 for
+    /// legacy drivers); `None` if absent.
+    pub on_disk_version: Option<u32>,
     pub mic: Mic,
+}
+
+impl Probe {
+    pub fn new(driver_status: DriverStatus, on_disk_version: Option<u32>, mic: Mic) -> Probe {
+        Probe {
+            driver_status,
+            on_disk_version,
+            mic,
+        }
+    }
+
+    /// Core Audio lists Oto Microphone (any revision).
+    pub fn is_loaded(&self) -> bool {
+        self.driver_status.is_loaded()
+    }
+
+    /// The driver bundle is in the HAL plug-in folder, loaded or not.
+    pub fn is_on_disk(&self) -> bool {
+        self.on_disk_version.is_some()
+    }
+}
+
+/// The driver as the UI presents it: the state table of docs/plans/0003-app-updates.md,
+/// Decision 5.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DriverUiState {
+    /// Not loaded, not on disk: onboarding, **Install…**.
+    NotInstalled,
+    /// On disk, not loaded: restart the Mac to finish.
+    InstalledNeedsReboot,
+    /// This build's revision is loaded and the copy on disk is as new.
+    UpToDate,
+    /// This build's revision is loaded, but the copy on disk is missing or older: **Reinstall…**.
+    OnDiskOutdatedOrMissing,
+    /// A newer compatible driver is loaded (an older Oto opened): never offer a downgrade.
+    NewerLoaded,
+    /// A new driver is on disk; Core Audio still holds the old one until a restart.
+    UpdateNeedsReboot,
+    /// Removed on disk, still loaded until a restart.
+    RemovedNeedsReboot,
+    /// An older, compatible driver runs: a non-blocking **Update Driver…** banner.
+    UpdateAvailable,
+    /// The loaded driver is too old for this engine: an urgent **Update Driver…** banner.
+    Incompatible,
+    /// Core Audio couldn't say; nothing is flagged.
+    Unknown,
+}
+
+impl DriverUiState {
+    /// Places the loaded driver and the one on disk in the state table.
+    pub fn of(loaded: DriverStatus, on_disk: Option<u32>, bundled: u32, min_compat: u32) -> Self {
+        let rev = match loaded {
+            DriverStatus::Unknown => return Self::Unknown,
+            DriverStatus::Absent if on_disk.is_some() => return Self::InstalledNeedsReboot,
+            DriverStatus::Absent => return Self::NotInstalled,
+            DriverStatus::Loaded(rev) => rev,
+        };
+        if rev > bundled {
+            return Self::NewerLoaded;
+        }
+        if rev == bundled {
+            return match on_disk {
+                Some(d) if d >= bundled => Self::UpToDate,
+                _ => Self::OnDiskOutdatedOrMissing,
+            };
+        }
+        match on_disk {
+            Some(d) if d >= bundled => Self::UpdateNeedsReboot,
+            None => Self::RemovedNeedsReboot,
+            Some(_) if rev < min_compat => Self::Incompatible,
+            Some(_) => Self::UpdateAvailable,
+        }
+    }
+
+    /// The install button offers an update rather than a reinstall.
+    pub fn offers_update(self) -> bool {
+        matches!(self, Self::UpdateAvailable | Self::Incompatible)
+    }
+}
+
+/// The app update, from the check to the restart.
+#[derive(Clone, Debug, PartialEq)]
+pub enum UpdateState {
+    Idle,
+    /// A check is under way; `manual` ones report every result, background ones only offers.
+    Checking {
+        manual: bool,
+    },
+    UpToDate,
+    Available(UpdateInfo),
+    Downloading {
+        info: UpdateInfo,
+        pct: u8,
+    },
+    Verifying(UpdateInfo),
+    /// Downloaded and verified: **Restart to Update**.
+    Ready(StagedUpdate),
+    /// Staging next to the app, shutting the engine down and handing over to the helper.
+    Applying,
+    /// The manifest isn't signed by a key this build trusts: neutral copy, link to Releases.
+    UnrecognizedKey {
+        releases_url: String,
+    },
+    /// A newer version needs a newer macOS.
+    IncompatibleOs {
+        version: String,
+        min_os: String,
+    },
+    Failed(String),
+}
+
+impl UpdateState {
+    /// The offer this state is about, if any.
+    pub fn info(&self) -> Option<&UpdateInfo> {
+        match self {
+            UpdateState::Available(i)
+            | UpdateState::Downloading { info: i, .. }
+            | UpdateState::Verifying(i) => Some(i),
+            UpdateState::Ready(staged) => Some(&staged.info),
+            _ => None,
+        }
+    }
+
+    /// A download or verification is running.
+    pub fn downloading(&self) -> bool {
+        matches!(
+            self,
+            UpdateState::Downloading { .. } | UpdateState::Verifying(_)
+        )
+    }
+}
+
+/// One update operation (check, download, apply), for the hooks. `gen` identifies it: results
+/// of any other generation are stale and dropped. Setting `cancel` asks it to stop.
+#[derive(Clone, Debug)]
+pub struct UpdateJob {
+    pub generation: u64,
+    pub cancel: Arc<AtomicBool>,
+}
+
+/// The note on the update banner about the audio driver the new version brings, given the
+/// loaded driver's revision.
+pub fn update_driver_note(info: &UpdateInfo, loaded: Option<u32>) -> Option<&'static str> {
+    let loaded = loaded?;
+    if loaded < info.min_driver_version {
+        Some("Requires an audio driver update after restarting (asks for your password).")
+    } else if loaded < info.driver_version {
+        Some("An audio driver update may be offered separately after restarting.")
+    } else {
+        None
+    }
+}
+
+/// What the install mode says about updating, for captions.
+pub fn install_mode_note(mode: &InstallMode) -> Option<&'static str> {
+    match mode {
+        InstallMode::SelfUpdatable { .. } => None,
+        InstallMode::NotifyOnly(NotifyReason::NotInApplications) => {
+            Some("Move Oto to Applications for automatic updates.")
+        }
+        InstallMode::NotifyOnly(_) => Some("Download the installer to update Oto."),
+        InstallMode::Unsupported(UnsupportedReason::DevBuild) => {
+            Some("This development build doesn\u{2019}t update itself.")
+        }
+    }
+}
+
+/// Only GitHub pages of the project open from the app.
+pub fn openable_url(url: &str) -> bool {
+    url.starts_with("https://github.com/deepso7/oto/")
+        && !url.contains(char::is_whitespace)
+        && !url.contains(['"', '\\', '`'])
+}
+
+/// An automatic check is due: they're on, this copy can update (or at least be told about
+/// one), and the last check finished a day or more ago.
+pub fn update_check_due(prefs: &Prefs, mode: &InstallMode, now: u64) -> bool {
+    prefs.check_for_updates
+        && !matches!(mode, InstallMode::Unsupported(_))
+        && prefs
+            .last_update_check
+            .is_none_or(|t| now.saturating_sub(t) >= UPDATE_INTERVAL_SECS || t > now)
 }
 
 /// Which popup select is open.
@@ -129,11 +330,29 @@ pub struct HearJob {
 }
 
 /// What the UI asks of the engine's host thread.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 pub enum Request {
     Cmd(Command),
     /// Make Oto Microphone the system default input (`true`) or put the previous one back.
     SystemMic(bool),
+    /// An update is about to swap the app: unless a call is active, stop the engine, restore
+    /// the default input and end the host thread (releasing `engine.lock`). On `Err` the engine
+    /// keeps (or goes back to) running.
+    CommitShutdown(SyncSender<Result<(), String>>),
+    /// The update this candidate belongs to is durable: leave inert mode.
+    CommitCandidate(SyncSender<Result<(), String>>),
+}
+
+impl PartialEq for Request {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Request::Cmd(a), Request::Cmd(b)) => a == b,
+            (Request::SystemMic(a), Request::SystemMic(b)) => a == b,
+            (Request::CommitShutdown(_), Request::CommitShutdown(_))
+            | (Request::CommitCandidate(_), Request::CommitCandidate(_)) => true,
+            _ => false,
+        }
+    }
 }
 
 /// Where requests go.
@@ -188,6 +407,21 @@ pub struct Hooks {
     pub stop_hear_test: fn(),
     /// Switches the playback between raw (`false`) and cleaned.
     pub set_hear_cleaned: fn(bool),
+    /// Checks for an update off the UI thread; the result comes back through
+    /// [`State::update_checked`].
+    pub check_update: fn(UpdateJob),
+    /// Downloads and verifies an update off the UI thread; progress comes back through
+    /// [`State::update_progress`] and [`State::update_verifying`], the result through
+    /// [`State::update_downloaded`].
+    pub download_update: fn(UpdateJob, UpdateInfo),
+    /// Stages the update next to the app at `PathBuf`, asks the engine to shut down through
+    /// [`State::commit_shutdown`] and hands over to the helper; quits on success, else reports
+    /// through [`State::update_apply_failed`].
+    pub apply_update: fn(UpdateJob, StagedUpdate, PathBuf),
+    /// Opens a validated `https://github.com/` page in the browser.
+    pub open_url: fn(&str) -> Result<(), String>,
+    /// Seconds since the Unix epoch.
+    pub now: fn() -> u64,
 }
 
 impl Hooks {
@@ -203,6 +437,11 @@ impl Hooks {
         play_hear_test: |_| Ok(()),
         stop_hear_test: || {},
         set_hear_cleaned: |_| {},
+        check_update: |_| {},
+        download_update: |_, _| {},
+        apply_update: |_, _, _| {},
+        open_url: |_| Ok(()),
+        now: || 0,
     };
 }
 
@@ -264,6 +503,25 @@ pub struct State {
     pub size: (f32, f32),
     /// When the popover last hid for losing focus.
     pub hidden_at: Option<std::time::Instant>,
+    /// The loaded driver, as last known for certain (an `Unknown` probe keeps the last).
+    pub driver_status: DriverStatus,
+    /// The revision of the driver on disk; `None` when there is none.
+    pub on_disk_version: Option<u32>,
+    pub update: UpdateState,
+    /// How this copy can update itself; classified off the UI thread once the engine started.
+    pub install_mode: InstallMode,
+    /// The current update operation's generation; results of others are dropped.
+    update_gen: u64,
+    /// The current update operation's cancel flag.
+    update_cancel: Option<Arc<AtomicBool>>,
+    /// This process is an update's new build, waiting for the update to become durable: no
+    /// side effects (settings, login item, driver, microphone, system microphone, the mic
+    /// test, onboarding) until [`State::commit_candidate`].
+    pub candidate_pending: bool,
+    /// A save was skipped while `candidate_pending`; done at commit.
+    save_deferred: bool,
+    /// The engine was told to shut down (quit, or an update's [`Request::CommitShutdown`]).
+    shutdown_sent: bool,
 }
 
 /// What the user reads when the engine can't start.
@@ -321,6 +579,19 @@ impl State {
             focused: false,
             size: (crate::view::WIDTH, 400.0),
             hidden_at: None,
+            driver_status: if driver_installed {
+                DriverStatus::Loaded(BUNDLED_DRIVER_VERSION)
+            } else {
+                DriverStatus::Absent
+            },
+            on_disk_version: driver_installed.then_some(BUNDLED_DRIVER_VERSION),
+            update: UpdateState::Idle,
+            install_mode: InstallMode::Unsupported(UnsupportedReason::DevBuild),
+            update_gen: 0,
+            update_cancel: None,
+            candidate_pending: false,
+            save_deferred: false,
+            shutdown_sent: false,
         }
     }
 
@@ -328,6 +599,7 @@ impl State {
     /// they said "not now").
     pub fn onboarding(&self) -> bool {
         self.driver_known
+            && !self.candidate_pending
             && !self.skipped_onboarding
             && (!self.prefs.onboarded || !self.driver_installed)
     }
@@ -349,6 +621,10 @@ impl State {
     }
 
     fn save(&mut self) {
+        if self.candidate_pending {
+            self.save_deferred = true;
+            return;
+        }
         if let Err(e) = (self.hooks.save)(&self.prefs) {
             self.fail(e);
         }
@@ -504,6 +780,9 @@ impl State {
     }
 
     pub fn set_start_at_login(&mut self, on: bool) {
+        if self.candidate_pending {
+            return;
+        }
         match (self.hooks.set_login)(on) {
             Ok(()) => {
                 self.prefs.start_at_login = on;
@@ -525,8 +804,14 @@ impl State {
 
     /// Asks the engine for whatever the setting and the driver's presence call for, once.
     fn sync_system_mic(&mut self) {
+        if self.candidate_pending {
+            return;
+        }
+        // A driver known to be too old is refused by the engine: don't ask (and fail) until
+        // it is updated.
         let want = self.prefs.system_microphone
             && self.driver_installed
+            && (!self.driver_status.is_loaded() || self.driver_status.is_compatible())
             && !matches!(self.engine, EngineState::Failed(_));
         if want != self.system_mic_applied {
             self.system_mic_applied = want;
@@ -643,6 +928,29 @@ impl State {
                 self.error = Some(msg);
                 self.error_from_engine = true;
             }
+            // Its own urgent banner (`DriverUiState::Incompatible`), not a dismissible error.
+            // A probe that cannot tell yet (or is behind) must not hide it: the engine saw it.
+            Event::DriverIncompatible { loaded, .. } => {
+                if !self.install.busy() {
+                    self.driver_status = DriverStatus::Loaded(loaded);
+                    self.driver_installed = true;
+                    self.driver_known = true;
+                    // A loaded driver came from disk; the next probe corrects this.
+                    if self.on_disk_version.is_none() {
+                        self.on_disk_version = Some(loaded);
+                        self.driver_on_disk = true;
+                    }
+                }
+                // Not missing after all.
+                if self
+                    .error
+                    .as_deref()
+                    .is_some_and(|e| e.starts_with("Oto driver is not installed"))
+                {
+                    self.clear_engine_error();
+                }
+                self.sync_system_mic();
+            }
             // Only the engine error: Voice Isolation can stay muted (a failed load) while a
             // missing mic or a stall comes and goes; `DegradedCleared` ends that.
             Event::Recovered => self.clear_engine_error(),
@@ -685,6 +993,20 @@ impl State {
         self.engine = EngineState::Running;
     }
 
+    /// The host thread restarted its engine (a failed restore while an update shut it down):
+    /// the new engine needs the system microphone asked for again.
+    pub fn engine_restarted(&mut self) {
+        self.engine = EngineState::Running;
+        self.system_mic_applied = false;
+        self.shutdown_sent = false;
+        self.sync_system_mic();
+    }
+
+    /// How this copy of Oto can update, once the engine knows whether it holds `engine.lock`.
+    pub fn set_install_mode(&mut self, mode: InstallMode) {
+        self.install_mode = mode;
+    }
+
     /// `e` is `Engine::start`'s error.
     pub fn engine_failed(&mut self, e: &str) {
         self.engine = EngineState::Failed(engine_failure(e));
@@ -706,16 +1028,23 @@ impl State {
 
     /// Quitting: the host thread drops the engine, which stops audio and puts back the default
     /// input if "Use Oto as the system microphone" changed it.
+    /// Idempotent: after an update's [`Request::CommitShutdown`] (or a first quit) nothing more
+    /// is sent.
     pub fn shutdown(&mut self) {
         self.stop_hear_test();
-        self.command(Command::Shutdown);
+        if !self.shutdown_sent {
+            self.shutdown_sent = true;
+            self.command(Command::Shutdown);
+        }
     }
 
     // ----- "Hear the Difference" ---------------------------------------------------------------
 
     /// Why the test can't start now, if it can't. `None` means it can.
     pub fn hear_blocked(&self) -> Option<&'static str> {
-        if self.clients_active {
+        if self.candidate_pending {
+            Some(FINISHING_UPDATE)
+        } else if self.clients_active {
             Some(HEAR_IN_CALL)
         } else if self.engine != EngineState::Running {
             Some("Waits for Oto\u{2019}s audio engine.")
@@ -815,16 +1144,20 @@ impl State {
 
     /// A fresh look at the driver and the microphone permission.
     pub fn probed(&mut self, p: Probe) {
+        self.mic = p.mic;
+        // Core Audio couldn't say: keep what was last known for certain, and don't decide
+        // anything (setup included) on it.
+        if p.driver_status == DriverStatus::Unknown {
+            return;
+        }
         let first = !self.driver_known;
         self.driver_known = true;
         // While the installer runs its own result is the truth; it reports when it ends.
         if !self.install.busy() {
-            self.driver_installed = p.driver;
-            self.driver_on_disk = p.on_disk;
+            self.take_driver(&p);
         }
-        self.mic = p.mic;
         // Someone who already has the driver and the permission has nothing to set up.
-        if first && p.driver && p.mic == Mic::Authorized && !self.prefs.onboarded {
+        if first && p.is_loaded() && p.mic == Mic::Authorized && !self.prefs.onboarded {
             self.prefs.onboarded = true;
             self.save();
         }
@@ -834,6 +1167,9 @@ impl State {
     /// The step-two button: ask macOS, or, once it has said no, open System Settings (macOS
     /// asks only once).
     pub fn allow_mic(&mut self) {
+        if self.candidate_pending {
+            return;
+        }
         match self.mic {
             Mic::NotDetermined if !self.mic_requesting => {
                 self.mic_requesting = true;
@@ -867,8 +1203,59 @@ impl State {
 
     // ----- the driver --------------------------------------------------------------------------
 
+    /// The driver's place in the state table.
+    pub fn driver_ui(&self) -> DriverUiState {
+        DriverUiState::of(
+            self.driver_status,
+            self.on_disk_version,
+            BUNDLED_DRIVER_VERSION,
+            MIN_COMPATIBLE_DRIVER_VERSION,
+        )
+    }
+
+    /// The loaded driver's revision, if one is loaded.
+    pub fn loaded_driver(&self) -> Option<u32> {
+        match self.driver_status {
+            DriverStatus::Loaded(r) => Some(r),
+            _ => None,
+        }
+    }
+
+    fn take_driver(&mut self, p: &Probe) {
+        if p.driver_status != DriverStatus::Unknown {
+            self.driver_status = p.driver_status;
+            self.driver_installed = p.is_loaded();
+        }
+        self.driver_on_disk = p.is_on_disk();
+        self.on_disk_version = p.on_disk_version;
+    }
+
+    /// Why the driver can't be installed, updated or removed right now. Serialized with an app
+    /// update, and never during a call (the install restarts Core Audio).
+    pub fn install_blocked(&self) -> Option<&'static str> {
+        if self.candidate_pending {
+            Some(FINISHING_UPDATE)
+        } else if self.clients_active {
+            Some(UPDATE_IN_CALL)
+        } else if matches!(self.update, UpdateState::Applying) {
+            Some("Oto is updating.")
+        } else {
+            None
+        }
+    }
+
+    /// True if a driver newer than this build's bundled revision is either loaded in Core Audio
+    /// or already on disk: never offer or allow replacing it with our older bundled driver.
+    pub fn newer_driver_present(&self) -> bool {
+        matches!(self.driver_status, DriverStatus::Loaded(r) if r > BUNDLED_DRIVER_VERSION)
+            || self
+                .on_disk_version
+                .is_some_and(|v| v > BUNDLED_DRIVER_VERSION)
+    }
+
     pub fn start_install(&mut self) {
-        if !self.install.busy() {
+        if !self.install.busy() && self.install_blocked().is_none() && !self.newer_driver_present()
+        {
             self.install = Install::Running;
             (self.hooks.install)();
         }
@@ -876,11 +1263,10 @@ impl State {
 
     /// The install finished; `p` is what the system reports now.
     pub fn installed(&mut self, outcome: Outcome, p: Probe) {
-        self.driver_installed = p.driver;
-        self.driver_on_disk = p.on_disk;
+        self.take_driver(&p);
         self.mic = p.mic;
         self.install = match outcome {
-            Outcome::Installed if !p.driver => Install::Failed(
+            Outcome::Installed if !p.is_loaded() => Install::Failed(
                 "The installer finished, but Core Audio doesn't list Oto Microphone yet.".into(),
             ),
             Outcome::Installed => {
@@ -906,7 +1292,7 @@ impl State {
     }
 
     pub fn start_uninstall(&mut self) {
-        if !self.install.busy() {
+        if !self.install.busy() && self.install_blocked().is_none() {
             self.install = Install::Removing;
             // Stay on the settings page rather than jumping to setup when the driver goes.
             self.skipped_onboarding = true;
@@ -916,8 +1302,7 @@ impl State {
 
     /// The uninstall finished; `p` is what the system reports now.
     pub fn uninstalled(&mut self, outcome: UninstallOutcome, p: Probe) {
-        self.driver_installed = p.driver;
-        self.driver_on_disk = p.on_disk;
+        self.take_driver(&p);
         self.mic = p.mic;
         self.install = match outcome {
             UninstallOutcome::Removed
@@ -929,6 +1314,325 @@ impl State {
             UninstallOutcome::Failed(msg) => Install::Failed(msg),
         };
         self.sync_system_mic();
+    }
+
+    // ----- the update candidate ----------------------------------------------------------------
+
+    /// The update this process is the new build of is durable: the engine leaves inert mode,
+    /// skipped side effects happen now, and the UI (onboarding included) works normally.
+    pub fn commit_candidate(&mut self) {
+        if !self.candidate_pending {
+            return;
+        }
+        self.candidate_pending = false;
+        let (tx, _rx) = std::sync::mpsc::sync_channel(1);
+        self.send(Request::CommitCandidate(tx));
+        if std::mem::take(&mut self.save_deferred) {
+            self.save();
+        }
+        self.sync_system_mic();
+    }
+
+    // ----- app updates -------------------------------------------------------------------------
+
+    /// Ends the current update operation, if any, and starts generation `gen + 1`.
+    fn next_update_job(&mut self) -> UpdateJob {
+        if let Some(c) = self.update_cancel.take() {
+            c.store(true, Ordering::Release);
+        }
+        self.update_gen += 1;
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.update_cancel = Some(cancel.clone());
+        UpdateJob {
+            generation: self.update_gen,
+            cancel,
+        }
+    }
+
+    fn is_update_job(&self, generation: u64) -> bool {
+        generation == self.update_gen && self.update_cancel.is_some()
+    }
+
+    fn finish_update_job(&mut self) {
+        self.update_cancel = None;
+    }
+
+    fn set_update(&mut self, u: UpdateState) {
+        self.update = u;
+        let label = self
+            .update
+            .info()
+            .map(|i| format!("Update to v{}\u{2026}", i.version));
+        if let Some(t) = &self.tray {
+            t.set_update_label(label.as_deref());
+        }
+    }
+
+    /// The current update operation's generation (tests play the hooks' part with it).
+    #[cfg(test)]
+    pub fn update_generation(&self) -> u64 {
+        self.update_gen
+    }
+
+    /// Checks for an update. A manual check reports every result and offers a skipped version
+    /// again; a background one only ever shows an offer, and never opens the popover.
+    pub fn check_for_updates(&mut self, manual: bool) {
+        if self.candidate_pending {
+            return;
+        }
+        match self.update {
+            UpdateState::Checking { manual: m } => {
+                // Already checking: a manual request makes it report everything.
+                self.update = UpdateState::Checking {
+                    manual: m || manual,
+                };
+                return;
+            }
+            UpdateState::Downloading { .. }
+            | UpdateState::Verifying(_)
+            | UpdateState::Ready(_)
+            | UpdateState::Applying => return,
+            // An offer on screen stays unless the user asks again.
+            UpdateState::Available(_) | UpdateState::UnrecognizedKey { .. } if !manual => return,
+            _ => {}
+        }
+        let job = self.next_update_job();
+        self.set_update(UpdateState::Checking { manual });
+        (self.hooks.check_update)(job);
+    }
+
+    /// The background schedule's tick: checks if one is due.
+    pub fn maybe_check_for_updates(&mut self) {
+        let now = (self.hooks.now)();
+        if update_check_due(&self.prefs, &self.install_mode, now)
+            && matches!(
+                self.update,
+                UpdateState::Idle | UpdateState::UpToDate | UpdateState::Failed(_)
+            )
+        {
+            self.check_for_updates(false);
+        }
+    }
+
+    /// Check `gen` finished.
+    pub fn update_checked(&mut self, generation: u64, r: Result<CheckOutcome, String>) {
+        if !self.is_update_job(generation) {
+            return;
+        }
+        let UpdateState::Checking { manual } = self.update else {
+            return;
+        };
+        self.finish_update_job();
+        if r.is_ok() {
+            self.prefs.last_update_check = Some((self.hooks.now)());
+            self.save();
+        }
+        let next = match r {
+            Ok(CheckOutcome::UpToDate) => UpdateState::UpToDate,
+            Ok(CheckOutcome::Available(info)) => {
+                if !manual && self.prefs.skipped_version.as_deref() == Some(info.version.as_str()) {
+                    UpdateState::Idle
+                } else {
+                    UpdateState::Available(info)
+                }
+            }
+            Ok(CheckOutcome::UnrecognizedKey { releases_url }) => {
+                UpdateState::UnrecognizedKey { releases_url }
+            }
+            Ok(CheckOutcome::IncompatibleOs { version, min_os }) if manual => {
+                UpdateState::IncompatibleOs { version, min_os }
+            }
+            Ok(CheckOutcome::IncompatibleOs { .. }) => UpdateState::Idle,
+            Err(e) if manual => UpdateState::Failed(e),
+            // Offline, a captive portal, a server hiccup: the next check will do.
+            Err(_) => UpdateState::Idle,
+        };
+        self.set_update(next);
+    }
+
+    /// The offer's primary button: download and verify (when this copy can update itself), or
+    /// open the release page.
+    pub fn start_update(&mut self) {
+        if self.candidate_pending {
+            return;
+        }
+        match self.update.clone() {
+            UpdateState::Available(info) => {
+                if matches!(self.install_mode, InstallMode::SelfUpdatable { .. }) {
+                    let job = self.next_update_job();
+                    self.set_update(UpdateState::Downloading {
+                        info: info.clone(),
+                        pct: 0,
+                    });
+                    (self.hooks.download_update)(job, info);
+                } else {
+                    self.open_url(&info.notes_url);
+                }
+            }
+            UpdateState::UnrecognizedKey { .. } => self.open_url(RELEASES_URL),
+            _ => {}
+        }
+    }
+
+    /// Opens a project page on GitHub; anything else is refused.
+    pub fn open_url(&mut self, url: &str) {
+        let url = if openable_url(url) { url } else { RELEASES_URL };
+        if let Err(e) = (self.hooks.open_url)(url) {
+            self.fail(e);
+        }
+    }
+
+    /// The release notes of the version on offer.
+    pub fn open_release_notes(&mut self) {
+        if let Some(url) = self.update.info().map(|i| i.notes_url.clone()) {
+            self.open_url(&url);
+        }
+    }
+
+    pub fn update_progress(&mut self, generation: u64, pct: u8) {
+        if !self.is_update_job(generation) {
+            return;
+        }
+        if let UpdateState::Downloading { pct: p, .. } = &mut self.update {
+            *p = pct.min(100);
+        }
+    }
+
+    /// The download of `gen` is complete; its checks run now.
+    pub fn update_verifying(&mut self, generation: u64) {
+        if !self.is_update_job(generation) {
+            return;
+        }
+        if let UpdateState::Downloading { info, .. } = &self.update {
+            let info = info.clone();
+            self.set_update(UpdateState::Verifying(info));
+        }
+    }
+
+    /// Download `gen` ended. A cancelled one goes back to the offer.
+    pub fn update_downloaded(&mut self, generation: u64, r: Result<StagedUpdate, String>) {
+        if !self.is_update_job(generation) || !self.update.downloading() {
+            return;
+        }
+        self.finish_update_job();
+        let next = match r {
+            Ok(staged) => UpdateState::Ready(staged),
+            Err(e) => UpdateState::Failed(e),
+        };
+        self.set_update(next);
+    }
+
+    /// Stops a download (back to the offer) or a check (back to idle).
+    pub fn cancel_update(&mut self) {
+        let back = match &self.update {
+            UpdateState::Downloading { info, .. } | UpdateState::Verifying(info) => {
+                UpdateState::Available(info.clone())
+            }
+            UpdateState::Checking { .. } => UpdateState::Idle,
+            _ => return,
+        };
+        if let Some(c) = self.update_cancel.take() {
+            c.store(true, Ordering::Release);
+        }
+        // Whatever the cancelled job still reports is stale.
+        self.update_gen += 1;
+        self.set_update(back);
+    }
+
+    /// "Skip This Version": background checks won't offer it again.
+    pub fn skip_update(&mut self) {
+        if let UpdateState::Available(info) = &self.update {
+            self.prefs.skipped_version = Some(info.version.clone());
+            self.save();
+            self.set_update(UpdateState::Idle);
+        }
+    }
+
+    /// Hides the banner until the next check.
+    pub fn dismiss_update(&mut self) {
+        if matches!(
+            self.update,
+            UpdateState::Available(_)
+                | UpdateState::UnrecognizedKey { .. }
+                | UpdateState::IncompatibleOs { .. }
+                | UpdateState::Failed(_)
+                | UpdateState::UpToDate
+        ) {
+            self.set_update(UpdateState::Idle);
+        }
+    }
+
+    pub fn set_check_for_updates(&mut self, on: bool) {
+        if self.prefs.check_for_updates != on {
+            self.prefs.check_for_updates = on;
+            self.save();
+        }
+    }
+
+    /// Why **Restart to Update** can't run now, if it can't.
+    pub fn apply_blocked(&self) -> Option<&'static str> {
+        if self.candidate_pending {
+            Some(FINISHING_UPDATE)
+        } else if self.clients_active {
+            Some(UPDATE_IN_CALL)
+        } else if self.install.busy() {
+            Some("Wait for the audio driver to finish installing.")
+        } else if !matches!(self.install_mode, InstallMode::SelfUpdatable { .. }) {
+            install_mode_note(&self.install_mode)
+        } else {
+            None
+        }
+    }
+
+    /// **Restart to Update**: stages the verified update and hands over to the helper.
+    pub fn restart_to_update(&mut self) {
+        if self.apply_blocked().is_some() {
+            return;
+        }
+        let InstallMode::SelfUpdatable { bundle } = self.install_mode.clone() else {
+            return;
+        };
+        let UpdateState::Ready(staged) = self.update.clone() else {
+            return;
+        };
+        // The mic test must not hold the mic or the speakers across the restart.
+        self.stop_hear_test();
+        let job = self.next_update_job();
+        self.set_update(UpdateState::Applying);
+        (self.hooks.apply_update)(job, staged, bundle);
+    }
+
+    /// The apply worker staged the update: ask the engine to shut down. A stale or cancelled
+    /// job's request is dropped, which the worker reads as a refusal.
+    pub fn commit_shutdown(&mut self, generation: u64, ack: SyncSender<Result<(), String>>) {
+        if !self.is_update_job(generation) || self.update != UpdateState::Applying {
+            return;
+        }
+        self.stop_hear_test();
+        self.shutdown_sent = true;
+        if !self.link.send(Request::CommitShutdown(ack)) {
+            self.shutdown_sent = false;
+        }
+    }
+
+    /// The update couldn't go ahead. `restart_engine` when the engine was already shut down
+    /// (the helper died before the commit byte): start a new one and keep running.
+    pub fn update_apply_failed(&mut self, generation: u64, msg: String, restart_engine: bool) {
+        if !self.is_update_job(generation) {
+            return;
+        }
+        self.finish_update_job();
+        self.shutdown_sent = false;
+        if restart_engine {
+            self.start_engine();
+        }
+        self.set_update(UpdateState::Failed(msg));
+    }
+
+    /// The helper has the commit byte: the engine is down and the app quits now.
+    pub fn update_committed(&mut self) {
+        self.finish_update_job();
+        self.shutdown_sent = true;
     }
 
     // ----- what the screens say ----------------------------------------------------------------
@@ -1021,7 +1725,7 @@ mod tests {
             .iter()
             .filter_map(|r| match r {
                 Request::Cmd(c) => Some(c.clone()),
-                Request::SystemMic(_) => None,
+                _ => None,
             })
             .collect()
     }
@@ -1031,16 +1735,20 @@ mod tests {
             .iter()
             .filter_map(|r| match r {
                 Request::SystemMic(on) => Some(*on),
-                Request::Cmd(_) => None,
+                _ => None,
             })
             .collect()
     }
 
     fn probe(driver: bool) -> Probe {
-        Probe {
-            driver,
-            on_disk: driver,
-            mic: Mic::Authorized,
+        if driver {
+            Probe::new(
+                DriverStatus::Loaded(BUNDLED_DRIVER_VERSION),
+                Some(BUNDLED_DRIVER_VERSION),
+                Mic::Authorized,
+            )
+        } else {
+            Probe::new(DriverStatus::Absent, None, Mic::Authorized)
         }
     }
 
@@ -1118,6 +1826,30 @@ mod tests {
         assert_eq!(s.error.as_deref(), Some("nope"));
         s.dismiss_error();
         assert_eq!(s.error, None);
+    }
+
+    #[test]
+    fn an_incompatible_driver_shows_its_banner_not_an_error() {
+        let mut s = State::new(Prefs::default(), false);
+        s.link = Link::Record(Vec::new());
+        s.prefs.system_microphone = true;
+        s.on_event(Event::Error(
+            "Oto driver is not installed: Oto Microphone is not available".into(),
+        ));
+        s.on_event(Event::DriverIncompatible {
+            loaded: 0,
+            min_required: MIN_COMPATIBLE_DRIVER_VERSION,
+        });
+        assert_eq!(s.error, None, "no dismissible error banner");
+        assert_eq!(s.driver_status, DriverStatus::Loaded(0));
+        assert!(s.driver_installed && s.driver_known);
+        assert_eq!(s.driver_ui(), DriverUiState::Incompatible);
+        // The engine would refuse: Oto Microphone is not made the system input.
+        assert!(!system_mic(&s).contains(&true), "{:?}", requests(&s));
+        // Updated: the probe sees a compatible driver and the system input follows.
+        s.probed(probe(true));
+        assert_eq!(s.driver_ui(), DriverUiState::UpToDate);
+        assert_eq!(system_mic(&s).last(), Some(&true));
     }
 
     #[test]
@@ -1701,5 +2433,633 @@ mod tests {
         s.mic_answered(Mic::Authorized);
         s.allow_mic();
         assert_eq!(OPENED.load(Ordering::Relaxed), 1);
+    }
+
+    // ----- the driver state table ---------------------------------------------------------------
+
+    #[test]
+    fn the_driver_state_table() {
+        use DriverStatus::{Absent, Loaded, Unknown};
+        use DriverUiState as U;
+        // bundled = 3, min_compat = 2
+        let of = |l, d| DriverUiState::of(l, d, 3, 2);
+        assert_eq!(of(Absent, None), U::NotInstalled);
+        assert_eq!(of(Absent, Some(0)), U::InstalledNeedsReboot);
+        assert_eq!(of(Absent, Some(3)), U::InstalledNeedsReboot);
+        assert_eq!(of(Unknown, None), U::Unknown);
+        assert_eq!(of(Unknown, Some(3)), U::Unknown);
+        assert_eq!(of(Loaded(3), Some(3)), U::UpToDate);
+        assert_eq!(of(Loaded(3), Some(4)), U::UpToDate);
+        assert_eq!(of(Loaded(3), None), U::OnDiskOutdatedOrMissing);
+        assert_eq!(of(Loaded(3), Some(2)), U::OnDiskOutdatedOrMissing);
+        assert_eq!(of(Loaded(4), None), U::NewerLoaded);
+        assert_eq!(of(Loaded(4), Some(1)), U::NewerLoaded);
+        assert_eq!(of(Loaded(2), Some(3)), U::UpdateNeedsReboot);
+        assert_eq!(of(Loaded(1), Some(5)), U::UpdateNeedsReboot);
+        assert_eq!(of(Loaded(2), None), U::RemovedNeedsReboot);
+        assert_eq!(of(Loaded(2), Some(2)), U::UpdateAvailable);
+        assert_eq!(of(Loaded(2), Some(0)), U::UpdateAvailable);
+        assert_eq!(of(Loaded(1), Some(1)), U::Incompatible);
+        assert_eq!(of(Loaded(0), Some(0)), U::Incompatible);
+        assert!(U::UpdateAvailable.offers_update() && U::Incompatible.offers_update());
+        assert!(!U::UpToDate.offers_update() && !U::UpdateNeedsReboot.offers_update());
+        // Legacy v0.0.1–v0.0.3 drivers (no 'otvr', so revision 0) are incompatible with this
+        // build, not missing.
+        assert_eq!(MIN_COMPATIBLE_DRIVER_VERSION, 1);
+        assert_eq!(
+            DriverUiState::of(
+                Loaded(0),
+                Some(0),
+                BUNDLED_DRIVER_VERSION,
+                MIN_COMPATIBLE_DRIVER_VERSION
+            ),
+            U::Incompatible
+        );
+        assert!(!Loaded(0).is_compatible() && Loaded(0).is_loaded());
+    }
+
+    #[test]
+    fn an_unknown_driver_status_changes_nothing() {
+        let mut s = State::new(Prefs::default(), false);
+        s.driver_known = false;
+        s.probed(Probe::new(DriverStatus::Unknown, None, Mic::Authorized));
+        assert!(!s.driver_known, "nothing is decided on an unknown status");
+        assert!(!s.onboarding());
+
+        let mut s = state();
+        s.probed(Probe::new(DriverStatus::Unknown, None, Mic::Authorized));
+        assert!(s.driver_installed);
+        assert_eq!(s.driver_ui(), DriverUiState::UpToDate);
+        s.probed(Probe::new(
+            DriverStatus::Loaded(BUNDLED_DRIVER_VERSION),
+            None,
+            Mic::Authorized,
+        ));
+        assert_eq!(s.driver_ui(), DriverUiState::OnDiskOutdatedOrMissing);
+    }
+
+    #[test]
+    fn start_install_refuses_to_downgrade_a_newer_driver() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static INSTALLS: AtomicUsize = AtomicUsize::new(0);
+        let cases = [
+            // Newer loaded, missing on disk.
+            (DriverStatus::Loaded(BUNDLED_DRIVER_VERSION + 1), None),
+            // Bundled loaded, newer already on disk.
+            (
+                DriverStatus::Loaded(BUNDLED_DRIVER_VERSION),
+                Some(BUNDLED_DRIVER_VERSION + 1),
+            ),
+            // Older loaded, newer already on disk (waiting for reboot).
+            (
+                DriverStatus::Loaded(BUNDLED_DRIVER_VERSION.saturating_sub(1)),
+                Some(BUNDLED_DRIVER_VERSION + 1),
+            ),
+            // Absent in Core Audio, newer already on disk.
+            (DriverStatus::Absent, Some(BUNDLED_DRIVER_VERSION + 1)),
+        ];
+        for (loaded, on_disk) in cases {
+            let mut s = state();
+            s.hooks.install = || {
+                INSTALLS.fetch_add(1, Ordering::Relaxed);
+            };
+            s.probed(Probe::new(loaded, on_disk, Mic::Authorized));
+            assert!(s.newer_driver_present(), "{loaded:?} / {on_disk:?}");
+            s.start_install();
+            assert_eq!(s.install, Install::Idle, "{loaded:?} / {on_disk:?}");
+        }
+        assert_eq!(INSTALLS.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn a_cancelled_password_prompt_is_not_an_error() {
+        let mut s = state();
+        s.start_install();
+        assert!(s.install.busy());
+        s.installed(Outcome::Cancelled, probe(true));
+        assert_eq!(s.install, Install::Idle);
+        assert_eq!(s.error, None);
+        s.start_uninstall();
+        s.uninstalled(UninstallOutcome::Cancelled, probe(true));
+        assert_eq!(s.install, Install::Idle);
+        assert_eq!(s.error, None);
+    }
+
+    // ----- updates -------------------------------------------------------------------------------
+
+    fn info(version: &str) -> UpdateInfo {
+        UpdateInfo {
+            version: version.into(),
+            notes_url: format!("https://github.com/deepso7/oto/releases/tag/v{version}"),
+            asset_url: format!(
+                "https://github.com/deepso7/oto/releases/download/v{version}/Oto-{version}-macos.zip"
+            ),
+            sha256: "0".repeat(64),
+            size: 1,
+            min_os: "13.0".into(),
+            driver_version: BUNDLED_DRIVER_VERSION,
+            min_driver_version: MIN_COMPATIBLE_DRIVER_VERSION,
+            published_at: String::new(),
+        }
+    }
+
+    fn staged(version: &str) -> StagedUpdate {
+        StagedUpdate::unowned(info(version), "/tmp/c/Oto.app".into(), "/tmp/c".into())
+    }
+
+    fn updatable() -> State {
+        let mut s = state();
+        s.install_mode = InstallMode::SelfUpdatable {
+            bundle: "/Applications/Oto.app".into(),
+        };
+        s.hooks.now = || 1_000_000;
+        s
+    }
+
+    fn shutdowns(s: &State) -> usize {
+        sent(s).iter().filter(|c| **c == Command::Shutdown).count()
+    }
+
+    #[test]
+    fn an_update_from_check_to_restart() {
+        static CHECKS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        static DOWNLOADS: std::sync::Mutex<Vec<UpdateInfo>> = std::sync::Mutex::new(Vec::new());
+        static APPLIED: std::sync::Mutex<Vec<(StagedUpdate, PathBuf)>> =
+            std::sync::Mutex::new(Vec::new());
+        let mut s = updatable();
+        s.hooks.check_update = |_| {
+            CHECKS.fetch_add(1, Ordering::Relaxed);
+        };
+        s.hooks.download_update = |_, i| DOWNLOADS.lock().unwrap().push(i);
+        s.hooks.apply_update = |_, st, b| APPLIED.lock().unwrap().push((st, b));
+
+        s.check_for_updates(true);
+        assert_eq!(s.update, UpdateState::Checking { manual: true });
+        // A second request while checking doesn't start another check.
+        s.check_for_updates(false);
+        assert_eq!(CHECKS.load(Ordering::Relaxed), 1);
+        assert_eq!(s.update, UpdateState::Checking { manual: true });
+        let g = s.update_generation();
+        s.update_checked(g, Ok(CheckOutcome::Available(info("9.0.0"))));
+        assert_eq!(s.update, UpdateState::Available(info("9.0.0")));
+        assert_eq!(s.prefs.last_update_check, Some(1_000_000));
+
+        s.start_update();
+        assert_eq!(DOWNLOADS.lock().unwrap().as_slice(), [info("9.0.0")]);
+        let g = s.update_generation();
+        s.update_progress(g, 42);
+        assert!(matches!(s.update, UpdateState::Downloading { pct: 42, .. }));
+        s.update_verifying(g);
+        assert_eq!(s.update, UpdateState::Verifying(info("9.0.0")));
+        s.update_downloaded(g, Ok(staged("9.0.0")));
+        assert_eq!(s.update, UpdateState::Ready(staged("9.0.0")));
+
+        s.restart_to_update();
+        assert_eq!(s.update, UpdateState::Applying);
+        let applied = APPLIED.lock().unwrap().pop().unwrap();
+        assert_eq!(applied.1, PathBuf::from("/Applications/Oto.app"));
+        // The worker staged it: the engine is asked to shut down, once.
+        let g = s.update_generation();
+        let (tx, _rx) = std::sync::mpsc::sync_channel(1);
+        s.commit_shutdown(g, tx);
+        assert!(matches!(
+            requests(&s).last(),
+            Some(Request::CommitShutdown(_))
+        ));
+        s.update_committed();
+        // Quitting afterwards doesn't send a second shutdown.
+        s.shutdown();
+        assert_eq!(shutdowns(&s), 0);
+    }
+
+    #[test]
+    fn stale_worker_results_are_dropped() {
+        let mut s = updatable();
+        s.check_for_updates(true);
+        let old = s.update_generation();
+        s.cancel_update();
+        assert_eq!(s.update, UpdateState::Idle);
+        s.update_checked(old, Ok(CheckOutcome::Available(info("9.0.0"))));
+        assert_eq!(s.update, UpdateState::Idle, "a cancelled check's result");
+
+        s.check_for_updates(true);
+        let g = s.update_generation();
+        s.update_checked(g, Ok(CheckOutcome::Available(info("9.0.0"))));
+        s.start_update();
+        let first = s.update_generation();
+        s.cancel_update();
+        assert_eq!(s.update, UpdateState::Available(info("9.0.0")));
+        s.update_progress(first, 80);
+        s.update_verifying(first);
+        s.update_downloaded(first, Ok(staged("9.0.0")));
+        assert_eq!(s.update, UpdateState::Available(info("9.0.0")));
+
+        // A new download replaces the old one, whose cancel flag is set.
+        s.start_update();
+        let second = s.update_generation();
+        assert_ne!(first, second);
+        s.update_downloaded(first, Err("late".into()));
+        assert!(matches!(s.update, UpdateState::Downloading { pct: 0, .. }));
+        s.update_downloaded(second, Err("disk full".into()));
+        assert_eq!(s.update, UpdateState::Failed("disk full".into()));
+        // A result for the finished job is stale too.
+        s.update_downloaded(second, Ok(staged("9.0.0")));
+        assert_eq!(s.update, UpdateState::Failed("disk full".into()));
+    }
+
+    #[test]
+    fn cancelling_sets_the_workers_flag() {
+        static JOB: std::sync::Mutex<Option<UpdateJob>> = std::sync::Mutex::new(None);
+        let mut s = updatable();
+        s.hooks.check_update = |j| *JOB.lock().unwrap() = Some(j);
+        s.check_for_updates(true);
+        let job = JOB.lock().unwrap().take().unwrap();
+        assert!(!job.cancel.load(Ordering::Relaxed));
+        s.cancel_update();
+        assert!(job.cancel.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn background_checks_stay_quiet() {
+        let mut s = updatable();
+        for r in [
+            Err("offline".to_string()),
+            Ok(CheckOutcome::IncompatibleOs {
+                version: "9.0.0".into(),
+                min_os: "99.0".into(),
+            }),
+        ] {
+            s.check_for_updates(false);
+            let g = s.update_generation();
+            s.update_checked(g, r);
+            assert_eq!(s.update, UpdateState::Idle);
+            assert_eq!(s.error, None);
+        }
+        // A failed check doesn't count as the day's check.
+        let mut s = updatable();
+        s.check_for_updates(false);
+        let g = s.update_generation();
+        s.update_checked(g, Err("offline".into()));
+        assert_eq!(s.prefs.last_update_check, None);
+
+        // Manual checks say what happened.
+        s.check_for_updates(true);
+        let g = s.update_generation();
+        s.update_checked(g, Err("offline".into()));
+        assert_eq!(s.update, UpdateState::Failed("offline".into()));
+        s.check_for_updates(true);
+        let g = s.update_generation();
+        s.update_checked(
+            g,
+            Ok(CheckOutcome::IncompatibleOs {
+                version: "9.0.0".into(),
+                min_os: "99.0".into(),
+            }),
+        );
+        assert!(matches!(s.update, UpdateState::IncompatibleOs { .. }));
+        s.check_for_updates(true);
+        let g = s.update_generation();
+        s.update_checked(g, Ok(CheckOutcome::UpToDate));
+        assert_eq!(s.update, UpdateState::UpToDate);
+    }
+
+    #[test]
+    fn a_skipped_version_is_offered_only_on_request() {
+        let mut s = updatable();
+        s.check_for_updates(true);
+        let g = s.update_generation();
+        s.update_checked(g, Ok(CheckOutcome::Available(info("9.0.0"))));
+        s.skip_update();
+        assert_eq!(s.prefs.skipped_version.as_deref(), Some("9.0.0"));
+        assert_eq!(s.update, UpdateState::Idle);
+
+        s.check_for_updates(false);
+        let g = s.update_generation();
+        s.update_checked(g, Ok(CheckOutcome::Available(info("9.0.0"))));
+        assert_eq!(s.update, UpdateState::Idle, "skipped");
+
+        s.check_for_updates(false);
+        let g = s.update_generation();
+        s.update_checked(g, Ok(CheckOutcome::Available(info("9.1.0"))));
+        assert_eq!(s.update, UpdateState::Available(info("9.1.0")), "newer");
+
+        s.check_for_updates(true);
+        let g = s.update_generation();
+        s.update_checked(g, Ok(CheckOutcome::Available(info("9.0.0"))));
+        assert_eq!(
+            s.update,
+            UpdateState::Available(info("9.0.0")),
+            "a manual check overrides the skip"
+        );
+        s.dismiss_update();
+        assert_eq!(s.update, UpdateState::Idle);
+        assert_eq!(s.prefs.skipped_version.as_deref(), Some("9.0.0"));
+    }
+
+    #[test]
+    fn automatic_checks_run_once_a_day_when_allowed() {
+        let mode = InstallMode::SelfUpdatable {
+            bundle: "/Applications/Oto.app".into(),
+        };
+        let day = UPDATE_INTERVAL_SECS;
+        let mut p = Prefs::default();
+        assert!(update_check_due(&p, &mode, 10 * day));
+        p.last_update_check = Some(10 * day);
+        assert!(!update_check_due(&p, &mode, 10 * day + day - 1));
+        assert!(update_check_due(&p, &mode, 11 * day));
+        // A clock set back doesn't silence checks for good.
+        assert!(update_check_due(&p, &mode, 5 * day));
+        assert!(update_check_due(
+            &p,
+            &InstallMode::NotifyOnly(NotifyReason::NotInApplications),
+            11 * day
+        ));
+        assert!(!update_check_due(
+            &p,
+            &InstallMode::Unsupported(UnsupportedReason::DevBuild),
+            11 * day
+        ));
+        p.check_for_updates = false;
+        assert!(!update_check_due(&p, &mode, 11 * day));
+
+        static CHECKS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let mut s = updatable();
+        s.hooks.check_update = |_| {
+            CHECKS.fetch_add(1, Ordering::Relaxed);
+        };
+        s.maybe_check_for_updates();
+        assert_eq!(CHECKS.load(Ordering::Relaxed), 1);
+        let g = s.update_generation();
+        s.update_checked(g, Ok(CheckOutcome::UpToDate));
+        s.maybe_check_for_updates();
+        assert_eq!(CHECKS.load(Ordering::Relaxed), 1, "checked today");
+        s.set_check_for_updates(false);
+        s.prefs.last_update_check = None;
+        s.maybe_check_for_updates();
+        assert_eq!(CHECKS.load(Ordering::Relaxed), 1, "turned off");
+    }
+
+    #[test]
+    fn notify_only_copies_open_the_release_page() {
+        static OPENED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+        static DOWNLOADS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let mut s = updatable();
+        s.install_mode = InstallMode::NotifyOnly(NotifyReason::NotInApplications);
+        s.hooks.open_url = |u| {
+            OPENED.lock().unwrap().push(u.to_owned());
+            Ok(())
+        };
+        s.hooks.download_update = |_, _| {
+            DOWNLOADS.fetch_add(1, Ordering::Relaxed);
+        };
+        s.update = UpdateState::Available(info("9.0.0"));
+        s.start_update();
+        assert_eq!(DOWNLOADS.load(Ordering::Relaxed), 0);
+        assert_eq!(s.update, UpdateState::Available(info("9.0.0")));
+        s.restart_to_update();
+        assert_eq!(s.update, UpdateState::Available(info("9.0.0")));
+
+        s.update = UpdateState::UnrecognizedKey {
+            releases_url: "https://evil.example/".into(),
+        };
+        s.start_update();
+        // Anything but the project's GitHub pages falls back to the fixed Releases page.
+        s.open_url("https://evil.example/x");
+        assert_eq!(
+            OPENED.lock().unwrap().as_slice(),
+            [
+                "https://github.com/deepso7/oto/releases/tag/v9.0.0",
+                RELEASES_URL,
+                RELEASES_URL
+            ]
+        );
+        assert!(openable_url(RELEASES_URL));
+        assert!(!openable_url("http://github.com/deepso7/oto/releases"));
+        assert!(!openable_url("https://github.com/deepso7/oto/releases x"));
+        assert!(!openable_url("https://github.com.evil/deepso7/oto/"));
+        assert_eq!(
+            install_mode_note(&InstallMode::NotifyOnly(NotifyReason::NotInApplications)),
+            Some("Move Oto to Applications for automatic updates.")
+        );
+        assert_eq!(
+            install_mode_note(&InstallMode::NotifyOnly(
+                NotifyReason::RequiresManualInstall
+            )),
+            Some("Download the installer to update Oto.")
+        );
+    }
+
+    #[test]
+    fn a_call_blocks_the_restart_and_driver_changes() {
+        static APPLIES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        static INSTALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let mut s = updatable();
+        s.hooks.apply_update = |_, _, _| {
+            APPLIES.fetch_add(1, Ordering::Relaxed);
+        };
+        s.hooks.install = || {
+            INSTALLS.fetch_add(1, Ordering::Relaxed);
+        };
+        s.hooks.uninstall = || {
+            INSTALLS.fetch_add(1, Ordering::Relaxed);
+        };
+        s.update = UpdateState::Ready(staged("9.0.0"));
+        s.on_event(Event::ClientsActive(true));
+        assert_eq!(s.apply_blocked(), Some(UPDATE_IN_CALL));
+        assert_eq!(s.install_blocked(), Some(UPDATE_IN_CALL));
+        s.restart_to_update();
+        s.start_install();
+        s.start_uninstall();
+        assert_eq!(s.update, UpdateState::Ready(staged("9.0.0")));
+        assert_eq!(s.install, Install::Idle);
+        assert_eq!(APPLIES.load(Ordering::Relaxed), 0);
+        assert_eq!(INSTALLS.load(Ordering::Relaxed), 0);
+        s.on_event(Event::ClientsActive(false));
+
+        // A driver install and an update never overlap.
+        s.start_install();
+        assert_eq!(INSTALLS.load(Ordering::Relaxed), 1);
+        assert!(s.apply_blocked().is_some());
+        s.restart_to_update();
+        assert_eq!(APPLIES.load(Ordering::Relaxed), 0);
+        s.installed(Outcome::Installed, probe(true));
+        s.restart_to_update();
+        assert_eq!(APPLIES.load(Ordering::Relaxed), 1);
+        assert_eq!(s.update, UpdateState::Applying);
+        assert!(s.install_blocked().is_some());
+        s.start_install();
+        s.start_uninstall();
+        assert_eq!(INSTALLS.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn a_refused_or_failed_hand_over_keeps_oto_running() {
+        static STARTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let mut s = updatable();
+        s.hooks.start_engine = |_, _| {
+            STARTS.fetch_add(1, Ordering::Relaxed);
+            Link::Record(Vec::new())
+        };
+        s.update = UpdateState::Ready(staged("9.0.0"));
+        s.restart_to_update();
+        let g = s.update_generation();
+        // The host refused (a call started): the engine kept running.
+        s.update_apply_failed(g, UPDATE_IN_CALL.into(), false);
+        assert_eq!(s.update, UpdateState::Failed(UPDATE_IN_CALL.into()));
+        assert_eq!(STARTS.load(Ordering::Relaxed), 0);
+        s.shutdown();
+        assert_eq!(shutdowns(&s), 1, "quitting still stops the engine");
+
+        // The helper died before the commit byte (EPIPE): a new engine starts.
+        let mut s = updatable();
+        s.hooks.start_engine = |_, _| {
+            STARTS.fetch_add(1, Ordering::Relaxed);
+            Link::Record(Vec::new())
+        };
+        s.set_system_mic(true);
+        s.update = UpdateState::Ready(staged("9.0.0"));
+        s.restart_to_update();
+        let g = s.update_generation();
+        let (tx, _rx) = std::sync::mpsc::sync_channel(1);
+        s.commit_shutdown(g, tx);
+        s.update_apply_failed(g, "The updater stopped unexpectedly.".into(), true);
+        assert_eq!(STARTS.load(Ordering::Relaxed), 1);
+        assert_eq!(s.engine, EngineState::Starting);
+        assert!(matches!(s.update, UpdateState::Failed(_)));
+        assert_eq!(
+            requests(&s),
+            [Request::SystemMic(true)],
+            "the new engine is asked again"
+        );
+        s.engine_started();
+        s.shutdown();
+        assert_eq!(shutdowns(&s), 1);
+    }
+
+    #[test]
+    fn a_stale_hand_over_never_reaches_the_engine() {
+        let mut s = updatable();
+        s.update = UpdateState::Ready(staged("9.0.0"));
+        s.restart_to_update();
+        let g = s.update_generation();
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        s.commit_shutdown(g + 1, tx);
+        assert!(requests(&s).is_empty());
+        // The worker reads the dropped ack as a refusal.
+        assert!(rx.recv().is_err());
+    }
+
+    #[test]
+    fn shutting_down_is_idempotent() {
+        let mut s = state();
+        s.shutdown();
+        s.shutdown();
+        assert_eq!(shutdowns(&s), 1);
+    }
+
+    #[test]
+    fn the_banner_says_when_a_driver_update_follows() {
+        let mut i = info("9.0.0");
+        i.driver_version = 5;
+        i.min_driver_version = 4;
+        assert_eq!(
+            update_driver_note(&i, Some(3)),
+            Some("Requires an audio driver update after restarting (asks for your password).")
+        );
+        assert_eq!(
+            update_driver_note(&i, Some(4)),
+            Some("An audio driver update may be offered separately after restarting.")
+        );
+        assert_eq!(update_driver_note(&i, Some(5)), None);
+        assert_eq!(update_driver_note(&i, Some(6)), None);
+        assert_eq!(update_driver_note(&i, None), None);
+    }
+
+    // ----- the update candidate -----------------------------------------------------------------
+
+    #[test]
+    fn a_candidate_does_nothing_until_the_update_commits() {
+        static SAVES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        static SIDE_EFFECTS: std::sync::atomic::AtomicUsize =
+            std::sync::atomic::AtomicUsize::new(0);
+        static HEARS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let mut s = State::new(
+            Prefs {
+                system_microphone: true,
+                ..Prefs::default()
+            },
+            true,
+        );
+        s.link = Link::Record(Vec::new());
+        s.candidate_pending = true;
+        s.hooks.save = |_| {
+            SAVES.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        };
+        s.hooks.set_login = |_| {
+            SIDE_EFFECTS.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        };
+        s.hooks.install = || {
+            SIDE_EFFECTS.fetch_add(1, Ordering::Relaxed);
+        };
+        s.hooks.uninstall = || {
+            SIDE_EFFECTS.fetch_add(1, Ordering::Relaxed);
+        };
+        s.hooks.request_mic = || {
+            SIDE_EFFECTS.fetch_add(1, Ordering::Relaxed);
+        };
+        s.hooks.check_update = |_| {
+            SIDE_EFFECTS.fetch_add(1, Ordering::Relaxed);
+        };
+        s.hooks.start_hear_test = |_| {
+            HEARS.fetch_add(1, Ordering::Relaxed);
+        };
+
+        s.probed(probe(true));
+        s.set_strength(Strength::Strong);
+        s.set_start_at_login(true);
+        s.start_install();
+        s.start_uninstall();
+        s.mic = Mic::NotDetermined;
+        s.allow_mic();
+        s.mic = Mic::Authorized;
+        s.set_system_mic(false);
+        s.set_system_mic(true);
+        s.check_for_updates(true);
+        assert_eq!(s.hear_blocked(), Some(FINISHING_UPDATE));
+        s.start_hear_test();
+        assert_eq!(s.hear, HearTest::Idle);
+        assert!(!s.onboarding(), "no setup popup while finishing");
+
+        assert_eq!(SAVES.load(Ordering::Relaxed), 0);
+        assert_eq!(SIDE_EFFECTS.load(Ordering::Relaxed), 0);
+        assert_eq!(HEARS.load(Ordering::Relaxed), 0);
+        assert!(!s.prefs.start_at_login);
+        assert_eq!(s.install, Install::Idle);
+        assert!(system_mic(&s).is_empty(), "the default input is untouched");
+
+        s.commit_candidate();
+        assert!(!s.candidate_pending);
+        assert!(
+            requests(&s)
+                .iter()
+                .any(|r| matches!(r, Request::CommitCandidate(_)))
+        );
+        assert_eq!(SAVES.load(Ordering::Relaxed), 1, "the skipped save happens");
+        assert_eq!(system_mic(&s), [true]);
+        assert_eq!(s.hear_blocked(), None);
+        s.start_hear_test();
+        assert_eq!(HEARS.load(Ordering::Relaxed), 1);
+        assert!(s.onboarding(), "setup resumes after the commit");
+        // Committing twice is harmless.
+        s.commit_candidate();
+        assert_eq!(
+            requests(&s)
+                .iter()
+                .filter(|r| matches!(r, Request::CommitCandidate(_)))
+                .count(),
+            1
+        );
     }
 }
