@@ -104,9 +104,12 @@ jobs:
         run: |
           make -C driver/macos test
           cargo test --locked -p oto-sign
-          cargo test --locked -p oto-engine --lib
-          cargo test --locked -p oto-app --bin oto-app
-          cargo test --locked -p oto-cli
+          # Run engine/app/cli unit tests without heavy ML model features (the release build
+          # step below compiles dfn3,onnx) and serialize engine tests so realtime audio-callback
+          # timing tests are not starved by parallel threads on a 3-vCPU VM.
+          cargo test --locked --no-default-features -p oto-engine --lib -- --test-threads=1
+          cargo test --locked --no-default-features -p oto-app --bin oto-app
+          cargo test --locked --no-default-features -p oto-cli
 
       - name: Build an ad-hoc signed Oto.app
         # The release's feature set; host architecture only (no Developer ID, so UNIVERSAL=0).
