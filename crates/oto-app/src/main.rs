@@ -799,7 +799,7 @@ fn window_options() -> rune::ConfiguredWindowOptions {
     .macos(
         rune::MacWindowOptions::default()
             .nonactivating_panel(true)
-            .corner_radius(12.0)
+            .corner_radius(view::RADIUS)
             .shadow(true),
     )
 }
