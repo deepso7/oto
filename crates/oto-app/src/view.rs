@@ -21,9 +21,9 @@ use crate::updater::verify::UNRECOGNIZED_KEY_MESSAGE;
 pub const WIDTH: f32 = 340.0;
 /// The popover's corner radius; main.rs gives the window the same.
 pub const RADIUS: f32 = 22.0;
-const PAD: f32 = 14.0;
+const PAD: f32 = 12.0;
 /// A tile's side padding.
-const TILE_PX: f32 = 14.0;
+const TILE_PX: f32 = 12.0;
 /// A tile's content width.
 const CARD_INNER: f32 = WIDTH - 2.0 * PAD - 2.0 * TILE_PX;
 const TILE_RADIUS: f32 = 16.0;
@@ -63,6 +63,55 @@ static CHEVRON_LEFT: Icon = Icon {
     body: r#"<path d="M9.5 4L5.5 8L9.5 12" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>"#,
 };
 
+/// The brand colours, swappable while we try palettes. `OTO_SCHEME=ocean` picks Summer Ocean
+/// Breeze; anything else is the app icon's blue.
+#[derive(Clone, Copy)]
+struct Scheme {
+    /// The lit hero, top to bottom; also the logo tile.
+    brand: (&'static str, &'static str),
+    /// Switches and focus rings, light and dark.
+    accent: (&'static str, &'static str),
+    /// What sits on the lit hero: the power button, the Out bar and the rings.
+    on_hero: &'static str,
+    /// The power glyph on `on_hero`.
+    glyph: &'static str,
+    /// The In bar on the lit hero.
+    hero_in: &'static str,
+    /// Muted: the state line when Oto is on but silencing the mic.
+    alert: Option<(&'static str, &'static str)>,
+    /// The window behind the glass (and in renders), light and dark; None keeps neutral grey.
+    backdrop: Option<(&'static str, &'static str)>,
+}
+
+const ICON_BLUE: Scheme = Scheme {
+    brand: ("#4392F7", "#285CC2"),
+    accent: ("#2F6FDB", "#4A97F8"),
+    on_hero: "#FFFFFF",
+    glyph: "#285CC2",
+    hero_in: "#FFFFFF80",
+    alert: None,
+    backdrop: None,
+};
+
+/// Summer Ocean Breeze: Strawberry Red, Honeydew, Frosted Blue, Steel Blue, Deep Space Blue.
+const OCEAN: Scheme = Scheme {
+    brand: ("#457B9D", "#1D3557"),
+    accent: ("#457B9D", "#6FA3C2"),
+    on_hero: "#F1FAEE",
+    glyph: "#1D3557",
+    hero_in: "#A8DADCB0",
+    alert: Some(("#D62F3C", "#F0606B")),
+    backdrop: Some(("#ECF5EC", "#13233A")),
+};
+
+fn scheme() -> Scheme {
+    static S: std::sync::OnceLock<Scheme> = std::sync::OnceLock::new();
+    *S.get_or_init(|| match std::env::var("OTO_SCHEME").as_deref() {
+        Ok("ocean") => OCEAN,
+        _ => ICON_BLUE,
+    })
+}
+
 /// Everything a piece needs to paint itself. The popover is Liquid Glass; what sits on it is
 /// translucent so the glass shows through.
 struct Paint {
@@ -75,12 +124,17 @@ struct Paint {
     hair: f32,
     /// What the window shows where the native glass can't draw (headless renders, older macOS).
     backdrop: Color,
-    /// A tile on the glass, its top-lit bevel, and a stronger fill for wells and chips.
+    /// A tile on the glass, its top-lit bevel, and a stronger fill for wells and chips. Tiles
+    /// are a thin tint, as Control Center's modules are, so the glass shows through them.
     platter: Color,
     bevel: (Color, Color),
     well: Color,
-    /// The app icon's blue, top to bottom.
+    /// The lit hero, top to bottom.
     brand: (Color, Color),
+    /// On the lit hero: the power button, Out bar and rings; the glyph; the In bar.
+    on_hero: Color,
+    glyph: Color,
+    hero_in: Color,
     /// The opaque surface dropdown lists draw on, over the glass.
     menu: Color,
 }
@@ -89,35 +143,46 @@ impl Paint {
     fn new(dark: bool, scale: f32) -> Paint {
         let hex = |s: &str| rune::color::hex(s).unwrap_or(Color::BLACK);
         let w = Color::WHITE;
-        let b = Color::BLACK;
-        let brand = (hex("#4392F7"), hex("#285CC2"));
-        let accent = if dark { hex("#4A97F8") } else { hex("#2F6FDB") };
+        let sc = scheme();
+        let pick = |(l, d): (&str, &str)| hex(if dark { d } else { l });
+        let brand = (hex(sc.brand.0), hex(sc.brand.1));
+        let accent = pick(sc.accent);
         let t = tok::theme(dark);
         let (platter, bevel, well, field, backdrop, menu) = if dark {
             (
-                w.alpha(0.065),
-                (w.alpha(0.16), w.alpha(0.03)),
+                w.alpha(0.045),
+                (w.alpha(0.14), w.alpha(0.02)),
                 w.alpha(0.08),
-                w.alpha(0.085),
+                w.alpha(0.08),
                 rune::oklch(0.215, 0.012, 262.0),
                 rune::oklch(0.25, 0.01, 262.0),
             )
         } else {
             (
-                w.alpha(0.62),
-                (w.alpha(0.95), b.alpha(0.045)),
+                w.alpha(0.3),
+                (w.alpha(0.85), w.alpha(0.1)),
                 rune::oklcha(0.2, 0.01, 262.0, 0.07),
-                w.alpha(0.85),
+                w.alpha(0.6),
                 rune::oklch(0.935, 0.008, 262.0),
                 w,
             )
         };
+        let backdrop = sc.backdrop.map_or(backdrop, pick);
         let mut k = Kit::neutral(dark);
         // Fields and neutral buttons sit on tiles, so they are translucent too; lists stay solid.
         k.c.bg_base = field;
         k.c.bg_button_neutral = field;
         k.c.layer_01 = menu;
         k.c.border_focus = accent;
+        // A scheme with its own alert colour tints warnings with it, so a muted mic reads as one
+        // colour from the hero line to the banner.
+        if let Some(a) = sc.alert {
+            let c = pick(a);
+            k.c.warning.fg = c;
+            k.c.warning.icon = c;
+            k.c.warning.bg = c.alpha(if dark { 0.22 } else { 0.12 });
+            k.c.warning.border = c.alpha(if dark { 0.4 } else { 0.3 });
+        }
         k.c.bg_accent = accent;
         // Controls are capsules, as macOS 26 draws them: the 28 pt field and buttons round to
         // half their height, like the pills beside them, and list rows round with them.
@@ -131,13 +196,18 @@ impl Paint {
             dark,
             accent,
             green: rune::oklch(if dark { 0.74 } else { 0.62 }, 0.17, 152.0),
-            amber: rune::oklch(if dark { 0.8 } else { 0.7 }, 0.15, 75.0),
+            amber: sc
+                .alert
+                .map_or(rune::oklch(if dark { 0.8 } else { 0.7 }, 0.15, 75.0), pick),
             hair: 1.0 / scale,
             backdrop,
             platter,
             bevel,
             well,
             brand,
+            on_hero: hex(sc.on_hero),
+            glyph: hex(sc.glyph),
+            hero_in: hex(sc.hero_in),
             menu,
         }
     }
@@ -159,7 +229,7 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
         .w_full()
         .fill(p.backdrop)
         .padding(PAD)
-        .gap(10.0)
+        .gap(8.0)
         .child(body)
         .on_layout(|s: &mut State, r: [f32; 4]| s.size = (r[2], r[3]));
     if s.popover {
@@ -388,7 +458,7 @@ fn power_button(p: &Paint, label: &str, on: bool, lit: bool, breathing: bool) ->
         .center()
         .radius(d / 2.0)
         .fill(if lit {
-            Color::WHITE
+            p.on_hero
         } else if on {
             p.accent
         } else {
@@ -407,7 +477,7 @@ fn power_button(p: &Paint, label: &str, on: bool, lit: bool, breathing: bool) ->
         .child(
             icon(&POWER, 20.0)
                 .color(if lit {
-                    p.brand.1
+                    p.glyph
                 } else if on {
                     Color::WHITE
                 } else {
@@ -424,7 +494,7 @@ fn power_button(p: &Paint, label: &str, on: bool, lit: bool, breathing: bool) ->
                     .absolute(at, at)
                     .size(ring, ring)
                     .radius(ring / 2.0)
-                    .border(1.0, Color::WHITE.alpha(0.55 - 0.12 * i as f32))
+                    .border(1.0, p.on_hero.alpha(0.55 - 0.12 * i as f32))
                     .cycle(Cycle {
                         period: BREATH_S,
                         phase: 0.16 * i as f32,
@@ -456,7 +526,7 @@ fn field_row(p: &Paint, key: &str, label: &str, control: El) -> El {
     row()
         .key(key)
         .w_full()
-        .h(42.0)
+        .h(36.0)
         .center_y()
         .justify_between()
         .gap(12.0)
@@ -469,7 +539,7 @@ fn labelled(p: &Paint, key: &str, label: &str, control: El) -> El {
     col()
         .key(key)
         .w_full()
-        .gap(7.0)
+        .gap(5.0)
         .child(
             text(label.to_uppercase())
                 .key("label")
@@ -482,7 +552,7 @@ fn labelled(p: &Paint, key: &str, label: &str, control: El) -> El {
 
 /// A status colour's background, thinned so the glass reads through it.
 fn tint(c: &StateColors) -> Color {
-    c.bg.alpha(0.7)
+    c.bg.alpha(c.bg.a * 0.7)
 }
 
 fn error_banner(p: &Paint, msg: &str, dismiss: fn(&mut State)) -> El {
@@ -870,7 +940,7 @@ fn hear_card(s: &State, p: &Paint) -> El {
         .font(TITLE)
         .color(p.t.text)
         .a11y_hidden();
-    let mut c = card(p, "hear").py(TILE_PX).gap(8.0).child(title);
+    let mut c = card(p, "hear").py(TILE_PX).gap(6.0).child(title);
     match &s.hear {
         HearTest::Idle | HearTest::Failed(_) => {
             let blocked = s.hear_blocked();
@@ -1066,7 +1136,7 @@ fn main_page(s: &State, p: &Paint, layer: &mut Vec<El>) -> El {
         CARD_INNER,
         |s, i| s.set_strength(STRENGTHS[i].0),
     );
-    let mut controls = card(p, "controls").py(TILE_PX).gap(14.0).child(mic_row);
+    let mut controls = card(p, "controls").py(TILE_PX).gap(10.0).child(mic_row);
     // Two modes only when this build has Voice Isolation. The Noise Cancellation model is a
     // setting.
     if s.offers_isolation() {
@@ -1171,20 +1241,21 @@ fn hero(s: &State, p: &Paint, title: &str, state_line: &str) -> El {
     // On but muted (Voice Isolation can't run): not lit, and the state line says so in amber.
     let muted = on && (s.degraded.is_some() || (s.isolating() && !s.offers_isolation()));
     let lit = on && !muted;
-    let ink = if lit { Color::WHITE } else { p.t.text };
+    let ink = if lit { p.on_hero } else { p.t.text };
     let ink2 = if lit {
-        Color::WHITE.alpha(0.78)
+        p.on_hero.alpha(0.78)
     } else if muted {
         p.amber
     } else {
         p.t.text_secondary
     };
-    let mut t = tile(p, "hero").padding(16.0).gap(16.0);
+    let mut t = tile(p, "hero").padding(14.0).gap(12.0);
     if lit {
         t = t
             .linear_gradient(
                 std::f32::consts::PI * 0.88,
-                [(0.0, p.brand.0), (1.0, p.brand.1)],
+                // Tinted glass, not paint: the material shows through the hero's colour.
+                [(0.0, p.brand.0.alpha(0.82)), (1.0, p.brand.1.alpha(0.86))],
             )
             .border_gradient(p.hair, Color::WHITE.alpha(0.42), Color::WHITE.alpha(0.06))
             .shadow(8.0, 22.0, p.brand.1.alpha(if p.dark { 0.45 } else { 0.32 }));
@@ -1218,14 +1289,14 @@ fn hero(s: &State, p: &Paint, title: &str, state_line: &str) -> El {
     let mut levels = col()
         .key("meter")
         .w_full()
-        .gap(8.0)
+        .gap(6.0)
         .child(meter_row(
             p,
             "raw",
             "In",
             "Input level",
             &s.meter.raw,
-            Color::WHITE.alpha(0.5),
+            p.hero_in,
         ))
         .child(meter_row(
             p,
@@ -1233,7 +1304,7 @@ fn hero(s: &State, p: &Paint, title: &str, state_line: &str) -> El {
             "Out",
             "Cleaned level",
             &s.meter.clean,
-            Color::WHITE,
+            p.on_hero,
         ));
     if !s.clients_active {
         levels = levels.child(
