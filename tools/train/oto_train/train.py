@@ -261,7 +261,7 @@ def main(argv=None) -> dict:
     sync_down(args.sync, "latest.pt", latest)
     sync_down(args.sync, "best.pt", ckpt_dir / "best.pt")
     if latest.exists():
-        ck = torch.load(latest, map_location=device, weights_only=False)
+        ck = torch.load(latest, map_location=device, weights_only=True)
         model.load_state_dict(ck["model"])
         opt.load_state_dict(ck["opt"])
         ema.shadow = {k: v.to(device) for k, v in ck["ema"].items()}
@@ -269,7 +269,7 @@ def main(argv=None) -> dict:
         torch.set_rng_state(ck["rng_cpu"].to(device="cpu", dtype=torch.uint8))
         print(f"resumed from {latest} at step {step} (best val {best_val:.4f})", flush=True)
     elif args.init_from:
-        ck = torch.load(args.init_from, map_location=device, weights_only=False)
+        ck = torch.load(args.init_from, map_location=device, weights_only=True)
         model.load_state_dict(ck["ema"] if ck.get("ema") else ck["model"])
         ema = EMA(model, args.ema)
         print(f"initialised from {args.init_from}", flush=True)

@@ -138,7 +138,13 @@ impl Otow {
         if digest[..] != b[32..64] {
             return Err(".otow: SHA-256 mismatch (file corrupt or truncated)".into());
         }
-        if !table_offset.is_multiple_of(ALIGN) || table_offset < HEADER_LEN + config_len {
+        let config_end = HEADER_LEN
+            .checked_add(config_len)
+            .ok_or(".otow: config length overflows")?;
+        if !table_offset.is_multiple_of(ALIGN)
+            || table_offset < config_end
+            || table_offset > b.len()
+        {
             return Err(format!(".otow: bad table offset {table_offset}"));
         }
         let table_end = num_tensors
@@ -146,13 +152,10 @@ impl Otow {
             .and_then(|n| n.checked_add(table_offset))
             .filter(|&e| e <= b.len())
             .ok_or(".otow: tensor directory runs past the end of the file")?;
-        let config = core::str::from_utf8(&b[HEADER_LEN..HEADER_LEN + config_len])
+        let config = core::str::from_utf8(&b[HEADER_LEN..config_end])
             .map_err(|_| ".otow: config is not UTF-8")?
             .to_owned();
-        if b[HEADER_LEN + config_len..table_offset]
-            .iter()
-            .any(|&x| x != 0)
-        {
+        if b[config_end..table_offset].iter().any(|&x| x != 0) {
             return Err(".otow: config padding is not zero".into());
         }
 
@@ -426,6 +429,18 @@ mod tests {
             b[at] ^= 1;
             assert!(Otow::parse(&b).is_err(), "flip at {at} accepted");
         }
+        // Crafted 64-byte header with config_len = u32::MAX and matching SHA-256 must return Err,
+        // never wrap HEADER_LEN + config_len on 32-bit targets (wasm32).
+        let mut crafted = vec![0u8; HEADER_LEN];
+        crafted[0..4].copy_from_slice(&MAGIC);
+        crafted[4..8].copy_from_slice(&VERSION.to_le_bytes());
+        crafted[8..12].copy_from_slice(&1u32.to_le_bytes());
+        crafted[12..16].copy_from_slice(&DTYPE_F16.to_le_bytes());
+        crafted[20..24].copy_from_slice(&u32::MAX.to_le_bytes());
+        crafted[28..32].copy_from_slice(&(HEADER_LEN as u32).to_le_bytes());
+        let d = sha256(&crafted[HEADER_LEN..]);
+        crafted[32..64].copy_from_slice(&d);
+        assert!(Otow::parse(&crafted).is_err());
         assert!(Otow::parse(&good[..good.len() - 64]).is_err());
     }
 }

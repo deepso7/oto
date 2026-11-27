@@ -287,7 +287,7 @@ def main(argv: list[str] | None = None) -> None:
         overrides[k] = json.loads(v)
     meta: dict = {}
     if args.ckpt:
-        ck = torch.load(args.ckpt, map_location="cpu", weights_only=False)
+        ck = torch.load(args.ckpt, map_location="cpu", weights_only=True)
         model = build_model(ck["arch"], **ck["model_cfg"])
         model.load_state_dict(ck["ema"] if ck.get("ema") else ck["model"])
         meta = {"step": ck.get("step"), "val_loss": ck.get("best_val")}
