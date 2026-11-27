@@ -100,7 +100,7 @@ const OCEAN: Scheme = Scheme {
     on_hero: "#F1FAEE",
     glyph: "#1D3557",
     hero_in: "#A8DADCB0",
-    alert: Some(("#D62F3C", "#F0606B")),
+    alert: Some(("#C42634", "#F0606B")),
     backdrop: Some(("#ECF5EC", "#13233A")),
 };
 
