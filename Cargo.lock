@@ -3092,6 +3092,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "oto-wasm"
+version = "0.0.6"
+dependencies = [
+ "oto-dsp",
+]
+
+[[package]]
 name = "parking"
 version = "2.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

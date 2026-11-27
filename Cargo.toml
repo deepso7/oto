@@ -6,6 +6,7 @@ members = [
     "crates/oto-cli",
     "crates/oto-app",
     "crates/oto-sign",
+    "crates/oto-wasm",
 ]
 # The UI pulls in the whole GPU stack; keep plain `cargo build/test` fast.
 default-members = ["crates/oto-dsp", "crates/oto-engine", "crates/oto-cli"]

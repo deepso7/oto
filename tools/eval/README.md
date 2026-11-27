@@ -20,7 +20,8 @@ python3 -m unittest discover -s tools/eval -v        # the harness's own tests
 
 With `uv`, `uv run --project tools/eval tools/eval/eval.py …` works the same. Extras:
 `--extra metrics` (numpy, scipy), `--extra perceptual` (PESQ, onnxruntime for DNSMOS),
-`--extra asr` (faster-whisper).
+`--extra asr` (faster-whisper), `--extra parakeet` (Parakeet TDT 0.6B v2 via onnx-asr; numpy +
+onnxruntime, no torch), `--extra nemo-tn` (NeMo text normalisation, Linux-first).
 
 ## CI suite
 
@@ -81,6 +82,9 @@ Only `noisy` is required. What each field enables:
 | `kind: background_only` + `--asr` | leaked words per minute |
 | `kind: noise_only` + `--asr` | hallucinated words per minute, next to the ASR's own rate on the raw input |
 | `--dnsmos-model` | DNSMOS P.835 SIG / BAK / OVR |
+| `segments` + `speaker_id` + `--asr` | Krisp scoring: pooled WER, missed caller words, secondary-segment leak and noise-segment hallucinations per minute, speaker-bootstrap 95% CIs (`krisp.py`) |
+| `baselines` (`{name: wav}`) + `--asr` | the same Krisp metrics for each baseline, and paired `*_delta_vs_<name>` intervals; with `--dnsmos-model`, `dnsmos_*_delta_vs_<name>` |
+| fullband input (≥ 44.1 kHz, content > 16 kHz) | `high_band_16k_db` and `high_band_16k_delta_db`: the 48 kHz fullband check |
 
 ### Same-ASR head-to-head
 
@@ -98,6 +102,33 @@ blamed for.
 oto latency --stimulus speech --tier standard --json > latency-dfn3.json
 python3 tools/eval/eval.py --latency-report latency-dfn3.json [--gates-profile voice_isolation.opt_in]
 ```
+
+`--asr-backend parakeet` uses NVIDIA Parakeet TDT 0.6B v2 (the Krisp benchmark's recogniser)
+through onnx-asr and returns word timestamps. Use the default fp32 weights for anything compared
+with published numbers: the int8 export drops quiet background talkers (on one Krisp clip it
+transcribed none of the 38 background words the fp32 model and NeMo transcribe).
+
+### Krisp Voice Isolation Benchmark (plan 0004, Phase 0)
+
+[`krisp_bench.py`](krisp_bench.py) fetches the benchmark and Krisp's published VI 2.5 outputs
+from Hugging Face (stdlib HTTP, `$HF_TOKEN` optional) into `--data-dir` (default
+`~/.cache/oto-eval/krisp`; paths inside the repo are refused), checks free disk first
+(`--reserve-gb`, default 20), builds an eval.py manifest, transcribes with Parakeet, and scores.
+
+```bash
+python3 tools/eval/krisp_bench.py download --dry-run        # 1.94 GB: raw + VI 2.5 Default
+uv run --project tools/eval --extra parakeet tools/eval/krisp_bench.py reproduce
+uv run --project tools/eval --extra parakeet tools/eval/krisp_bench.py eval --models dfn3,dpdfnet,nearfield
+python3 tools/eval/krisp_bench.py score --clips krisp.clips.jsonl --check   # re-pool published per-clip counts
+```
+
+`reproduce` exits 1 unless pooled WER is within 0.2 points of the published rows (raw 23.21%,
+Krisp VI 2.5 Default 5.30%). `eval` runs eval.py with `--gates-profile oto1.isolate`; Krisp's
+output is the `krisp_default` baseline, so the "not significantly worse WER / significantly lower
+leak" gates are paired speaker-bootstrap intervals over the 47 speakers. Scoring follows Krisp's
+methodology (regex rules + NeMo TN + jiwer transform, pooled WER) and the VoxLock scorer's leak
+and missed definitions; see the docstring of [`krisp.py`](krisp.py). Without `nemo-tn` a stdlib
+verbaliser stands in for NeMo TN (reported as `krisp_normalizer` in the report).
 
 ### Fault injection
 
@@ -131,7 +162,9 @@ From [the training-data audit](../../docs/training-data-audit.md):
 | `eval.py` | CLI: suites, processors, gate checks, reports |
 | `fixtures.py` | Synthetic CI fixtures (`python3 tools/eval/fixtures.py OUT_DIR`) |
 | `metrics.py` | RMS, peak, SNR, SI-SDR, windowed attenuation, delay estimation |
-| `asr.py` | WER alignment, first-word deletion, words per minute, faster-whisper wrapper |
+| `asr.py` | WER alignment, first-word deletion, words per minute, faster-whisper and Parakeet (onnx-asr) backends |
+| `krisp.py` | Krisp benchmark scoring: normalisation, pooled WER, missed, leak, speaker bootstrap |
+| `krisp_bench.py` | Krisp benchmark CLI: download, manifest, ASR cache, score, reproduce, eval |
 | `wavio.py` | Stdlib WAV reader and writer (PCM 8/16/24/32, float 32/64, extensible) |
-| `gates.toml` | Gates for the CI suite, per model and for Voice Isolation |
+| `gates.toml` | Gates for the CI suite, per model, Voice Isolation, and Oto-1 (`[oto1.clean]`, `[oto1.isolate]`) |
 | `test_eval.py` | Tests, including the `MODELS.toml` hash check |

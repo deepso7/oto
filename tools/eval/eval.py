@@ -32,6 +32,7 @@ if str(HERE) not in sys.path:
     sys.path.insert(0, str(HERE))
 
 import fixtures as fx  # noqa: E402
+import krisp  # noqa: E402
 import metrics as mx  # noqa: E402
 from wavio import Audio, read_wav, write_wav  # noqa: E402
 
@@ -447,8 +448,10 @@ def run_ci(models: list[ModelSpec], strengths: list[str], proc: Processor, gates
 def read_manifest(path: Path) -> list[dict]:
     """JSONL. Required: `noisy`. Optional: `id`, `clean`, `interferer`, `transcript`,
     `interferer_transcript`, `kind` (speech | noise_only | background_only), `noise_windows`,
-    `speech_windows` (seconds), `dataset`, `license`. Relative paths are relative to the
-    manifest file."""
+    `speech_windows` (seconds), `dataset`, `license`. Krisp-benchmark style entries add
+    `segments` (labelled primary / mix / secondary / noise), `speaker_id`, `scenario` and
+    `baselines` ({name: wav}, e.g. Krisp's published outputs, scored with the same ASR).
+    Relative paths are relative to the manifest file."""
     entries = []
     for n, line in enumerate(Path(path).read_text().splitlines(), 1):
         line = line.strip()
@@ -464,10 +467,22 @@ def read_manifest(path: Path) -> list[dict]:
         e.setdefault("kind", "speech")
         if e["kind"] not in ("speech", "noise_only", "background_only"):
             raise HarnessError(f"{path}:{n}: unknown kind {e['kind']!r}")
+        def resolve(v):
+            p = Path(v).expanduser()
+            return str(p if p.is_absolute() else (Path(path).parent / p).resolve())
+
         for k in ("noisy", "clean", "interferer"):
             if e.get(k):
-                p = Path(e[k]).expanduser()
-                e[k] = str(p if p.is_absolute() else (Path(path).parent / p).resolve())
+                e[k] = resolve(e[k])
+        if e.get("baselines"):
+            if not isinstance(e["baselines"], dict):
+                raise HarnessError(f"{path}:{n}: `baselines` must be an object of name -> wav")
+            e["baselines"] = {str(k): resolve(v) for k, v in e["baselines"].items() if v}
+        if e.get("segments") is not None:
+            try:
+                e["segments"] = krisp.validate_segments(e["segments"])
+            except (ValueError, KeyError, TypeError) as err:
+                raise HarnessError(f"{path}:{n}: segments: {err}") from err
         entries.append(e)
     return entries
 
@@ -552,7 +567,15 @@ class Dnsmos:
         return {f"dnsmos_{k}": float(np.polyval(self.POLY[k], raw[i])) for i, k in enumerate(("sig", "bak", "ovr"))}
 
 
-def run_manifest(entries: list[dict], models: list[ModelSpec], strengths: list[str], proc: Processor, gates: dict, out_dir: Path, profile: str | None = None, transcriber=None, dnsmos=None, log=print, latency_gates_by_key: dict[tuple[str, str], set[str]] | None = None) -> list[dict]:
+def _krisp_scored(e: dict) -> bool:
+    return e["kind"] == "speech" and bool(e.get("transcript")) and e.get("segments") is not None
+
+
+def _krisp_row(e: dict, text: str, words, normalizer, offset: float = 0.0) -> dict:
+    return krisp.clip_row(e["id"], e.get("scenario") or e.get("dataset") or "", e.get("speaker_id") or e["id"], e["transcript"], text, words, e["segments"], normalizer, offset)
+
+
+def run_manifest(entries: list[dict], models: list[ModelSpec], strengths: list[str], proc: Processor, gates: dict, out_dir: Path, profile: str | None = None, transcriber=None, dnsmos=None, log=print, latency_gates_by_key: dict[tuple[str, str], set[str]] | None = None, normalizer=None, n_boot: int = 2000) -> list[dict]:
     work = out_dir / "processed"
     work.mkdir(parents=True, exist_ok=True)
     fixtures_dir = out_dir / "fixtures"
@@ -561,16 +584,40 @@ def run_manifest(entries: list[dict], models: list[ModelSpec], strengths: list[s
 
     # Same-ASR baseline: the unprocessed input (downmixed identically to `oto process`),
     # transcribed once with the same configuration.
+    # Krisp-style entries (with `segments`) also get timed words for leak scoring, and their
+    # `baselines` (e.g. Krisp's published outputs) are transcribed once with the same ASR.
+    import asr as _asr
+
     raw_text: dict[str, str] = {}
+    krisp_raw: dict[str, dict] = {}
+    krisp_base: dict[str, dict[str, dict]] = {}
     if transcriber:
+        normalizer = normalizer or krisp.KrispNormalizer()
         for e in entries:
+            scored = _krisp_scored(e)
             inp_audio = read_wav(e["noisy"])
+            src = e["noisy"]
             if len(inp_audio.channels) != 1:
-                mono_path = work / f"raw__{_safe(e['id'])}.wav"
-                write_wav(mono_path, inp_audio.rate, inp_audio.mono, "float32")
-                raw_text[e["id"]] = transcriber(str(mono_path))
-            else:
-                raw_text[e["id"]] = transcriber(e["noisy"])
+                src = work / f"raw__{_safe(e['id'])}.wav"
+                write_wav(src, inp_audio.rate, inp_audio.mono, "float32")
+            raw_text[e["id"]], words = _asr.transcribe(transcriber, src, scored)
+            if scored:
+                krisp_raw[e["id"]] = _krisp_row(e, raw_text[e["id"]], words, normalizer)
+                for name, path in (e.get("baselines") or {}).items():
+                    try:
+                        text, bwords = _asr.transcribe(transcriber, path, True)
+                    except (ValueError, OSError) as err:
+                        log(f"  baseline {name} {e['id']}: {err}")
+                        continue
+                    krisp_base.setdefault(e["id"], {})[name] = _krisp_row(e, text, bwords, normalizer)
+
+    # DNSMOS of each baseline (e.g. Krisp NC captures), once per clip, for paired deltas.
+    base_dnsmos: dict[str, dict[str, dict]] = {}
+    if dnsmos is not None:
+        for e in entries:
+            for name, path in (e.get("baselines") or {}).items():
+                b = read_wav(path)
+                base_dnsmos.setdefault(e["id"], {})[name] = dnsmos([s if math.isfinite(s) else 0.0 for s in b.mono], b.rate)
 
     profile_gates = _lookup(gates, profile) if profile else {}
     if profile and not profile_gates:
@@ -585,10 +632,18 @@ def run_manifest(entries: list[dict], models: list[ModelSpec], strengths: list[s
                 out = work / f"{model.key}__{strength}__{_safe(e['id'])}.wav"
                 try:
                     proc.process(model, strength, Path(e["noisy"]), out, hint=e)
-                    clips.append(clip_metrics(e, read_wav(e["noisy"]), read_wav(out), delay48, out, transcriber, raw_text.get(e["id"]), dnsmos))
+                    c = clip_metrics(e, read_wav(e["noisy"]), read_wav(out), delay48, out, transcriber, raw_text.get(e["id"]), dnsmos, normalizer)
+                    if e["id"] in krisp_raw:
+                        c["krisp_raw"] = krisp_raw[e["id"]]
+                    if e["id"] in krisp_base:
+                        c["krisp_baselines"] = krisp_base[e["id"]]
+                    if e["id"] in base_dnsmos:
+                        c["baseline_dnsmos"] = base_dnsmos[e["id"]]
+                    c["speaker_id"] = e.get("speaker_id") or e["id"]
+                    clips.append(c)
                 except (ProcessError, ValueError, OSError) as err:
                     errors.append(f"{e['id']}: {err}")
-            agg = aggregate_manifest(clips)
+            agg = aggregate_manifest(clips, n_boot)
             agg["delay_error_samples"] = calib.get("delay_error_samples")
             # Always enforce baseline output & calibration safety checks alongside any quality profile.
             ci_safety = {k: v for k, v in gates.get("ci", {}).items() if k in ("max_nan_count", "max_clip_count", "max_delay_error_samples")}
@@ -607,7 +662,7 @@ def run_manifest(entries: list[dict], models: list[ModelSpec], strengths: list[s
     return results
 
 
-def clip_metrics(e: dict, inp: Audio, out: Audio, delay48: int, out_path: Path, transcriber=None, raw_text=None, dnsmos=None) -> dict:
+def clip_metrics(e: dict, inp: Audio, out: Audio, delay48: int, out_path: Path, transcriber=None, raw_text=None, dnsmos=None, normalizer=None) -> dict:
     y = [s if math.isfinite(s) else 0.0 for s in out.mono]
     delay = round(delay48 * out.rate / ENGINE_RATE)
     duration = inp.frames / inp.rate
@@ -635,13 +690,18 @@ def clip_metrics(e: dict, inp: Audio, out: Audio, delay48: int, out_path: Path, 
             leak = mx.overlap_leakage_db(inp.mono, mx.shift(y, delay, itf.frames), itf.mono, itf.rate, clean=clean_mono)
             if leak is not None:
                 c["overlap_leakage_db"] = leak
+    if e["kind"] == "speech":
+        c.update(mx.high_band_metrics(inp.mono, inp.rate, y, out.rate))
     if dnsmos is not None:
         c.update(dnsmos(y, out.rate))
     if transcriber is not None:
         import asr
 
-        hyp = transcriber(str(out_path))
+        hyp, words = asr.transcribe(transcriber, out_path, _krisp_scored(e))
         c["hyp"], c["raw_hyp"] = hyp, raw_text
+        if _krisp_scored(e):
+            # Word times are in the output's timeline: undo the chain delay before matching segments.
+            c["krisp"] = _krisp_row(e, hyp, words, normalizer or krisp.KrispNormalizer(), delay48 / ENGINE_RATE)
         if e.get("transcript") and e["kind"] == "speech":
             ref_words = asr.normalize(e["transcript"])
             c["ref_words"] = len(ref_words)
@@ -659,14 +719,14 @@ def clip_metrics(e: dict, inp: Audio, out: Audio, delay48: int, out_path: Path, 
     return c
 
 
-def aggregate_manifest(clips: list[dict]) -> dict:
+def aggregate_manifest(clips: list[dict], n_boot: int = 2000) -> dict:
     a: dict = {"clips": len(clips)}
 
     def mean(key):
         v = [c[key] for c in clips if c.get(key) is not None and math.isfinite(c[key])]
         return sum(v) / len(v) if v else None
 
-    for k in ("si_sdr_in_db", "si_sdr_out_db", "si_sdr_delta_db", "snr_out_db", "pesq_wb", "dnsmos_sig", "dnsmos_bak", "dnsmos_ovr", "overlap_leakage_db"):
+    for k in ("si_sdr_in_db", "si_sdr_out_db", "si_sdr_delta_db", "snr_out_db", "pesq_wb", "dnsmos_sig", "dnsmos_bak", "dnsmos_ovr", "overlap_leakage_db", "input_high_band_16k_db", "high_band_16k_db", "high_band_16k_delta_db"):
         a[k] = mean(k)
     a["quiet_attenuation_db"] = mean("attenuation_db")
     a["nan_count"] = sum(c["nan_count"] for c in clips)
@@ -690,7 +750,48 @@ def aggregate_manifest(clips: list[dict]) -> dict:
     a["background_leaked_words_per_min"] = per_min("leaked_words_per_min", "background_only")
     a["noise_only_hallucinated_words_per_min"] = per_min("hallucinated_words_per_min", "noise_only")
     a["raw_noise_only_hallucinated_words_per_min"] = per_min("raw_hallucinated_words_per_min", "noise_only")
+    a.update(aggregate_krisp(clips, n_boot))
+    a.update(aggregate_baseline_dnsmos(clips, n_boot))
     return {k: v for k, v in a.items() if v is not None}
+
+
+def aggregate_baseline_dnsmos(clips: list[dict], n_boot: int = 2000) -> dict:
+    """`dnsmos_<k>_delta_vs_<baseline>` (mean of per-clip Oto − baseline) with `_ci_lo` /
+    `_ci_hi` from a speaker-clustered bootstrap, for every baseline scored with DNSMOS."""
+    a: dict = {}
+    names = sorted({n for c in clips for n in (c.get("baseline_dnsmos") or {})})
+    for name in names:
+        for k in ("sig", "bak", "ovr"):
+            key = f"dnsmos_{k}"
+            sel = [c for c in clips if key in c and key in (c.get("baseline_dnsmos") or {}).get(name, {})]
+            if not sel:
+                continue
+            point, lo, hi = krisp.cluster_mean_ci([c[key] - c["baseline_dnsmos"][name][key] for c in sel], [c.get("speaker_id", c["id"]) for c in sel], n_boot)
+            base = f"{key}_delta_vs_{name}"
+            a[base], a[base + "_ci_lo"], a[base + "_ci_hi"] = point, lo, hi
+    return a
+
+
+def aggregate_krisp(clips: list[dict], n_boot: int = 2000) -> dict:
+    """Krisp benchmark metrics (krisp.py): pooled WER, missed caller words, secondary-segment
+    leak and noise-segment hallucinations with speaker-bootstrap CIs, for the model (no
+    prefix), the raw input (`raw_`) and each baseline (`<name>_`), plus paired
+    `<metric>_delta_vs_raw` / `_delta_vs_<baseline>` intervals (model minus reference)."""
+    rows = [c["krisp"] for c in clips if "krisp" in c]
+    if not rows:
+        return {}
+    a = krisp.summary_metrics(rows, n_boot=n_boot)
+    raw = [c["krisp_raw"] for c in clips if "krisp" in c and "krisp_raw" in c]
+    refs: dict[str, list[dict]] = {"raw": raw} if raw else {}
+    for c in clips:
+        if "krisp" in c:
+            for name, row in (c.get("krisp_baselines") or {}).items():
+                refs.setdefault(name, []).append(row)
+    for name, ref_rows in refs.items():
+        a.update(krisp.summary_metrics(ref_rows, prefix=f"{name}_", n_boot=n_boot))
+        a.update(krisp.delta_metrics(rows, ref_rows, name, n_boot=n_boot))
+    a["krisp_references"] = sorted(refs)
+    return a
 
 
 # ------------------------------------------------------------------------------------------
@@ -1087,6 +1188,27 @@ def markdown(report: dict) -> str:
         for r in man:
             m = r["metrics"]
             L.append(f"| {r['model']} | {r['strength']} | {m.get('clips', 0)} | {_fmt(m.get('si_sdr_delta_db'))} | {_fmt(m.get('quiet_attenuation_db'))} | {_fmt(m.get('pesq_wb'), 2)} | {_fmt(m.get('dnsmos_ovr'), 2)} | {_fmt(m.get('target_wer_delta'), 3)} | {_fmt(m.get('first_word_deletion_rate'), 3)} | {_fmt(m.get('wrong_speaker_rate'), 3)} | {_fmt(m.get('background_leaked_words_per_min'))} | {_fmt(m.get('noise_only_hallucinated_words_per_min'))} | {_fmt(m.get('overlap_leakage_db'))} | {_verdict(r['checks'])} |")
+        kr = [r for r in man if "krisp_wer_pct" in r["metrics"]]
+        if kr:
+            L += ["", "### Krisp Voice Isolation Benchmark scoring", "", "Pooled WER, caller words missed and leaked words per minute of secondary-only speech; [95% speaker-bootstrap interval]. Deltas are model minus reference (paired).", "", "| Row | Files / speakers | WER % | Missed % | Leak w/min | Phone-call WER % |", "|---|---|---|---|---|---|"]
+
+            def ci(m, k, d=2):
+                lo, hi = m.get(k + "_ci_lo"), m.get(k + "_ci_hi")
+                return f"{_fmt(m.get(k), d)}" + (f" [{_fmt(lo, d)}, {_fmt(hi, d)}]" if lo is not None else "")
+
+            shown: set[str] = set()
+            for r in kr:
+                m = r["metrics"]
+                for ref in m.get("krisp_references", []):
+                    if ref in shown:
+                        continue
+                    shown.add(ref)
+                    p = f"{ref}_"
+                    L.append(f"| {ref} | {m.get(p + 'krisp_files', '–')} / {m.get(p + 'krisp_speakers', '–')} | {ci(m, p + 'krisp_wer_pct')} | {ci(m, p + 'missed_caller_pct')} | {ci(m, p + 'secondary_leaked_words_per_min')} | {_fmt(m.get(p + 'phone_calls_krisp_wer_pct'), 2)} |")
+                L.append(f"| **{r['model']} / {r['strength']}** | {m.get('krisp_files')} / {m.get('krisp_speakers')} | {ci(m, 'krisp_wer_pct')} | {ci(m, 'missed_caller_pct')} | {ci(m, 'secondary_leaked_words_per_min')} | {_fmt(m.get('phone_calls_krisp_wer_pct'), 2)} |")
+                for ref in m.get("krisp_references", []):
+                    if ref != "raw":
+                        L.append(f"| ↳ Δ vs {ref} | | {ci(m, f'krisp_wer_pct_delta_vs_{ref}')} | {ci(m, f'missed_caller_pct_delta_vs_{ref}')} | {ci(m, f'secondary_leaked_words_per_min_delta_vs_{ref}')} | |")
         if meta.get("asr"):
             L += ["", f"Same-ASR head-to-head, one configuration for every row and the raw input: `{json.dumps(meta['asr'])}`."]
     bench = [r for r in report["results"] if r["suite"] == "bench"]
@@ -1153,8 +1275,12 @@ def parse_args(argv=None):
     p.add_argument("--fault-report", type=Path, help="engine fault-injection JSON, checked against [voice_isolation.fault_injection]")
     p.add_argument("--latency-report", type=Path, action="append", default=[], help="saved `oto latency --stimulus speech --json` file (repeatable)")
     p.add_argument("--gates-profile", help="gates.toml table for the manifest/latency suite, e.g. voice_isolation.opt_in")
-    p.add_argument("--asr", action="store_true", help="same-ASR head-to-head with faster-whisper (extra: asr)")
-    p.add_argument("--asr-model", default="small.en")
+    p.add_argument("--asr", action="store_true", help="same-ASR head-to-head (extra: asr for faster-whisper, parakeet for Parakeet TDT)")
+    p.add_argument("--asr-backend", choices=["faster-whisper", "parakeet"], default="faster-whisper", help="parakeet = NVIDIA Parakeet TDT 0.6B v2 via onnx-asr, the Krisp benchmark's recogniser")
+    p.add_argument("--asr-model", help="backend model (default: small.en for faster-whisper, nemo-parakeet-tdt-0.6b-v2 for parakeet)")
+    p.add_argument("--asr-quantization", help="parakeet only: e.g. int8 (default fp32)")
+    p.add_argument("--krisp-normalizer", choices=["auto", "nemo", "stdlib"], default="auto", help="text normalisation for Krisp-style entries (auto: NeMo TN if installed)")
+    p.add_argument("--bootstrap", type=int, default=2000, help="speaker-bootstrap resamples for Krisp-style CIs")
     p.add_argument("--dnsmos-model", help="local DNSMOS sig_bak_ovr.onnx (extra: perceptual)")
     p.add_argument("--gates", type=Path, default=HERE / "gates.toml")
     p.add_argument("--models-toml", type=Path, default=REPO / "MODELS.toml")
@@ -1216,21 +1342,25 @@ def run(args, log=print) -> int:
             entries = read_manifest(args.manifest)
             meta["manifest"] = str(args.manifest)
             transcriber = None
+            normalizer = None
             if args.asr:
-                from asr import Transcriber
+                from asr import make_transcriber
 
                 try:
-                    transcriber = Transcriber(args.asr_model)
+                    transcriber = make_transcriber(args.asr_backend, args.asr_model, args.asr_quantization)
+                    normalizer = krisp.KrispNormalizer(args.krisp_normalizer)
                 except RuntimeError as e:
                     raise HarnessError(str(e)) from e
                 meta["asr"] = transcriber.config
+                if any(e.get("segments") is not None for e in entries):
+                    meta["krisp_normalizer"] = normalizer.backend
             dnsmos = None
             if args.dnsmos_model:
                 try:
                     dnsmos = Dnsmos(args.dnsmos_model)
                 except ImportError as e:
                     raise HarnessError("DNSMOS needs the `perceptual` extra (onnxruntime, numpy)") from e
-            results += run_manifest(entries, models, strengths, proc, gates, args.out, args.gates_profile, transcriber, dnsmos, log, latency_gates_by_key=latency_gates_by_key)
+            results += run_manifest(entries, models, strengths, proc, gates, args.out, args.gates_profile, transcriber, dnsmos, log, latency_gates_by_key=latency_gates_by_key, normalizer=normalizer, n_boot=args.bootstrap)
 
     if args.bench:
         binary = find_oto(args.oto)

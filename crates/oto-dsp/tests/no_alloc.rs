@@ -178,6 +178,58 @@ fn dfn3_allocations_per_frame() {
     );
 }
 
+/// Oto-1 Candidate A and B, every kernel backend this CPU has: `process_frame` (and the
+/// `FrameAdapter` around it, at awkward block sizes) never touches the heap, including across
+/// silence and `reset`-free restarts.
+#[cfg(feature = "oto1")]
+#[test]
+fn oto1_process_frame_never_allocates() {
+    use oto_dsp::oto1::{Arch, Backend, HOP, Oto1, random_otow};
+    use oto_dsp::{Denoiser, FrameAdapter};
+    let sr = oto_dsp::SAMPLE_RATE as usize;
+    let mut audio = signal::noisy_speech(sr * 2, 3);
+    audio.extend(std::iter::repeat_n(0.0, sr / 2));
+    audio.extend(signal::noisy_speech(sr / 2, 4));
+    for arch in [Arch::A, Arch::B] {
+        let bytes = random_otow(arch, 1);
+        for be in Backend::all() {
+            let mut model = Oto1::from_otow_with(&bytes, be).unwrap();
+            let mut out = vec![0.0f32; HOP];
+            let (heap, ()) = count(|| {
+                for frame in audio.as_chunks::<HOP>().0 {
+                    model.process_frame(frame, &mut out);
+                }
+            });
+            assert_eq!(
+                heap.calls(),
+                0,
+                "{arch:?} {be:?}: process_frame touched the heap: {heap:?}"
+            );
+
+            let mut fa = FrameAdapter::new(model);
+            let mut buf = audio.clone();
+            let blocks = [1usize, 128, 333, 480, 512, 1024, 2048];
+            let (heap, ()) = count(|| {
+                let mut at = 0;
+                for &n in blocks.iter().cycle() {
+                    if at >= buf.len() {
+                        break;
+                    }
+                    let end = (at + n).min(buf.len());
+                    fa.process_in_place(&mut buf[at..end]);
+                    at = end;
+                }
+            });
+            assert_eq!(
+                heap.calls(),
+                0,
+                "{arch:?} {be:?}: FrameAdapter touched the heap: {heap:?}"
+            );
+            assert!(buf.iter().any(|&v| v != 0.0));
+        }
+    }
+}
+
 #[test]
 fn the_counter_works() {
     let (heap, v) = count(|| vec![1u8; 16]);
