@@ -766,17 +766,18 @@ impl PreparedUpdate {
         let staging = parent.join(format!("{STAGING_PREFIX}{nonce}"));
         let helper_path = paths.update_helper(&nonce);
         let helper_tmp = paths.dir.join(format!(".update-helper-{nonce}.tmp"));
+        let staging_record = paths.dir.join(format!("staging-{nonce}"));
 
         // Serialize staging + helper preparation under `.helper-prep.lock` until the helper
-        // replies ready (holding `updating.lock` with a journal referencing `staging`). Any crash
-        // before that releases this lock so startup cleanup reclaims both `.Oto-update-<nonce>`
-        // and `.update-helper-<nonce>.tmp`.
+        // replies ready (holding `updating.lock` with a journal referencing `staging`). Recording
+        // `staging-<nonce>` in this user's own state dir lets crash cleanup reclaim only stages
+        // this user created, never touching another user's live rollback backup in a shared folder.
         let _prep_lock = open_helper_prep_lock(paths)
             .and_then(|f| f.lock().map(|()| f))
             .map_err(|e| format!("Couldn't prepare the updater: {e}"))?;
 
         struct PrepCleanup<'a> {
-            paths: [&'a Path; 3],
+            paths: [&'a Path; 4],
             disarmed: bool,
         }
         impl Drop for PrepCleanup<'_> {
@@ -789,9 +790,12 @@ impl PreparedUpdate {
             }
         }
         let mut guard = PrepCleanup {
-            paths: [&staging, &helper_tmp, &helper_path],
+            paths: [&staging, &helper_tmp, &helper_path, &staging_record],
             disarmed: false,
         };
+
+        write_staging_record(&staging_record, &staging)
+            .map_err(|e| format!("Couldn't prepare the updater: {e}"))?;
 
         clone_tree(&staged.cached_app_path, &staging)
             .map_err(|e| format!("Couldn't copy the update next to Oto: {e}"))?;
@@ -836,6 +840,8 @@ impl PreparedUpdate {
                 return Err("The updater couldn't start. Try again later.".into());
             }
         }
+        // The helper now holds `updating.lock` with a journal tracking `staging`.
+        let _ = rec::remove_path(&staging_record);
         guard.disarmed = true;
         drop(guard);
         Ok(Self {
@@ -1455,8 +1461,7 @@ pub fn startup_recovery(exe: &Path) -> RecoveryOutcome {
         },
     );
     if out == RecoveryOutcome::NoTransaction || out == RecoveryOutcome::Resolved {
-        let app_dir = driver::app_bundle(exe).and_then(|b| b.parent().map(Path::to_path_buf));
-        cleanup_stale_files_in(&paths, app_dir.as_deref());
+        cleanup_stale_files(&paths);
         if let Some(cache) = verify::updates_cache_dir() {
             verify::reclaim_abandoned_work_dirs(&cache);
         }
@@ -1494,20 +1499,57 @@ fn open_helper_prep_lock(paths: &UpdatePaths) -> io::Result<File> {
     o.open(paths.dir.join(HELPER_PREP_LOCK))
 }
 
+fn write_staging_record(record: &Path, staging: &Path) -> io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    if let Some(dir) = record.parent() {
+        fs::create_dir_all(dir)?;
+    }
+    let mut o = fs::OpenOptions::new();
+    o.create(true).truncate(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        o.mode(0o600);
+    }
+    let mut f = o.open(record)?;
+    f.write_all(staging.as_os_str().as_bytes())?;
+    f.sync_data()
+}
+
+fn owned_staging_dir(path: &Path, nonce: &Nonce) -> bool {
+    let expected = format!("{STAGING_PREFIX}{nonce}");
+    if !path.is_absolute() || path.file_name().and_then(|n| n.to_str()) != Some(expected.as_str()) {
+        return false;
+    }
+    let Ok(meta) = fs::symlink_metadata(path) else {
+        return false;
+    };
+    if !meta.file_type().is_dir() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        // SAFETY: geteuid has no preconditions.
+        let euid = unsafe { libc::geteuid() };
+        meta.uid() == euid
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
 /// Removes leftovers of finished transactions: helper copies, state and ack files of other
 /// transactions older than ten minutes (so a starting helper or a candidate reading its
-/// `committed` is never raced), plus any crashed `.update-helper-<nonce>.tmp` files (and
-/// abandoned `.Oto-update-<nonce>` staging copies when `app_dir` is given) when no helper
-/// preparation is in flight. Only while holding `updating.lock`.
+/// `committed` is never raced), plus any crashed `.update-helper-<nonce>.tmp` files and
+/// abandoned `.Oto-update-<nonce>` staging copies recorded by this user (`staging-<nonce>`) when
+/// no helper preparation is in flight. Only while holding `updating.lock`.
 pub fn cleanup_stale_files(paths: &UpdatePaths) {
-    cleanup_stale_files_with(paths, None, STALE_AGE);
+    cleanup_stale_files_with(paths, STALE_AGE);
 }
 
-fn cleanup_stale_files_in(paths: &UpdatePaths, app_dir: Option<&Path>) {
-    cleanup_stale_files_with(paths, app_dir, STALE_AGE);
-}
-
-fn cleanup_stale_files_with(paths: &UpdatePaths, app_dir: Option<&Path>, max_age: Duration) {
+fn cleanup_stale_files_with(paths: &UpdatePaths, max_age: Duration) {
     let Ok(Some(_lock)) = UpdatingLock::try_acquire(paths) else {
         return;
     };
@@ -1525,6 +1567,22 @@ fn cleanup_stale_files_with(paths: &UpdatePaths, app_dir: Option<&Path>, max_age
                 .and_then(|r| r.strip_suffix(".tmp"))
             {
                 if prep_lock.is_some() && Nonce::parse(n).is_ok() {
+                    let _ = rec::remove_path(&e.path());
+                }
+                continue;
+            }
+            if let Some(n) = name.strip_prefix("staging-") {
+                if prep_lock.is_some()
+                    && let Ok(n) = Nonce::parse(n)
+                    && current.as_ref() != Some(&n)
+                {
+                    if let Ok(raw) = fs::read(e.path()) {
+                        use std::os::unix::ffi::OsStrExt;
+                        let staging = PathBuf::from(std::ffi::OsStr::from_bytes(&raw));
+                        if owned_staging_dir(&staging, &n) {
+                            let _ = rec::remove_path(&staging);
+                        }
+                    }
                     let _ = rec::remove_path(&e.path());
                 }
                 continue;
@@ -1555,24 +1613,6 @@ fn cleanup_stale_files_with(paths: &UpdatePaths, app_dir: Option<&Path>, max_age
             if old {
                 let _ = rec::remove_path(&e.path());
             }
-        }
-    }
-    if prep_lock.is_some()
-        && let Some(dir) = app_dir
-        && let Ok(rd) = fs::read_dir(dir)
-    {
-        for e in rd.flatten() {
-            let Some(name) = e.file_name().to_str().map(str::to_owned) else {
-                continue;
-            };
-            let Some(n) = name.strip_prefix(STAGING_PREFIX) else {
-                continue;
-            };
-            let Ok(n) = Nonce::parse(n) else { continue };
-            if current.as_ref() == Some(&n) {
-                continue;
-            }
-            let _ = rec::remove_path(&e.path());
         }
     }
 }
@@ -2738,7 +2778,7 @@ mod tests {
         // Once past the age threshold, unreferenced helper and state files are removed while the
         // current transaction's files stay.
         std::thread::sleep(Duration::from_millis(10));
-        cleanup_stale_files_with(&w.paths, None, Duration::ZERO);
+        cleanup_stale_files_with(&w.paths, Duration::ZERO);
         assert!(w.paths.update_helper(&cur).exists());
         assert!(w.paths.tx_state(&cur).exists());
         assert!(!w.paths.update_helper(&old).exists());
@@ -2747,7 +2787,7 @@ mod tests {
         fs::write(w.paths.update_helper(&old), "h").unwrap();
         std::thread::sleep(Duration::from_millis(10));
         let held = UpdatingLock::try_acquire(&w.paths).unwrap().unwrap();
-        cleanup_stale_files_with(&w.paths, None, Duration::ZERO);
+        cleanup_stale_files_with(&w.paths, Duration::ZERO);
         assert!(w.paths.update_helper(&old).exists());
         drop(held);
     }
@@ -2780,20 +2820,35 @@ mod tests {
         let cur = Nonce::parse("cur").unwrap();
         let cur_tx = verifying(&w, &cur);
         let app_dir = w.target.parent().unwrap();
+        // This user's own crashed preparation (recorded in this user's state dir).
         let crashed = app_dir.join(format!("{STAGING_PREFIX}crashed2"));
         bundle(&crashed, "1.2.0");
+        let record = w.paths.dir.join("staging-crashed2");
+        write_staging_record(&record, &crashed).unwrap();
+        // Another user's live rollback backup in a shared folder has no record in this user's
+        // state dir and must never be touched.
+        let other_users_backup = app_dir.join(format!("{STAGING_PREFIX}otheruser"));
+        bundle(&other_users_backup, "1.0.0");
 
         // While a helper preparation holds .helper-prep.lock, abandoned staging copies stay.
         let prep_lock = open_helper_prep_lock(&w.paths).unwrap();
         prep_lock.lock().unwrap();
-        cleanup_stale_files_in(&w.paths, Some(app_dir));
+        cleanup_stale_files(&w.paths);
         assert!(crashed.exists());
+        assert!(record.exists());
+        assert!(other_users_backup.exists());
         assert!(cur_tx.staging_path.exists());
         drop(prep_lock);
 
-        // Once released, startup cleanup removes the abandoned copy while keeping the active tx's.
-        cleanup_stale_files_in(&w.paths, Some(app_dir));
+        // Once released, startup cleanup removes only this user's abandoned copy while keeping
+        // the current transaction's staging and leaving untracked backups untouched.
+        cleanup_stale_files(&w.paths);
         assert!(!crashed.exists(), "abandoned staging copy reclaimed");
+        assert!(!record.exists(), "staging record removed");
+        assert!(
+            other_users_backup.exists(),
+            "untracked staging copy (e.g. another user's backup) untouched"
+        );
         assert!(cur_tx.staging_path.exists(), "current tx staging kept");
     }
 }
