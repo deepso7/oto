@@ -130,8 +130,9 @@ def silent_target_loss(
     eo, ei = frame_energy(est), frame_energy(mix)
     n = min(eo.shape[-1], silent.shape[-1])
     eo, ei, silent = eo[..., :n], ei[..., :n], silent[..., :n]
-    ratio_db = 10 * torch.log10(eo + d) - 10 * torch.log10(ei + d)
-    per = torch.relu(ratio_db + floor_db) / floor_db
+    target_floor = ei * (10.0 ** (-floor_db / 10.0)) + d
+    excess_db = 10 * torch.log10(eo + d) - 10 * torch.log10(target_floor)
+    per = torch.relu(excess_db) / floor_db
     return (per * silent).sum() / silent.sum().clamp_min(1.0)
 
 

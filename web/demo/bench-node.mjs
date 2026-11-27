@@ -21,6 +21,7 @@ function errDb(a, b) {
 }
 const f32 = (p) => { const b = readFileSync(p); return new Float32Array(b.buffer, b.byteOffset, b.length / 4); };
 
+let parityFailed = false;
 for (const build of ["simd", "scalar"]) {
   const module = new WebAssembly.Module(readFileSync(join(here, "wasm", `oto-${build}.wasm`)));
   for (const [arch, name] of [[1, "a"], [2, "b"]]) {
@@ -37,7 +38,9 @@ for (const build of ["simd", "scalar"]) {
         got.set(inst.output, h * HOP);
       }
       const db = errDb(got, want);
-      parity = `vs native scalar ${db.toFixed(1)} dB ${db <= -90 ? "PASS" : "FAIL"}`;
+      const ok = db <= -90;
+      if (!ok) parityFailed = true;
+      parity = `vs native scalar ${db.toFixed(1)} dB ${ok ? "PASS" : "FAIL"}`;
     }
     const r = await benchAll(module, { arch, seed: 1, racingHops: 3000, pacedSeconds });
     const { racing: a, paced: p } = r;
@@ -48,3 +51,4 @@ for (const build of ["simd", "scalar"]) {
     );
   }
 }
+if (parityFailed) process.exitCode = 1;

@@ -310,15 +310,20 @@ def high_band_metrics(inp, in_rate: int, out, out_rate: int, min_input_db: float
     """`high_band_16k_db` (output's >16 kHz share) and `high_band_16k_delta_db` (output minus
     input share) when the input is fullband: rate ≥ 44.1 kHz and >16 kHz content above
     `min_input_db`. Band-limited inputs (the 32 kHz Krisp set, phone audio) return {}, so the
-    gate reports them as missing rather than failing a model for its input."""
-    if in_rate < 44100 or out_rate < 44100:
+    gate reports them as missing rather than failing a model for its input. When the input is
+    fullband and the output rate is below 44.1 kHz, the output cannot carry >16 kHz content and
+    scores `FLOOR_DB` so the fullband gate fails rather than being skipped."""
+    if in_rate < 44100:
         return {}
     a = band_energy_ratio_db(inp, in_rate)
     if a is None or a < min_input_db:
         return {}
-    b = band_energy_ratio_db(out, out_rate)
-    if b is None:
-        return {}
+    if out_rate < 44100:
+        b = FLOOR_DB
+    else:
+        b = band_energy_ratio_db(out, out_rate)
+        if b is None:
+            return {}
     return {"input_high_band_16k_db": a, "high_band_16k_db": b, "high_band_16k_delta_db": b - a}
 
 

@@ -1082,6 +1082,9 @@ class HighBandTests(unittest.TestCase):
         self.assertLess(m["high_band_16k_delta_db"], -20.0)
         self.assertEqual(mx.high_band_metrics(fullband[:16000], 32000, fullband, rate), {})  # 32 kHz input: not fullband
         self.assertEqual(mx.high_band_metrics(sine(300, rate, 0.5), rate, fullband, rate), {})  # no >16 kHz content in
+        narrow = mx.high_band_metrics(fullband, rate, sine(300, 16000, 0.5, 0.3), 16000)
+        self.assertEqual(narrow["high_band_16k_db"], mx.FLOOR_DB)
+        self.assertLess(narrow["high_band_16k_delta_db"], -100.0)
 
     def test_gates_cover_fullband(self):
         g = harness.load_toml(HERE / "gates.toml")["oto1"]["clean"]

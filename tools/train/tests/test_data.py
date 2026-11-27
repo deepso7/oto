@@ -107,11 +107,11 @@ def _hifitts_rows():
         for ch in range(4):
             for u in range(3):
                 r = {"audio_filepath": f"{spk}/{ch}/{u}.flac", "speaker": spk, "bandwidth": bw, "duration": 300.0,
-                     "chapter_id": ch}
+                     "chapter_id": ch, "snr": 32.0}
                 if multi is not None:
                     r["is_multispeaker"] = multi
                 rows.append(r)
-    rows.append({"audio_filepath": "s5/0/0.flac", "speaker": "s5", "duration": 3.0, "is_multispeaker": False})
+    rows.append({"audio_filepath": "s5/0/0.flac", "speaker": "s5", "duration": 3.0, "is_multispeaker": False, "snr": 32.0})
     return rows
 
 
@@ -121,10 +121,75 @@ def test_hifitts2_filters(tmp_path):
     items, st = P.collect_hifitts2([str(m)], "/audio", min_bw=16_000, max_speaker_hours=0.5)
     assert {i.speaker for i in items} == {"hifitts2:s1"}  # s2 bandwidth, s3 multi, s4 unknown, s5 no bw
     assert st["drop_no_bandwidth"] == 1 and st["drop_multispeaker"] == 12 and st["drop_unknown_multispeaker"] == 12
-    # cap: 0.5 h = 1800 s; chapters are 900 s each -> exactly 2 whole chapters kept
+    # cap: 0.5 h = 1800 s; chapters are 900 s each -> exactly 2 whole chapters kept, all keys unique across chapters
     assert sum(i.duration for i in items) == 1800 and len({i.session for i in items}) == 2
+    assert len({i.key for i in items}) == len(items)
     items2, _ = P.collect_hifitts2([str(m)], "/audio", allow_unknown_multispk=True, max_speaker_hours=10)
     assert {i.speaker for i in items2} == {"hifitts2:s1", "hifitts2:s4"}
+    assert len({i.key for i in items2}) == len(items2)
+
+
+def test_hifitts2_string_speaker_counts_and_quality_gates(tmp_path):
+    rows = [
+        {"audio_filepath": "a/ch1/0.flac", "speaker": "a", "bandwidth": 20000, "duration": 5.0, "num_speakers": "1", "snr": 30.0},
+        {"audio_filepath": "a/ch2/0.flac", "speaker": "a", "bandwidth": 20000, "duration": 5.0, "num_speakers": "1", "dnsmos_ovr": 3.8},
+        {"audio_filepath": "b/ch1/0.flac", "speaker": "b", "bandwidth": 20000, "duration": 5.0, "num_speakers": "2", "snr": 35.0},
+        {"audio_filepath": "c/ch1/0.flac", "speaker": "c", "bandwidth": 20000, "duration": 5.0, "num_speakers": "bad", "snr": 35.0},
+        {"audio_filepath": "d/ch1/0.flac", "speaker": "d", "bandwidth": 20000, "duration": 5.0, "num_speakers": "1", "snr": 10.0},
+        {"audio_filepath": "e/ch1/0.flac", "speaker": "e", "bandwidth": 20000, "duration": 5.0, "num_speakers": "1", "dnsmos_ovr": 2.4},
+        {"audio_filepath": "f/ch1/0.flac", "speaker": "f", "bandwidth": 20000, "duration": 5.0, "num_speakers": "1"},
+    ]
+    m = tmp_path / "q.jsonl"
+    m.write_text("\n".join(json.dumps(r) for r in rows))
+    items, st = P.collect_hifitts2([str(m)], "/audio", max_speaker_hours=10)
+    assert {i.speaker for i in items} == {"hifitts2:a"}
+    assert len(items) == 2 and len({i.key for i in items}) == 2
+    assert st["drop_multispeaker"] == 1 and st["drop_unknown_multispeaker"] == 1
+    assert st["drop_snr"] == 1 and st["drop_dnsmos"] == 1 and st["drop_no_quality"] == 1
+
+    items_unscored, _ = P.collect_hifitts2([str(m)], "/audio", max_speaker_hours=10, allow_unscored_quality=True)
+    assert {i.speaker for i in items_unscored} == {"hifitts2:a", "hifitts2:f"}
+
+
+def test_split_rejects_duplicate_keys():
+    a = P.Item(key="dup", source="vctk", path="/a", kind="speech", speaker="s1", session="s1", licence="CC-BY-4.0")
+    b = P.Item(key="dup", source="vctk", path="/b", kind="speech", speaker="s1", session="s1", licence="CC-BY-4.0")
+    with pytest.raises(ValueError, match="duplicate item key"):
+        P.split_items([a, b], {"train": 0.8, "dev": 0.2})
+
+
+def test_shard_stream_rir_split_isolation_and_pool_bounds(tmp_path):
+    import soundfile as sf
+    from oto_train.data.rir_gen import room_split
+    from oto_train.data.stream import SR, ShardPool, ShardStream
+
+    # Create a tiny valid speech shard with a 6 s clip.
+    split_dir = tmp_path / "shards" / "dev"
+    split_dir.mkdir(parents=True)
+    wav = tmp_path / "long.wav"
+    sf.write(wav, (0.1 * np.random.default_rng(0).standard_normal(SR * 6)).astype(np.float32), SR)
+    from dataclasses import asdict
+
+    it = P.Item(key="vctk_long", source="vctk", path=str(wav), kind="speech", speaker="s", session="s", licence="CC-BY-4.0")
+    key, flac, meta = P.encode_sample(asdict(it))
+    w = P.ShardWriter(str(split_dir / "speech-dev-%06d.tar"), max_count=10)
+    w.write(key, {"flac": flac, "json": meta})
+    w.close()
+
+    # Pool crops clips above max_len and flushes when max_bytes is reached.
+    pool = ShardPool(w.paths, seed=0, buffer=256, min_len=SR, max_len=SR * 2, max_bytes=SR * 4)
+    x, _ = next(iter(pool))
+    assert len(x) == SR * 2
+
+    # RIR dir containing only train rooms must fail for dev instead of leaking train rooms.
+    rir_dir = tmp_path / "rirs"
+    rir_dir.mkdir()
+    train_ids = [i for i in range(50) if room_split(i) == "train"][:2]
+    for rid in train_ids:
+        np.savez(rir_dir / f"{rid}.npz", near=np.zeros(1024, np.float32), far=np.zeros((1, 1024), np.float32),
+                 meta=json.dumps({"direct_idx": [0, 0]}))
+    with pytest.raises(FileNotFoundError, match="split 'dev'"):
+        ShardStream(str(tmp_path / "shards"), "dev", seconds=1.0, rir_dir=str(rir_dir))
 
 
 def test_split_speaker_and_session_disjoint():

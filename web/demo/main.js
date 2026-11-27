@@ -114,47 +114,69 @@ function makeNode(ctx, wasm, w, extra = {}) {
 }
 
 let live = null;
+let liveStarting = false;
+let liveGen = 0;
 async function startLive() {
-  if (live) return;
-  const name = buildName();
-  const wasm = await loadWasm(name);
-  // getUserMedia before the context: Safari may change the hardware rate when capture starts.
-  const stream = await navigator.mediaDevices.getUserMedia({
-    audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false, channelCount: 1 },
-  });
-  const ctx = new AudioContext({ sampleRate: 48000, latencyHint: "interactive" });
-  if (ctx.sampleRate !== 48000) log(`!! context runs at ${ctx.sampleRate} Hz, not 48000: output will be wrong (resampling not implemented in the demo)`);
-  await ctx.audioWorklet.addModule("worklet.js");
-  const node = makeNode(ctx, wasm, await weights());
-  let initReady = false;
-  let initError = false;
-  node.port.onmessage = (e) => {
-    const d = e.data;
-    if (d.type === "ready") {
-      initReady = true;
-      log(`live: ${name} build ready, simd=${d.simd}, ${d.params} params, warm-up ${d.warmup} hops in ${f(d.warmupMs)} ms, chain delay ${d.latencySamples} samples (21.33 ms) + context/device latency`);
-    }
-    if (d.type === "error") {
-      initError = true;
-      log("live: worklet error, bypassing: " + d.message);
-    }
-    if (d.type === "overload") log(`live: OVERLOAD (${d.slow}/${d.hops} hops > 2 ms in the last second) -> bypass`);
-    if (d.type === "stats") {
-      const gate = initError || d.overloaded || (d.hops > 0 && d.p99Ms > 2.0) ? "FAIL" : (!initReady || d.hops === 0 ? "N/A" : "PASS");
-      $("stats").textContent = `AudioWorklet paced: hops ${d.hops}, slow ${d.slow}, mean ${f(d.meanMs)} ms, p50 ${f(d.p50Ms)}, p95 ${f(d.p95Ms)}, p99 ${f(d.p99Ms)}, max(1 s) ${f(d.maxMs)} ms [${d.timer}] | gate(p99<=2.0 ms): ${gate} | p_target ${d.pTarget.toFixed(2)}, ${d.bypass ? "BYPASS" : "model on"}`;
-    }
-  };
-  const src = ctx.createMediaStreamSource(stream);
-  src.connect(node).connect(ctx.destination);
-  log(`live: baseLatency ${f(ctx.baseLatency * 1000)} ms, outputLatency ${f((ctx.outputLatency || 0) * 1000)} ms`);
-  live = { ctx, stream, node };
+  if (live || liveStarting) return;
+  liveStarting = true;
+  const gen = ++liveGen;
+  let stream = null;
+  let ctx = null;
+  try {
+    const name = buildName();
+    const wasm = await loadWasm(name);
+    if (gen !== liveGen) return;
+    // getUserMedia before the context: Safari may change the hardware rate when capture starts.
+    stream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false, channelCount: 1 },
+    });
+    if (gen !== liveGen) return;
+    ctx = new AudioContext({ sampleRate: 48000, latencyHint: "interactive" });
+    if (ctx.sampleRate !== 48000) log(`!! context runs at ${ctx.sampleRate} Hz, not 48000: output will be wrong (resampling not implemented in the demo)`);
+    await ctx.audioWorklet.addModule("worklet.js");
+    if (gen !== liveGen) return;
+    const w = await weights();
+    if (gen !== liveGen) return;
+    const node = makeNode(ctx, wasm, w, { forcedBypass: $("bypass").checked });
+    let initReady = false;
+    let initError = false;
+    node.port.onmessage = (e) => {
+      const d = e.data;
+      if (d.type === "ready") {
+        initReady = true;
+        log(`live: ${name} build ready, simd=${d.simd}, ${d.params} params, warm-up ${d.warmup} hops in ${f(d.warmupMs)} ms, chain delay ${d.latencySamples} samples (21.33 ms) + context/device latency`);
+      }
+      if (d.type === "error") {
+        initError = true;
+        log("live: worklet error, bypassing: " + d.message);
+      }
+      if (d.type === "overload") log(`live: OVERLOAD (${d.slow}/${d.hops} hops > 2 ms in the last second) -> bypass`);
+      if (d.type === "stats") {
+        const gate = initError || d.overloaded || (d.hops > 0 && d.p99Ms > 2.0) ? "FAIL" : (!initReady || d.hops === 0 ? "N/A" : "PASS");
+        $("stats").textContent = `AudioWorklet paced: hops ${d.hops}, slow ${d.slow}, mean ${f(d.meanMs)} ms, p50 ${f(d.p50Ms)}, p95 ${f(d.p95Ms)}, p99 ${f(d.p99Ms)}, max(1 s) ${f(d.maxMs)} ms [${d.timer}] | gate(p99<=2.0 ms): ${gate} | p_target ${d.pTarget.toFixed(2)}, ${d.bypass ? "BYPASS" : "model on"}`;
+      }
+    };
+    const src = ctx.createMediaStreamSource(stream);
+    src.connect(node).connect(ctx.destination);
+    log(`live: baseLatency ${f(ctx.baseLatency * 1000)} ms, outputLatency ${f((ctx.outputLatency || 0) * 1000)} ms`);
+    live = { ctx, stream, node };
+    stream = null;
+    ctx = null;
+  } finally {
+    liveStarting = false;
+    if (stream) stream.getTracks().forEach((t) => t.stop());
+    if (ctx) await ctx.close().catch(() => {});
+  }
 }
 
 async function stopLive() {
-  if (!live) return;
-  live.stream.getTracks().forEach((t) => t.stop());
-  await live.ctx.close();
+  liveGen++;
+  const cur = live;
   live = null;
+  if (cur) {
+    cur.stream.getTracks().forEach((t) => t.stop());
+    await cur.ctx.close();
+  }
   $("stats").textContent = "";
 }
 

@@ -58,6 +58,10 @@ def test_silent_target_loss_scale_aware():
     assert abs(float(l_pass) - 1.0) < 1e-3 and abs(float(l_scaled) - 1.0) < 1e-3
     assert float(l_supp) < 0.5
     assert float(silent_target_loss(mix * 1e-4, mix, tgt)) == 0.0
+    # Perfect digital silence must score 0.0, while hallucinated output on digital silence is penalized.
+    z = torch.zeros_like(mix)
+    assert float(silent_target_loss(z, z, z)) == 0.0
+    assert float(silent_target_loss(torch.full_like(mix, 1e-3), z, z)) > 0.5
 
 
 def test_presence_labels():

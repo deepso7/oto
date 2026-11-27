@@ -8,6 +8,7 @@ Each yielded sample is a dict of CPU tensors with a fixed segment length ``T``:
 
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import math
@@ -52,12 +53,26 @@ def decode_flac(data: bytes) -> np.ndarray:
 class ShardPool:
     """Infinite shuffled stream of ``(audio, meta)`` from a list of tar shards with a shuffle buffer."""
 
-    def __init__(self, shards: list[str], seed: int, buffer: int = 256, min_len: int = SR):
-        self.shards, self.seed, self.buffer, self.min_len = shards, seed, buffer, min_len
+    def __init__(
+        self,
+        shards: list[str],
+        seed: int,
+        buffer: int = 256,
+        min_len: int = SR,
+        max_len: int | None = None,
+        max_bytes: int = 32 << 20,
+    ):
+        self.shards = shards
+        self.seed = seed
+        self.buffer = buffer
+        self.min_len = min_len
+        self.max_len = max_len
+        self.max_bytes = max_bytes
 
     def __iter__(self):
         rng = random.Random(self.seed)
-        buf: list = []
+        buf: list[tuple[np.ndarray, dict]] = []
+        buf_bytes = 0
         while True:
             order = list(self.shards)
             rng.shuffle(order)
@@ -68,10 +83,16 @@ class ShardPool:
                     x = decode_flac(files["flac"])
                     if len(x) < self.min_len:
                         continue
+                    if self.max_len is not None and len(x) > self.max_len:
+                        start = rng.randrange(len(x) - self.max_len + 1)
+                        x = x[start : start + self.max_len].copy()
                     meta = json.loads(files.get("json", b"{}"))
                     buf.append((x, meta))
-                    if len(buf) >= self.buffer:
-                        yield buf.pop(rng.randrange(len(buf)))
+                    buf_bytes += x.nbytes
+                    while buf and (len(buf) >= self.buffer or buf_bytes >= self.max_bytes):
+                        item = buf.pop(rng.randrange(len(buf)))
+                        buf_bytes -= item[0].nbytes
+                        yield item
 
 
 def _crop_or_loop(x: np.ndarray, t: int, rng: random.Random) -> np.ndarray:
@@ -127,11 +148,17 @@ class ShardStream(IterableDataset):
         self.interf = sorted(str(p) for p in rootp.glob("interferer-*.tar")) or self.speech
         if not self.speech:
             raise FileNotFoundError(f"no speech shards under {rootp}")
-        rirs = sorted(str(p) for p in Path(rir_dir).glob("*.npz")) if rir_dir else []
-        if rirs:
+        if rir_dir:
+            all_rirs = sorted(str(p) for p in Path(rir_dir).glob("*.npz"))
+            if not all_rirs:
+                raise FileNotFoundError(f"no RIR .npz files under {rir_dir}")
             from .rir_gen import room_split
 
-            rirs = [r for r in rirs if room_split(int(Path(r).stem)) == split] or rirs
+            rirs = [r for r in all_rirs if room_split(int(Path(r).stem)) == split]
+            if not rirs:
+                raise FileNotFoundError(f"no RIR .npz files for split {split!r} under {rir_dir}")
+        else:
+            rirs = []
         self.rirs = RirBank(rirs)
         self.t = int(seconds * SR) // 512 * 512
         self.seed, self.split = seed, split
@@ -139,15 +166,15 @@ class ShardStream(IterableDataset):
     def __iter__(self):
         wi = get_worker_info()
         wid, nw = (wi.id, wi.num_workers) if wi else (0, 1)
-        seed = hash((self.seed, wid, self.split)) & 0xFFFFFFFF
+        seed = int.from_bytes(hashlib.sha256(f"{self.seed}:{wid}:{self.split}".encode()).digest()[:4], "big")
         rng = random.Random(seed)
 
         def part(lst):
             return lst[wid::nw] or lst
 
-        sp = iter(ShardPool(part(self.speech), seed))
-        nz = iter(ShardPool(part(self.noise), seed + 1)) if self.noise else None
-        it = iter(ShardPool(part(self.interf), seed + 2, min_len=SR // 2))
+        sp = iter(ShardPool(part(self.speech), seed, max_len=self.t * 2))
+        nz = iter(ShardPool(part(self.noise), seed + 1, max_len=self.t)) if self.noise else None
+        it = iter(ShardPool(part(self.interf), seed + 2, min_len=SR // 2, max_len=self.t))
         while True:
             speech, f_max = _fill_speech(sp, self.t, rng)
             sample = {"speech": torch.from_numpy(speech.copy()), "speech_fmax": torch.tensor(f_max)}

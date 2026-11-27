@@ -38,6 +38,7 @@ import csv
 import hashlib
 import io
 import json
+import math
 import os
 import random
 import re
@@ -159,33 +160,60 @@ class Item:
     extra: dict = field(default_factory=dict)
 
 
-def _safe_key(*parts: str) -> str:
-    return re.sub(r"[^A-Za-z0-9_-]+", "-", "_".join(parts)).strip("-")[:120]
+def _safe_key(*parts: str, unique_source: str | None = None) -> str:
+    base = re.sub(r"[^A-Za-z0-9_-]+", "-", "_".join(parts)).strip("-")
+    if unique_source is not None:
+        digest = hashlib.sha1(unique_source.encode()).hexdigest()[:8]
+        return f"{base[:111]}-{digest}" if base else digest
+    return base[:120]
 
 
-def _first(d: dict, names: list[str], default=None):
+def _first(d: dict, names: list[str | None], default=None):
     for n in names:
-        if n in d and d[n] not in (None, ""):
+        if n and n in d and d[n] not in (None, ""):
             return d[n]
     return default
+
+
+def _parse_float(v) -> float | None:
+    if v is None or isinstance(v, bool):
+        return None
+    try:
+        x = float(v)
+    except (TypeError, ValueError):
+        return None
+    return x if math.isfinite(x) else None
 
 
 # -- HiFiTTS-2 ---------------------------------------------------------------
 
 
 def _is_multispeaker(row: dict, field_name: str | None) -> bool | None:
-    """True/False if the row says so, ``None`` if it carries no multi-speaker information."""
+    """True/False if the row says so, ``None`` if it carries no readable multi-speaker information."""
     names = [field_name] if field_name else ["is_multispeaker", "multi_speaker", "multispeaker",
                                              "num_speakers", "speaker_count", "n_speakers"]  # fmt: skip
     for k in names:
         if k not in row or row[k] is None:
             continue
         v = row[k]
+        is_count = "count" in k or "num" in k or k.startswith("n_")
         if isinstance(v, bool):
-            return v
+            return None if is_count else v
         if isinstance(v, (int, float)):
-            return v > 1 if ("count" in k or "num" in k or k.startswith("n_")) else bool(v)
-        return str(v).strip().lower() in ("1", "true", "yes", "multi")
+            if not math.isfinite(float(v)):
+                return None
+            return v > 1 if is_count else bool(v)
+        s = str(v).strip().lower()
+        if not s:
+            continue
+        if is_count:
+            num = _parse_float(s)
+            return None if num is None else num > 1
+        if s in ("1", "true", "yes", "multi"):
+            return True
+        if s in ("0", "false", "no", "single"):
+            return False
+        return None
     return None
 
 
@@ -201,10 +229,15 @@ def collect_hifitts2(
     multispk_field: str | None = None,
     allow_unknown_multispk: bool = False,
     seed: int = 0,
+    min_snr_db: float | None = 25.0,
+    min_dnsmos: float | None = 3.2,
+    snr_field: str | None = None,
+    dnsmos_field: str | None = None,
+    allow_unscored_quality: bool = False,
 ) -> tuple[list[Item], dict]:
-    """Filter HiFiTTS-2 manifest rows. Fail closed: rows without bandwidth are dropped.
+    """Filter HiFiTTS-2 manifest rows. Fail closed: rows without bandwidth, quality score, or
+    multi-speaker metadata are dropped unless explicitly allowed.
 
-    Rows with no multi-speaker information are dropped unless ``allow_unknown_multispk``.
     The per-speaker cap keeps a seeded random subset of whole chapters.
     """
     stats: dict[str, float] = defaultdict(int)
@@ -216,23 +249,36 @@ def collect_hifitts2(
                     continue
                 row = json.loads(line)
                 stats["rows"] += 1
-                bw = _first(row, [bw_field, "bandwidth", "estimated_bandwidth"])
+                bw = _parse_float(_first(row, [bw_field, "bandwidth", "estimated_bandwidth"]))
                 if bw is None:
                     stats["drop_no_bandwidth"] += 1
                     continue
-                if float(bw) < min_bw:
+                if bw < min_bw:
                     stats["drop_bandwidth"] += 1
                     continue
                 multi = _is_multispeaker(row, multispk_field)
                 if multi or (multi is None and not allow_unknown_multispk):
                     stats["drop_multispeaker" if multi else "drop_unknown_multispeaker"] += 1
                     continue
+                snr = _parse_float(_first(row, [snr_field, "snr", "snr_db", "wada_snr"]))
+                dnsmos = _parse_float(_first(row, [dnsmos_field, "dnsmos_ovr", "dnsmos_ovrl", "dnsmos", "ovrl_mos"]))
+                if min_snr_db is not None and snr is not None and snr < min_snr_db:
+                    stats["drop_snr"] += 1
+                    continue
+                if min_dnsmos is not None and dnsmos is not None and dnsmos < min_dnsmos:
+                    stats["drop_dnsmos"] += 1
+                    continue
+                missing_explicit = (snr_field is not None and snr is None) or (dnsmos_field is not None and dnsmos is None)
+                need_quality = min_snr_db is not None or min_dnsmos is not None
+                if need_quality and (missing_explicit or (snr is None and dnsmos is None)) and not allow_unscored_quality:
+                    stats["drop_no_quality"] += 1
+                    continue
                 rel = row[path_field]
                 spk = str(_first(row, [speaker_field, "speaker_id", "speaker"]))
                 chapter = str(_first(row, ["chapter_id", "chapter", "book_id", "book"], Path(rel).parent.as_posix()))
                 by_spk[spk].append(
                     Item(
-                        key=_safe_key("hifitts2", spk, Path(rel).stem),
+                        key=_safe_key("hifitts2", spk, *Path(rel).with_suffix("").parts, unique_source=f"{spk}:{rel}"),
                         source="hifitts2",
                         path=str(Path(audio_root) / rel),
                         kind="speech",
@@ -241,7 +287,7 @@ def collect_hifitts2(
                         licence=ALLOWLIST["hifitts2"]["licence"],
                         url="https://librivox.org",
                         duration=float(_first(row, [duration_field, "duration"], 0.0)),
-                        f_max=float(bw),
+                        f_max=bw,
                     )
                 )
     rng = random.Random(seed)
@@ -460,8 +506,17 @@ def assign_split(group: str, ratios: dict[str, float], salt: str = "oto-v1") -> 
     return list(ratios)[-1]
 
 
+def check_unique_keys(items: list[Item]) -> None:
+    seen: set[str] = set()
+    for it in items:
+        if it.key in seen:
+            raise ValueError(f"duplicate item key {it.key!r}")
+        seen.add(it.key)
+
+
 def split_items(items: list[Item], ratios: dict[str, float], salt: str = "oto-v1") -> dict[str, list[Item]]:
     """Split by speaker hash (sessions are nested in speakers, so both are disjoint)."""
+    check_unique_keys(items)
     out: dict[str, list[Item]] = {k: [] for k in ratios}
     for it in items:
         out[assign_split(it.speaker, ratios, salt)].append(it)
@@ -562,6 +617,7 @@ class ShardWriter:
 
 
 def pack_split(items: list[Item], out_dir: Path, split: str, kind: str, workers: int, max_count: int) -> int:
+    check_unique_keys(items)
     writer = ShardWriter(str(out_dir / split / f"{kind}-{split}-%06d.tar"), max_count=max_count)
     items = list(items)
     random.Random(f"{split}:{kind}").shuffle(items)  # mix speakers inside shards
@@ -748,6 +804,11 @@ def _add_sources(ap: argparse.ArgumentParser) -> None:
     g.add_argument("--hifitts2-duration-field", default="duration")
     g.add_argument("--hifitts2-multispk-field", default=None)
     g.add_argument("--hifitts2-allow-unknown-multispk", action="store_true")
+    g.add_argument("--hifitts2-min-snr", type=float, default=25.0)
+    g.add_argument("--hifitts2-min-dnsmos", type=float, default=3.2)
+    g.add_argument("--hifitts2-snr-field", default=None)
+    g.add_argument("--hifitts2-dnsmos-field", default=None)
+    g.add_argument("--hifitts2-allow-unscored-quality", action="store_true")
     ap.add_argument("--vctk", help="VCTK-Corpus-0.92 root (with license_text.txt)")
     ap.add_argument("--fsd50k", help="FSD50K root (needs *_clips_info_FSD50K.json + ground_truth/)")
     ap.add_argument("--fma-tracks", help="fma_metadata/tracks.csv")
@@ -765,7 +826,8 @@ def _collect(args) -> tuple[list[Item], dict]:
             args.hifitts2_manifest, args.hifitts2_audio, args.hifitts2_min_bw, args.hifitts2_speaker_cap_hours,
             args.hifitts2_path_field, args.hifitts2_speaker_field, args.hifitts2_bw_field,
             args.hifitts2_duration_field, args.hifitts2_multispk_field, args.hifitts2_allow_unknown_multispk,
-            args.seed,
+            args.seed, args.hifitts2_min_snr, args.hifitts2_min_dnsmos, args.hifitts2_snr_field,
+            args.hifitts2_dnsmos_field, args.hifitts2_allow_unscored_quality,
         )  # fmt: skip
         items += its
         stats["hifitts2"] = st

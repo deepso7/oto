@@ -24,7 +24,7 @@ class OtoProcessor extends AudioWorkletProcessor {
     super();
     const o = options.processorOptions || {};
     this.bypass = true;
-    this.forcedBypass = false;
+    this.forcedBypass = !!o.forcedBypass;
     this.error = null;
     this.pos = 0;
     // Dry path, always running, so bypass keeps the same 1024-sample delay and switching is clean.

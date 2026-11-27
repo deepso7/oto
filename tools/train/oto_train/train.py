@@ -10,8 +10,8 @@ Examples::
         --rir-data r2://oto-train/rirs/ --ckpt-dir /content/ckpt --sync r2://oto-train/runs/a1/ \\
         --batch-size 32 --seconds 4 --steps 300000 --compile
 
-    # Long-sequence fine-tune of the best Clean checkpoint (30-60 s segments)
-    python -m oto_train.train --arch a --init-from /content/ckpt/best.pt --long-seq ...
+    # Long-sequence fine-tune of the best Clean checkpoint (30-60 s segments; use a fresh --ckpt-dir)
+    python -m oto_train.train --arch a --init-from /content/ckpt/best.pt --ckpt-dir /content/ckpt-long --long-seq ...
 
     # Phase 3 Isolate fine-tune (interferers, background-first/only, decoupled distance)
     python -m oto_train.train --arch a --init-from clean_best.pt --isolate ...
@@ -41,6 +41,19 @@ from .data.mixer import Mixer, MixConfig
 from .data.stream import ShardStream, SyntheticStream
 from .losses import LossWeights, OtoLoss
 from .models import build_model
+from .models.stft import HOP
+
+
+def _clear_dir(root: Path) -> None:
+    for child in root.iterdir():
+        if child.is_dir() and not child.is_symlink():
+            shutil.rmtree(child)
+        else:
+            child.unlink()
+
+
+def _norm_path(p: str | None) -> str | None:
+    return str(Path(p).resolve()) if p else None
 
 
 # ---------------------------------------------------------------------------
@@ -70,8 +83,12 @@ def stage(src: str, dst: str) -> str:
         if hf_path:
             resolved = str(root / hf_path)
     marker = root / ".staged"
+    staging = root / ".staging"
     if marker.exists() and marker.read_text() == src:
         return resolved
+    if (marker.exists() and marker.read_text() != src) or (staging.exists() and staging.read_text() != src):
+        _clear_dir(root)
+    staging.write_text(src)
     t0 = time.time()
     if src.startswith("r2://"):
         _, bucket, prefix = _split_remote(src)
@@ -80,7 +97,7 @@ def stage(src: str, dst: str) -> str:
         P.download_hf(hf_repo, str(root), f"{hf_path}*" if hf_path else None)
     else:
         shutil.copytree(src, str(root), dirs_exist_ok=True)
-    marker.write_text(src)
+    os.replace(staging, marker)
     print(f"staged {src} -> {resolved} in {time.time() - t0:.0f}s", flush=True)
     return resolved
 
@@ -222,7 +239,16 @@ def run_batch(model, mixer: Mixer, loss_fn: OtoLoss, batch: dict, device, bf16: 
     mixed = mixer(**{k: v.to(device, non_blocking=True) for k, v in batch.items()})
     with torch.autocast(device.type, dtype=torch.bfloat16, enabled=bf16):
         out = model(mixed["mix"])
-    return loss_fn(out["wav"], mixed["target"], mixed["mix"], out["p_logit"], mixed["f_max"])
+    # Batch iSTFT leaves the last HOP (512) samples incomplete because frame F does not exist yet.
+    valid = out["wav"].shape[-1] - HOP
+    if valid > 0:
+        wav = out["wav"][..., :valid]
+        tgt = mixed["target"][..., :valid]
+        mix = mixed["mix"][..., :valid]
+        p_logit = out["p_logit"][..., : valid // HOP]
+    else:
+        wav, tgt, mix, p_logit = out["wav"], mixed["target"], mixed["mix"], out["p_logit"]
+    return loss_fn(wav, tgt, mix, p_logit, mixed["f_max"])
 
 
 def main(argv=None) -> dict:
@@ -242,7 +268,7 @@ def main(argv=None) -> dict:
 
     data_root = rir_root = None
     if not args.smoke and args.data:
-        data_root = stage(args.data, args.stage_dir) if "://" in args.data else args.data
+        data_root = stage(args.data, str(Path(args.stage_dir) / "data")) if "://" in args.data else args.data
     if not args.smoke and args.rir_data:
         rir_root = stage(args.rir_data, str(Path(args.stage_dir) / "rirs")) if "://" in args.rir_data else args.rir_data
 
@@ -262,6 +288,13 @@ def main(argv=None) -> dict:
     sync_down(args.sync, "best.pt", ckpt_dir / "best.pt")
     if latest.exists():
         ck = torch.load(latest, map_location=device, weights_only=True)
+        if args.init_from:
+            ck_init = _norm_path((ck.get("args") or {}).get("init_from"))
+            if ck_init != _norm_path(args.init_from):
+                raise ValueError(
+                    f"--init-from {args.init_from!r} conflicts with existing {latest} "
+                    f"(initialized from {ck_init!r}); pass a fresh --ckpt-dir for fine-tuning"
+                )
         model.load_state_dict(ck["model"])
         opt.load_state_dict(ck["opt"])
         ema.shadow = {k: v.to(device) for k, v in ck["ema"].items()}
