@@ -3024,7 +3024,7 @@ dependencies = [
 
 [[package]]
 name = "oto-app"
-version = "0.0.4"
+version = "0.0.5"
 dependencies = [
  "auto-launch",
  "block2 0.6.2",
@@ -3045,7 +3045,7 @@ dependencies = [
 
 [[package]]
 name = "oto-cli"
-version = "0.0.4"
+version = "0.0.5"
 dependencies = [
  "lexopt",
  "oto-engine",
@@ -3053,7 +3053,7 @@ dependencies = [
 
 [[package]]
 name = "oto-dsp"
-version = "0.0.4"
+version = "0.0.5"
 dependencies = [
  "deep_filter",
  "ndarray 0.15.6",
@@ -3068,7 +3068,7 @@ dependencies = [
 
 [[package]]
 name = "oto-engine"
-version = "0.0.4"
+version = "0.0.5"
 dependencies = [
  "oto-dsp",
  "rtrb",
@@ -3079,7 +3079,7 @@ dependencies = [
 
 [[package]]
 name = "oto-sign"
-version = "0.0.4"
+version = "0.0.5"
 dependencies = [
  "base64 0.22.1",
  "ed25519-dalek",

@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.5](https://github.com/deepso7/oto/compare/v0.0.4...v0.0.5) - 2026-11-27
+
+### Added
+
+- add end-to-end app and macOS HAL driver update flow ([#14](https://github.com/deepso7/oto/pull/14))
+
+### Other
+
+- add 2026-11 update signing public key to TRUSTED_KEYS
+
 ## [0.0.4](https://github.com/deepso7/oto/compare/v0.0.3...v0.0.4) - 2026-11-26
 
 ### Added
