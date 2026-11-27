@@ -2,3 +2,4 @@
 *.wav
 .DS_Store
 .claude/worktrees/
+.env
