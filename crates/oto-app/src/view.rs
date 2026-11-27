@@ -2044,7 +2044,11 @@ mod tests {
         assert_eq!(rt.state.prefs.strength, Strength::Strong);
         // Tab leaves the group rather than walking its segments.
         press(&mut rt, Key::Tab);
-        assert!(!focus(&rt).contains("strength-row"), "focus: {}", focus(&rt));
+        assert!(
+            !focus(&rt).contains("strength-row"),
+            "focus: {}",
+            focus(&rt)
+        );
     }
 
     #[test]
