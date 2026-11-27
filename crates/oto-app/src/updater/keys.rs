@@ -18,9 +18,14 @@ pub const RELEASES_URL: &str = oto_sign::manifest::RELEASES_URL;
 ///
 /// While this list is empty every envelope is reported as signed by an unrecognized key, so
 /// the app never offers an update it cannot verify; it only points at [`RELEASES_URL`].
-pub const TRUSTED_KEYS: &[TrustedKey] = &[
-    // TrustedKey { key_id: "2026-11", pubkey: [/* 32 bytes from `oto-sign keygen` */] },
-];
+pub const TRUSTED_KEYS: &[TrustedKey] = &[TrustedKey {
+    key_id: "2026-11",
+    pubkey: [
+        0x24, 0x29, 0x02, 0xc1, 0xc4, 0x2d, 0x61, 0xa8, 0x15, 0x87, 0x0f, 0xea, 0x1e, 0x46, 0x8a,
+        0xdd, 0xfd, 0x50, 0xbb, 0x54, 0x2f, 0x8b, 0x94, 0xa2, 0xa4, 0xbe, 0xd9, 0x3d, 0x5c, 0xd6,
+        0x31, 0x9d,
+    ],
+}];
 
 /// The manifest URL to fetch. `OTO_UPDATE_URL` overrides it only in debug builds and in builds
 /// without a Developer ID team (dev and ad-hoc builds), never in a release build signed for
