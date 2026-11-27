@@ -3,10 +3,10 @@
 //! drawn here.
 
 use rune::tok::{self, Theme, motion, type_};
-use rune::{Color, Cx, El, Icon, TextStyle, col, el, icon, row, text};
+use rune::{Color, Cx, Cycle, El, Icon, SystemMaterial, TextStyle, col, el, icon, row, text};
 use rune_kit::{
-    Button, ButtonVariant, ControlSize, IconButton, IconButtonVariant, Kit, Placement,
-    SegmentedControl, Select, SelectAppearance, StateColors,
+    Button, ButtonVariant, ControlSize, IconButton, IconButtonVariant, Kit, Placement, Select,
+    SelectAppearance, StateColors,
 };
 
 use crate::meter::{BAR_H, BAR_W};
@@ -19,54 +19,132 @@ use crate::updater::apply::InstallMode;
 use crate::updater::verify::UNRECOGNIZED_KEY_MESSAGE;
 
 pub const WIDTH: f32 = 340.0;
-const PAD: f32 = 16.0;
-/// A card's content width.
-const CARD_INNER: f32 = WIDTH - 2.0 * PAD - 24.0;
-const RADIUS: f32 = 12.0;
+/// The popover's corner radius; main.rs gives the window the same.
+pub const RADIUS: f32 = 22.0;
+const PAD: f32 = 14.0;
+/// A tile's side padding.
+const TILE_PX: f32 = 14.0;
+/// A tile's content width.
+const CARD_INNER: f32 = WIDTH - 2.0 * PAD - 2.0 * TILE_PX;
+const TILE_RADIUS: f32 = 16.0;
+/// A dropdown list: its 24 pt capsule rows sit 4 pt in, so this keeps the corners concentric.
+const MENU_RADIUS: f32 = 16.0;
 
-const H1: TextStyle = TextStyle::new(17.0, 650.0).lh(22.0);
-const TITLE: TextStyle = TextStyle::new(14.0, 600.0).lh(18.0);
+const H1: TextStyle = TextStyle::new(19.0, 680.0).lh(24.0).tracking(-0.2);
+const BRAND: TextStyle = TextStyle::new(15.0, 700.0).lh(20.0).tracking(-0.1);
+const TITLE: TextStyle = TextStyle::new(14.0, 620.0).lh(18.0);
+const HERO: TextStyle = TextStyle::new(16.0, 680.0).lh(20.0).tracking(-0.15);
 const BODY: TextStyle = type_::BODY.lh(18.0);
-const LABEL: TextStyle = TextStyle::new(11.5, 500.0).lh(14.0);
-const CAPTION: TextStyle = TextStyle::new(11.5, 400.0).lh(15.0);
-const CAPTION_NUM: TextStyle = TextStyle::new(11.5, 500.0).lh(15.0).features("'tnum' 1");
+const LABEL: TextStyle = TextStyle::new(10.5, 600.0).lh(13.0).tracking(0.7);
+const CAPTION: TextStyle = TextStyle::new(11.5, 440.0).lh(15.0).tracking(0.05);
+const CAPTION_NUM: TextStyle = TextStyle::new(11.0, 500.0).lh(15.0).features("'tnum' 1");
+const PILL: TextStyle = TextStyle::new(12.0, 560.0).lh(14.0);
 
-static WAVE: Icon = Icon {
-    name: "oto-wave",
+/// The brand mark from packaging/brand/oto-mark.svg on a 24 grid: noise in (faint, ragged),
+/// the o, and voice out (even).
+static MARK: Icon = Icon {
+    name: "oto-mark",
+    view: 24.0,
+    body: r#"<g stroke="currentColor" stroke-width="1.25" stroke-linecap="round" fill="none"><path d="M0.81 10.54V13.46M2.51 8.59V15.41M4.22 11.03V12.97M5.92 7.62V16.38" stroke-opacity=".45"/><circle cx="12" cy="12" r="3.16" stroke-width="1.75"/><path d="M18.08 9.81V14.19M19.78 8.11V15.89M21.49 9.81V14.19M23.19 11.27V12.73"/></g>"#,
+};
+static POWER: Icon = Icon {
+    name: "oto-power",
     view: 16.0,
-    body: r#"<path d="M2.6 6.6V9.4M5.3 4.6V11.4M8 2.6V13.4M10.7 4.6V11.4M13.4 6.6V9.4" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/>"#,
+    body: r#"<path d="M8 2.25V7.25" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/><path d="M4.6 4.35A5.1 5.1 0 1 0 11.4 4.35" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" fill="none"/>"#,
 };
 static SLIDERS: Icon = Icon {
     name: "oto-sliders",
     view: 16.0,
-    body: r#"<path d="M2.5 5H8.5M12.5 5H13.5M2.5 11H3.5M7.5 11H13.5" stroke="currentColor" stroke-linecap="round"/><circle cx="10.5" cy="5" r="1.75" stroke="currentColor"/><circle cx="5.5" cy="11" r="1.75" stroke="currentColor"/>"#,
+    body: r#"<path d="M2.5 5H8.5M12.5 5H13.5M2.5 11H3.5M7.5 11H13.5" stroke="currentColor" stroke-width="1.25" stroke-linecap="round"/><circle cx="10.5" cy="5" r="1.75" stroke="currentColor" stroke-width="1.25"/><circle cx="5.5" cy="11" r="1.75" stroke="currentColor" stroke-width="1.25"/>"#,
 };
 static CHEVRON_LEFT: Icon = Icon {
     name: "oto-chevron-left",
     view: 16.0,
-    body: r#"<path d="M9.5 4L5.5 8L9.5 12" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/>"#,
+    body: r#"<path d="M9.5 4L5.5 8L9.5 12" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>"#,
 };
 
-/// Everything a piece needs to paint itself.
+/// Everything a piece needs to paint itself. The popover is Liquid Glass; what sits on it is
+/// translucent so the glass shows through.
 struct Paint {
     t: Theme,
     k: Kit,
+    dark: bool,
     accent: Color,
     green: Color,
     amber: Color,
     hair: f32,
+    /// What the window shows where the native glass can't draw (headless renders, older macOS).
+    backdrop: Color,
+    /// A tile on the glass, its top-lit bevel, and a stronger fill for wells and chips.
+    platter: Color,
+    bevel: (Color, Color),
+    well: Color,
+    /// The app icon's blue, top to bottom.
+    brand: (Color, Color),
+    /// The opaque surface dropdown lists draw on, over the glass.
+    menu: Color,
+}
+
+impl Paint {
+    fn new(dark: bool, scale: f32) -> Paint {
+        let hex = |s: &str| rune::color::hex(s).unwrap_or(Color::BLACK);
+        let w = Color::WHITE;
+        let b = Color::BLACK;
+        let brand = (hex("#4392F7"), hex("#285CC2"));
+        let accent = if dark { hex("#4A97F8") } else { hex("#2F6FDB") };
+        let t = tok::theme(dark);
+        let (platter, bevel, well, field, backdrop, menu) = if dark {
+            (
+                w.alpha(0.065),
+                (w.alpha(0.16), w.alpha(0.03)),
+                w.alpha(0.08),
+                w.alpha(0.085),
+                rune::oklch(0.215, 0.012, 262.0),
+                rune::oklch(0.25, 0.01, 262.0),
+            )
+        } else {
+            (
+                w.alpha(0.62),
+                (w.alpha(0.95), b.alpha(0.045)),
+                rune::oklcha(0.2, 0.01, 262.0, 0.07),
+                w.alpha(0.85),
+                rune::oklch(0.935, 0.008, 262.0),
+                w,
+            )
+        };
+        let mut k = Kit::neutral(dark);
+        // Fields and neutral buttons sit on tiles, so they are translucent too; lists stay solid.
+        k.c.bg_base = field;
+        k.c.bg_button_neutral = field;
+        k.c.layer_01 = menu;
+        k.c.border_focus = accent;
+        k.c.bg_accent = accent;
+        // Controls are capsules, as macOS 26 draws them: the 28 pt field and buttons round to
+        // half their height, like the pills beside them, and list rows round with them.
+        k.radius.sm = 12.0;
+        k.radius.md = 14.0;
+        k.radius.lg = 16.0;
+        k.radius.xl = 18.0;
+        Paint {
+            t,
+            k,
+            dark,
+            accent,
+            green: rune::oklch(if dark { 0.74 } else { 0.62 }, 0.17, 152.0),
+            amber: rune::oklch(if dark { 0.8 } else { 0.7 }, 0.15, 75.0),
+            hair: 1.0 / scale,
+            backdrop,
+            platter,
+            bevel,
+            well,
+            brand,
+            menu,
+        }
+    }
 }
 
 pub fn view(s: &State, cx: &mut Cx<State>) -> El {
-    let dark = cx.system_dark();
-    let p = Paint {
-        t: tok::theme(dark),
-        k: Kit::neutral(dark),
-        accent: tok::accent(0, dark),
-        green: rune::oklch(if dark { 0.72 } else { 0.62 }, 0.17, 150.0),
-        amber: rune::oklch(if dark { 0.78 } else { 0.7 }, 0.15, 75.0),
-        hair: 1.0 / cx.env().scale,
-    };
+    let p = Paint::new(cx.system_dark(), cx.env().scale);
     let mut layer = Vec::new();
     let body = if s.onboarding() {
         onboarding(s, &p)
@@ -79,29 +157,31 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
     let mut window = col()
         .key("window")
         .w_full()
-        .fill(p.t.bg)
+        .fill(p.backdrop)
         .padding(PAD)
-        .gap(12.0)
+        .gap(10.0)
         .child(body)
         .on_layout(|s: &mut State, r: [f32; 4]| s.size = (r[2], r[3]));
     if s.popover {
-        // The popover window clips itself to this radius; the hairline gives it an edge on
-        // backgrounds of the same lightness.
-        window = window.radius(RADIUS).border(p.hair, p.t.card_border);
+        // Liquid Glass behind the whole popover; the window clips itself to the same radius.
+        window = window.radius(RADIUS).system_material(SystemMaterial::Glass);
     }
     el().key("root").w_full().child(window).children(layer)
 }
 
-fn card(p: &Paint, key: &str) -> El {
+/// A tile on the glass: translucent, continuous corners, lit along its top edge.
+fn tile(p: &Paint, key: &str) -> El {
     col()
         .key(key)
         .w_full()
-        .px(12.0)
-        .py(6.0)
-        .radius(10.0)
-        .fill(p.t.card)
-        .border(p.hair, p.t.card_border)
-        .shadow(1.0, 2.0, p.t.shadow.alpha(0.08))
+        .radius(TILE_RADIUS)
+        .continuous_corners()
+        .fill(p.platter)
+        .border_gradient(p.hair, p.bevel.0, p.bevel.1)
+}
+
+fn card(p: &Paint, key: &str) -> El {
+    tile(p, key).px(TILE_PX).py(6.0)
 }
 
 fn separator(p: &Paint, key: &str) -> El {
@@ -121,23 +201,33 @@ fn caption(p: &Paint, key: &str, s: impl Into<String>) -> El {
         .w_full()
 }
 
+/// The app icon in small: the mark, white, on the icon's blue.
 fn logo(p: &Paint, size: f32) -> El {
     el().key("logo")
         .size(size, size)
         .center()
-        .radius(size * 0.28)
-        .gradient(p.accent, p.accent.mix(Color::BLACK, 0.18))
+        .radius(size * 0.26)
+        .continuous_corners()
+        .gradient(p.brand.0, p.brand.1)
+        .border_gradient(p.hair, Color::WHITE.alpha(0.3), Color::WHITE.alpha(0.06))
         .a11y_hidden()
-        .child(icon(&WAVE, size * 0.62).color(Color::WHITE))
+        .child(icon(&MARK, size * 0.78).color(Color::WHITE))
 }
 
 fn header(p: &Paint, title: &str, leading: Option<El>, trailing: Option<El>) -> El {
-    let mut r = row().key("header").w_full().h(28.0).center_y().gap(8.0);
-    r = r.child(leading.unwrap_or_else(|| logo(p, 22.0)));
+    let brand = leading.is_none();
+    let mut r = row()
+        .key("header")
+        .w_full()
+        .h(30.0)
+        .px(2.0)
+        .center_y()
+        .gap(9.0);
+    r = r.child(leading.unwrap_or_else(|| logo(p, 24.0)));
     r = r.child(
         text(title)
             .key("title")
-            .font(TITLE)
+            .font(if brand { BRAND } else { TITLE })
             .color(p.t.text)
             .grow(1.0)
             .shrink()
@@ -145,6 +235,87 @@ fn header(p: &Paint, title: &str, leading: Option<El>, trailing: Option<El>) -> 
     );
     if let Some(t) = trailing {
         r = r.child(t);
+    }
+    r
+}
+
+/// A capsule segmented control: a sliding raised pill over a recessed track. Segments are keyed
+/// `segment{i}`, as rune-kit's are.
+fn pills(
+    p: &Paint,
+    label: &str,
+    labels: &[&str],
+    selected: Option<usize>,
+    width: f32,
+    pick: fn(&mut State, usize),
+) -> El {
+    let h = 28.0;
+    let inset = 2.0;
+    let n = labels.len().max(1);
+    let seg = width / n as f32;
+    let mut r = row()
+        .role("radiogroup")
+        .label(label)
+        .focus_group()
+        .w(width)
+        .h(h)
+        .radius(h / 2.0)
+        .fill(if p.dark {
+            Color::BLACK.alpha(0.22)
+        } else {
+            p.well
+        });
+    if let Some(i) = selected {
+        r = r.child(
+            el().key("indicator")
+                .absolute(seg * i as f32 + inset, inset)
+                .size(seg - 2.0 * inset, h - 2.0 * inset)
+                .radius((h - 2.0 * inset) / 2.0)
+                .fill(if p.dark {
+                    Color::WHITE.alpha(0.16)
+                } else {
+                    Color::WHITE
+                })
+                .border_gradient(
+                    p.hair,
+                    Color::WHITE.alpha(if p.dark { 0.22 } else { 1.0 }),
+                    Color::WHITE.alpha(0.0),
+                )
+                .shadow(
+                    1.0,
+                    3.0,
+                    Color::BLACK.alpha(if p.dark { 0.25 } else { 0.1 }),
+                )
+                .motion(motion::SNAPPY)
+                .a11y_hidden(),
+        );
+    }
+    for (i, l) in labels.iter().enumerate() {
+        let on = selected == Some(i);
+        r = r.child(
+            row()
+                .key(format!("segment{i}"))
+                .role("radio")
+                .label(*l)
+                .checked(on)
+                .focusable(true)
+                .focus_selected(on)
+                .focus_ring(2.0, 1.0, p.accent)
+                .w(seg)
+                .h(h)
+                .center()
+                .px(6.0)
+                .press_scale(0.97)
+                .on_press(move |s: &mut State| pick(s, i))
+                .child(
+                    text(*l)
+                        .key("label")
+                        .font(PILL)
+                        .color(if on { p.t.text } else { p.t.text_secondary })
+                        .truncate()
+                        .a11y_hidden(),
+                ),
+        );
     }
     r
 }
@@ -171,7 +342,13 @@ fn switch(
         .focus_ring(2.0, 2.0, p.accent)
         .size(w, h)
         .radius(h / 2.0)
-        .fill(if on { p.accent } else { p.t.control_off })
+        .fill(if on {
+            p.accent
+        } else if p.dark {
+            Color::WHITE.alpha(0.14)
+        } else {
+            p.t.control_off
+        })
         .motion(motion::SNAPPY)
         .child(
             el().key("knob")
@@ -191,9 +368,76 @@ fn switch(
     e
 }
 
-/// The main on/off: bigger than a settings toggle.
-fn big_switch(p: &Paint, label: &str, on: bool) -> El {
-    switch(p, "switch", label, on, (46.0, 28.0), Some(|s| s.toggle()))
+/// One ripple ring's brightness over a breath: swells in, then fades as the next ring takes it.
+static BREATH: [(f32, f32); 4] = [(0.0, 0.0), (0.22, 1.0), (0.6, 0.25), (1.0, 0.0)];
+/// Seconds per breath of the ripple.
+const BREATH_S: f32 = 2.6;
+
+/// The main on/off: a round power button. White on the lit hero, accent on a plain one (on but
+/// muted), a thin outline when off. While Oto is cleaning a call, rings breathe out from it.
+fn power_button(p: &Paint, label: &str, on: bool, lit: bool, breathing: bool) -> El {
+    let d = 44.0;
+    let button = el()
+        .key("switch")
+        .role("switch")
+        .label(label)
+        .checked(on)
+        .focusable(true)
+        .focus_ring(2.0, 2.0, if lit { Color::WHITE } else { p.accent })
+        .size(d, d)
+        .center()
+        .radius(d / 2.0)
+        .fill(if lit {
+            Color::WHITE
+        } else if on {
+            p.accent
+        } else {
+            Color::TRANSPARENT
+        })
+        .border(if on { 0.0 } else { 1.25 }, p.t.text_secondary.alpha(0.55))
+        .shadow(
+            if on { 3.0 } else { 0.0 },
+            if on { 10.0 } else { 0.0 },
+            Color::BLACK.alpha(if on { 0.22 } else { 0.0 }),
+        )
+        .hover(if on { Color::TRANSPARENT } else { p.t.hover })
+        .press_scale(0.96)
+        .motion(motion::SNAPPY)
+        .on_press(|s: &mut State| s.toggle())
+        .child(
+            icon(&POWER, 20.0)
+                .color(if lit {
+                    p.brand.1
+                } else if on {
+                    Color::WHITE
+                } else {
+                    p.t.text
+                })
+                .a11y_hidden(),
+        );
+    let mut wrap = el().key("power").size(d, d);
+    if breathing {
+        for (i, ring) in [54.0f32, 64.0, 74.0].into_iter().enumerate() {
+            let at = (d - ring) / 2.0;
+            wrap = wrap.child(
+                el().key(format!("ring{i}"))
+                    .absolute(at, at)
+                    .size(ring, ring)
+                    .radius(ring / 2.0)
+                    .border(1.0, Color::WHITE.alpha(0.55 - 0.12 * i as f32))
+                    .cycle(Cycle {
+                        period: BREATH_S,
+                        phase: 0.16 * i as f32,
+                        stops: &BREATH,
+                        // Reduce Motion: the rings hold still, but still show Oto is working.
+                        still: 0.6 - 0.15 * i as f32,
+                        fps: 30.0,
+                    })
+                    .a11y_hidden(),
+            );
+        }
+    }
+    wrap.child(button)
 }
 
 /// A settings-sized switch; `enabled` false shows it dimmed and inert.
@@ -212,7 +456,7 @@ fn field_row(p: &Paint, key: &str, label: &str, control: El) -> El {
     row()
         .key(key)
         .w_full()
-        .h(40.0)
+        .h(42.0)
         .center_y()
         .justify_between()
         .gap(12.0)
@@ -225,15 +469,20 @@ fn labelled(p: &Paint, key: &str, label: &str, control: El) -> El {
     col()
         .key(key)
         .w_full()
-        .gap(6.0)
+        .gap(7.0)
         .child(
-            text(label)
+            text(label.to_uppercase())
                 .key("label")
                 .font(LABEL)
                 .color(p.t.text_secondary)
                 .a11y_hidden(),
         )
         .child(control)
+}
+
+/// A status colour's background, thinned so the glass reads through it.
+fn tint(c: &StateColors) -> Color {
+    c.bg.alpha(0.7)
 }
 
 fn error_banner(p: &Paint, msg: &str, dismiss: fn(&mut State)) -> El {
@@ -247,8 +496,9 @@ fn error_banner(p: &Paint, msg: &str, dismiss: fn(&mut State)) -> El {
         .py(6.0)
         .gap(8.0)
         .center_y()
-        .radius(8.0)
-        .fill(c.danger.bg)
+        .radius(12.0)
+        .continuous_corners()
+        .fill(tint(&c.danger))
         .border(p.hair, c.danger.border)
         .child(
             text(msg.to_owned())
@@ -284,8 +534,9 @@ fn notice(p: &Paint, key: &str, c: &StateColors, msg: &str, action: Option<Actio
         .py(8.0)
         .gap(10.0)
         .center_y()
-        .radius(8.0)
-        .fill(c.bg)
+        .radius(12.0)
+        .continuous_corners()
+        .fill(tint(c))
         .border(p.hair, c.border)
         .child(
             text(msg.to_owned())
@@ -349,8 +600,9 @@ fn banner(
         .pr(8.0)
         .py(8.0)
         .gap(6.0)
-        .radius(8.0)
-        .fill(c.bg)
+        .radius(12.0)
+        .continuous_corners()
+        .fill(tint(c))
         .border(p.hair, c.border)
         .child(head);
     if let Some(d) = detail {
@@ -580,8 +832,9 @@ fn degraded_banner(p: &Paint, title: &str, msg: &str) -> El {
         .px(12.0)
         .py(10.0)
         .gap(8.0)
-        .radius(8.0)
-        .fill(c.bg)
+        .radius(12.0)
+        .continuous_corners()
+        .fill(tint(c))
         .border(p.hair, c.border)
         .child(
             text(title.to_owned())
@@ -612,12 +865,12 @@ fn degraded_banner(p: &Paint, title: &str, msg: &str) -> El {
 
 /// "Hear the Difference": a button, then the recording, then raw-or-cleaned playback.
 fn hear_card(s: &State, p: &Paint) -> El {
-    let title = text("Hear the Difference")
+    let title = text("Hear the difference")
         .key("hear-title")
-        .font(LABEL)
-        .color(p.t.text_secondary)
+        .font(TITLE)
+        .color(p.t.text)
         .a11y_hidden();
-    let mut c = card(p, "hear").py(12.0).gap(8.0).child(title);
+    let mut c = card(p, "hear").py(TILE_PX).gap(8.0).child(title);
     match &s.hear {
         HearTest::Idle | HearTest::Failed(_) => {
             let blocked = s.hear_blocked();
@@ -673,11 +926,14 @@ fn hear_card(s: &State, p: &Paint) -> El {
             cleaned,
             is_bluetooth_hfp,
         } => {
-            let ab = SegmentedControl::new(&["Original", "Cleaned"], Some(usize::from(*cleaned)))
-                .width(Some(CARD_INNER))
-                .label("Playback")
-                .on_pick(|s: &mut State, i: usize, _| s.set_hear_cleaned(i == 1))
-                .build(&p.k);
+            let ab = pills(
+                p,
+                "Playback",
+                &["Original", "Cleaned"],
+                Some(usize::from(*cleaned)),
+                CARD_INNER,
+                |s, i| s.set_hear_cleaned(i == 1),
+            );
             c = c.child(el().key("hear-ab").w_full().child(ab));
             if *is_bluetooth_hfp {
                 c = c.child(caption(
@@ -761,43 +1017,20 @@ fn main_page(s: &State, p: &Paint, layer: &mut Vec<El>) -> El {
     let hero_title = if isolating {
         "Voice Isolation"
     } else {
-        "Noise cancellation"
+        "Noise Cancellation"
     };
-    let hero = card(p, "hero").py(14.0).child(
-        row()
-            .w_full()
-            .center_y()
-            .gap(12.0)
-            .child(
-                col()
-                    .grow(1.0)
-                    .shrink()
-                    .gap(3.0)
-                    .child(
-                        text(hero_title)
-                            .key("hero-title")
-                            .font(TITLE)
-                            .color(p.t.text),
-                    )
-                    .child(
-                        text(if !on {
-                            "Turn on to remove background noise"
-                        } else if s.degraded.is_some() {
-                            "Muted until it can run again"
-                        } else if s.clients_active && isolating {
-                            "Keeping only your voice"
-                        } else if s.clients_active {
-                            "Cleaning your voice"
-                        } else {
-                            "On, ready for your next call"
-                        })
-                        .key("hero-sub")
-                        .font(CAPTION)
-                        .color(p.t.text_secondary),
-                    ),
-            )
-            .child(big_switch(p, hero_title, on)),
-    );
+    let state_line = if !on {
+        "Off \u{00b7} your microphone passes through"
+    } else if s.degraded.is_some() {
+        "Muted until it can run again"
+    } else if s.clients_active && isolating {
+        "Keeping only your voice"
+    } else if s.clients_active {
+        "Cleaning your voice"
+    } else {
+        "On \u{00b7} ready for your next call"
+    };
+    let hero = hero(s, p, hero_title, state_line);
 
     let options: Vec<String> = s.device_options().into_iter().map(|(_, l)| l).collect();
     let current = s.device_label();
@@ -816,31 +1049,36 @@ fn main_page(s: &State, p: &Paint, layer: &mut Vec<El>) -> El {
         && let Some(list) = layer.pop()
     {
         // As wide as the field, so device names don't truncate in a narrow list.
-        layer.push(list.w(CARD_INNER));
+        layer.push(
+            list.w(CARD_INNER)
+                .fill(p.menu)
+                .radius(MENU_RADIUS)
+                .continuous_corners(),
+        );
     }
+    let mic_row = labelled(p, "mic-row", "Microphone", device);
     let labels: Vec<&str> = STRENGTHS.iter().map(|(_, l)| *l).collect();
-    let strength = SegmentedControl::new(
+    let strength = pills(
+        p,
+        "Strength",
         &labels,
         STRENGTHS.iter().position(|(v, _)| *v == s.prefs.strength),
-    )
-    .width(Some(CARD_INNER))
-    .label("Strength")
-    .on_pick(|s: &mut State, i: usize, _| s.set_strength(STRENGTHS[i].0))
-    .build(&p.k);
-    let mut controls =
-        card(p, "controls")
-            .py(12.0)
-            .gap(12.0)
-            .child(labelled(p, "mic-row", "Microphone", device));
+        CARD_INNER,
+        |s, i| s.set_strength(STRENGTHS[i].0),
+    );
+    let mut controls = card(p, "controls").py(TILE_PX).gap(14.0).child(mic_row);
     // Two modes only when this build has Voice Isolation. The Noise Cancellation model is a
     // setting.
     if s.offers_isolation() {
         let labels: Vec<&str> = MODES.iter().map(|(_, l)| *l).collect();
-        let mode = SegmentedControl::new(&labels, MODES.iter().position(|(m, _)| *m == s.mode()))
-            .width(Some(CARD_INNER))
-            .label("Mode")
-            .on_pick(|s: &mut State, i: usize, _| s.set_mode(MODES[i].0))
-            .build(&p.k);
+        let mode = pills(
+            p,
+            "Mode",
+            &labels,
+            MODES.iter().position(|(m, _)| *m == s.mode()),
+            CARD_INNER,
+            |s, i| s.set_mode(MODES[i].0),
+        );
         let mut row = labelled(p, "mode-row", "Mode", mode);
         if isolating {
             row = row.child(caption(
@@ -852,26 +1090,6 @@ fn main_page(s: &State, p: &Paint, layer: &mut Vec<El>) -> El {
         controls = controls.child(row);
     }
     controls = controls.child(labelled(p, "strength-row", "Strength", strength));
-
-    let metering = on && s.clients_active;
-    let mut meter = card(p, "meter")
-        .py(12.0)
-        .gap(10.0)
-        .child(meter_row(
-            p,
-            "raw",
-            "Input",
-            &s.meter.raw,
-            p.t.text_secondary.alpha(0.75),
-        ))
-        .child(meter_row(p, "clean", "Cleaned", &s.meter.clean, p.accent));
-    if !metering {
-        meter = meter.child(caption(
-            p,
-            "meter-hint",
-            "Levels show while an app is using Oto Microphone.",
-        ));
-    }
 
     let mut page = col()
         .key("main")
@@ -925,7 +1143,7 @@ fn main_page(s: &State, p: &Paint, layer: &mut Vec<El>) -> El {
             Some(("OK", |s| s.model_notice = None)),
         ));
     }
-    page = page.child(controls).child(meter);
+    page = page.child(controls);
     if let Some(e) = &s.error {
         page = page.child(error_banner(p, e, |s| s.dismiss_error()));
     }
@@ -946,26 +1164,118 @@ fn main_page(s: &State, p: &Paint, layer: &mut Vec<El>) -> El {
     page.child(status_line(s, p))
 }
 
-fn meter_row(p: &Paint, key: &str, label: &str, live: &rune::Live<[f32; 4]>, color: Color) -> El {
+/// The on/off tile. Lit in the app icon's blue while Oto runs, with the noise-in and
+/// voice-out levels; a plain tile while it's off.
+fn hero(s: &State, p: &Paint, title: &str, state_line: &str) -> El {
+    let on = s.prefs.enabled;
+    // On but muted (Voice Isolation can't run): not lit, and the state line says so in amber.
+    let muted = on && (s.degraded.is_some() || (s.isolating() && !s.offers_isolation()));
+    let lit = on && !muted;
+    let ink = if lit { Color::WHITE } else { p.t.text };
+    let ink2 = if lit {
+        Color::WHITE.alpha(0.78)
+    } else if muted {
+        p.amber
+    } else {
+        p.t.text_secondary
+    };
+    let mut t = tile(p, "hero").padding(16.0).gap(16.0);
+    if lit {
+        t = t
+            .linear_gradient(
+                std::f32::consts::PI * 0.88,
+                [(0.0, p.brand.0), (1.0, p.brand.1)],
+            )
+            .border_gradient(p.hair, Color::WHITE.alpha(0.42), Color::WHITE.alpha(0.06))
+            .shadow(8.0, 22.0, p.brand.1.alpha(if p.dark { 0.45 } else { 0.32 }));
+    }
+    t = t.child(
+        row()
+            .key("hero-top")
+            .w_full()
+            .center_y()
+            .gap(12.0)
+            .child(
+                col()
+                    .grow(1.0)
+                    .shrink()
+                    .gap(3.0)
+                    .child(text(title).key("hero-title").font(HERO).color(ink))
+                    .child(
+                        text(state_line)
+                            .key("hero-sub")
+                            .font(CAPTION)
+                            .color(ink2)
+                            .wrap()
+                            .w_full(),
+                    ),
+            )
+            .child(power_button(p, title, on, lit, lit && s.clients_active)),
+    );
+    if !lit {
+        return t;
+    }
+    let mut levels = col()
+        .key("meter")
+        .w_full()
+        .gap(8.0)
+        .child(meter_row(
+            p,
+            "raw",
+            "In",
+            "Input level",
+            &s.meter.raw,
+            Color::WHITE.alpha(0.5),
+        ))
+        .child(meter_row(
+            p,
+            "clean",
+            "Out",
+            "Cleaned level",
+            &s.meter.clean,
+            Color::WHITE,
+        ));
+    if !s.clients_active {
+        levels = levels.child(
+            text("Levels show while an app is using Oto Microphone.")
+                .key("meter-hint")
+                .font(CAPTION)
+                .color(ink2)
+                .wrap()
+                .w_full(),
+        );
+    }
+    t.child(levels)
+}
+
+fn meter_row(
+    _p: &Paint,
+    key: &str,
+    label: &str,
+    a11y: &str,
+    live: &rune::Live<[f32; 4]>,
+    color: Color,
+) -> El {
     row()
         .key(key)
         .w_full()
-        .gap(8.0)
+        .gap(10.0)
         .center_y()
         .child(
             text(label)
                 .key("label")
-                .font(CAPTION)
-                .color(p.t.text_secondary)
-                .grow(1.0),
+                .font(CAPTION_NUM)
+                .color(Color::WHITE.alpha(0.72))
+                .grow(1.0)
+                .a11y_hidden(),
         )
         .child(
             el().key("track")
                 .role("meter")
-                .label(label)
+                .label(a11y)
                 .size(BAR_W, BAR_H)
                 .radius(BAR_H / 2.0)
-                .fill(p.t.control_off)
+                .fill(Color::BLACK.alpha(0.18))
                 .child(
                     el().key("fill")
                         .absolute(0.0, 0.0)
@@ -993,14 +1303,16 @@ fn status_line(s: &State, p: &Paint) -> El {
     let mut r = row()
         .key("status")
         .w_full()
-        .px(4.0)
-        .gap(6.0)
+        .px(6.0)
+        .pt(2.0)
+        .gap(7.0)
         .center_y()
         .child(
             el().key("dot")
-                .size(7.0, 7.0)
-                .radius(3.5)
+                .size(6.0, 6.0)
+                .radius(3.0)
                 .fill(dot)
+                .shadow(0.0, 4.0, dot.alpha(0.6))
                 .a11y_hidden(),
         )
         .child(
@@ -1012,20 +1324,13 @@ fn status_line(s: &State, p: &Paint) -> El {
                 .shrink()
                 .truncate(),
         );
-    if let Some(model) = s.running_model() {
+    let meta: Vec<String> = s.running_model().into_iter().chain(s.cpu()).collect();
+    if !meta.is_empty() {
         r = r.child(
-            text(model)
+            text(meta.join(" \u{00b7} "))
                 .key("model")
                 .font(CAPTION_NUM)
-                .color(p.t.text_secondary),
-        );
-    }
-    if let Some(cpu) = s.cpu() {
-        r = r.child(
-            text(cpu)
-                .key("cpu")
-                .font(CAPTION_NUM)
-                .color(p.t.text_secondary),
+                .color(p.t.text_secondary.alpha(0.85)),
         );
     }
     r
@@ -1051,7 +1356,12 @@ fn models_card(s: &State, p: &Paint, layer: &mut Vec<El>) -> Option<El> {
     if s.open == Some(Open::Model)
         && let Some(list) = layer.pop()
     {
-        layer.push(list.w(CARD_INNER));
+        layer.push(
+            list.w(CARD_INNER)
+                .fill(p.menu)
+                .radius(MENU_RADIUS)
+                .continuous_corners(),
+        );
     }
     Some(
         card(p, "models")
