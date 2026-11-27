@@ -39,10 +39,12 @@ changelog_update = true
 changelog_include = ["oto-dsp", "oto-engine", "oto-cli"]
 
 # The release-side signing tool: shares the workspace version but is never tagged, released
-# or listed in the changelog on its own.
+# or listed in the changelog on its own. Give it a distinct tag pattern so git_only mode
+# never matches pre-oto-sign `v*` tags (e.g. v0.0.4) and tries to diff it in an older worktree.
 [[package]]
 name = "oto-sign"
 release = false
+git_tag_name = "oto-sign-v{{ version }}"
 git_tag_enable = false
 git_release_enable = false
 changelog_update = false
