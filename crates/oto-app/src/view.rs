@@ -195,7 +195,7 @@ impl Paint {
             green: rune::oklch(if dark { 0.74 } else { 0.62 }, 0.17, 152.0),
             amber: sc.alert.map_or(
                 // Light mode is darker so the small muted line keeps its contrast on a pale tile.
-                rune::oklch(if dark { 0.8 } else { 0.56 }, 0.14, 70.0),
+                rune::oklch(if dark { 0.8 } else { 0.5 }, 0.13, 65.0),
                 pick,
             ),
             hair: 1.0 / scale,
@@ -1241,7 +1241,7 @@ fn hero(s: &State, p: &Paint, title: &str, state_line: &str) -> El {
     let lit = on && !muted;
     let ink = if lit { p.on_hero } else { p.t.text };
     let ink2 = if lit {
-        p.on_hero.alpha(0.94)
+        p.on_hero
     } else if muted {
         p.amber
     } else {
@@ -1254,8 +1254,8 @@ fn hero(s: &State, p: &Paint, title: &str, state_line: &str) -> El {
                 std::f32::consts::PI * 0.88,
                 // Tinted glass, not paint: the material shows through the hero's colour.
                 [
-                    (0.0, p.brand.0.mix(p.brand.1, 0.35).alpha(0.86)),
-                    (1.0, p.brand.1.alpha(0.88)),
+                    (0.0, p.brand.0.mix(p.brand.1, 0.7).alpha(0.94)),
+                    (1.0, p.brand.1.alpha(0.94)),
                 ],
             )
             .border_gradient(p.hair, Color::WHITE.alpha(0.42), Color::WHITE.alpha(0.06))
@@ -1284,14 +1284,11 @@ fn hero(s: &State, p: &Paint, title: &str, state_line: &str) -> El {
             )
             .child(power_button(p, title, on, lit, lit && s.clients_active)),
     );
-    if !on {
+    // Muted means no stream feeds the meter, which would hold its last samples, so no levels.
+    if !lit {
         return t;
     }
-    let (raw_c, clean_c, label_c) = if lit {
-        (p.hero_in, p.on_hero, p.on_hero.alpha(0.72))
-    } else {
-        (p.t.text_secondary.alpha(0.6), p.t.text, p.t.text_secondary)
-    };
+    let (raw_c, clean_c, label_c) = (p.hero_in, p.on_hero, p.on_hero.alpha(0.72));
     let mut levels = col()
         .key("meter")
         .w_full()
