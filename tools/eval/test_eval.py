@@ -28,6 +28,8 @@ sys.path.insert(0, str(HERE))
 import asr  # noqa: E402
 import eval as harness  # noqa: E402
 import fixtures as fx  # noqa: E402
+import krisp  # noqa: E402
+import krisp_bench  # noqa: E402
 import metrics as mx  # noqa: E402
 from wavio import read_wav, write_wav  # noqa: E402
 
@@ -851,6 +853,651 @@ class HarnessEndToEndTests(unittest.TestCase):
         bad.write_text('{"noisy": "a.wav", "kind": "music"}\n')
         with self.assertRaises(harness.HarnessError):
             harness.read_manifest(bad)
+
+# ------------------------------------------------------------------------------------------
+# Krisp Voice Isolation Benchmark (krisp.py, krisp_bench.py), Parakeet helpers, high band
+
+
+def kseg(start, end, label, text=None):
+    return {"start": start, "end": end, "label": label, "text": text}
+
+
+def krow(i, caller, H, S=0, D=0, I=0, leak=0, bgmin=0.0, scen="work", noise_words=0, noise_min=0.0):
+    return {"i": i, "scen": scen, "caller": caller, "H": H, "S": S, "D": D, "I": I, "leak": leak, "bgmin": bgmin, "noise_words": noise_words, "noise_min": noise_min}
+
+
+class KrispNormalizationTests(unittest.TestCase):
+    def setUp(self):
+        self.norm = krisp.KrispNormalizer("stdlib")
+
+    def test_regex_rules(self):
+        self.assertEqual(krisp.split_general_id("ticket AB-1234 now"), "ticket A B 1 2 3 4 now")
+        self.assertEqual(krisp.split_digit_first("ref 12345B ok"), "ref 1 2 3 4 5 B ok")
+        self.assertEqual(krisp.split_digit_first("the 1990s"), "the 1990s")
+        self.assertEqual(krisp.split_standalone_4digits("PIN 4821 and 1969"), "PIN 4 8 2 1 and 1969")
+        self.assertEqual(krisp.split_standalone_4digits("$5000 or 5000 dollars"), "$5000 or 5000 dollars")
+        self.assertEqual(krisp.split_adjacent_digit_groups("call 555 123 4567"), "call 5 5 5 1 2 3 4 5 6 7")
+
+    def test_number_words(self):
+        self.assertEqual(krisp.number_words(0), "zero")
+        self.assertEqual(krisp.number_words(123), "one hundred twenty three")
+        self.assertEqual(krisp.number_words(35000), "thirty five thousand")
+        self.assertEqual(krisp.number_words(1_000_001), "one million one")
+        self.assertEqual(krisp.ordinal_words(14), "fourteenth")
+        self.assertEqual(krisp.ordinal_words(21), "twenty first")
+        self.assertEqual(krisp.ordinal_words(40), "fortieth")
+        self.assertEqual(krisp.year_words(1969), "nineteen sixty nine")
+        self.assertEqual(krisp.year_words(2024), "twenty twenty four")
+        self.assertEqual(krisp.year_words(2005), "two thousand five")
+        self.assertEqual(krisp.year_words(1905), "nineteen oh five")
+        self.assertEqual(krisp.year_words(1900), "nineteen hundred")
+
+    def test_stdlib_verbalize(self):
+        v = krisp.stdlib_verbalize
+        self.assertEqual(v("$5.50"), "five dollars fifty cents")
+        self.assertEqual(v("$1 and £3"), "one dollar and three pounds")
+        self.assertEqual(v("$2 million"), "two million dollars")
+        self.assertEqual(v("50%"), "fifty percent")
+        self.assertEqual(v("at 8:45 a.m."), "at eight forty five a m")
+        self.assertEqual(v("at 8:05"), "at eight oh five")
+        self.assertEqual(v("by 9:00"), "by nine o'clock")
+        self.assertEqual(v("on August 14th"), "on August fourteenth")
+        self.assertEqual(v("In 1969, 35,000 feet"), "In nineteen sixty nine, thirty five thousand feet")
+        self.assertEqual(v("3.5 stars"), "three point five stars")
+        self.assertEqual(v("the 1990s"), "the nineteen nineties")
+        self.assertEqual(v("R&D"), "R and D")
+
+    def test_jiwer_transform(self):
+        self.assertEqual(krisp.jiwer_words("I won't, can't; let's go. They're here, it's John's, I'd, we'll, I've, I'm"), "i will not can not let us go they are here it is john is i would we will i have i am".split())
+        self.assertEqual(krisp.jiwer_words("Um, uh, so... mhm OK-ish"), ["so", "ok", "ish"])
+        self.assertEqual(krisp.jiwer_words(""), [])
+
+    def test_full_normalizer_matches_spoken_form(self):
+        written = "Uh, we leave on August 14th at 8:45 from Platform 6. Don't forget $20!"
+        spoken = "we leave on august fourteenth at eight forty five from platform six do not forget twenty dollars"
+        self.assertEqual(self.norm(written), spoken.split())
+        self.assertEqual(self.norm(written), self.norm(spoken))
+        self.assertEqual(self.norm(None), [])
+        self.assertEqual(self.norm.backend, "stdlib")
+
+    def test_leak_tokens(self):
+        self.assertEqual(krisp.leak_tokens("Don't,"), ["don", "t"])  # as the published scorer counts
+        self.assertEqual(krisp.leak_tokens("Uh,"), [])
+        self.assertEqual(krisp.leak_tokens("Hello."), ["hello"])
+
+    def test_nemo_backend_without_package(self):
+        try:
+            import nemo_text_processing  # noqa: F401
+        except ImportError:
+            with self.assertRaises(RuntimeError):
+                krisp.KrispNormalizer("nemo")
+            self.assertEqual(krisp.KrispNormalizer("auto").backend, "stdlib")
+        else:  # pragma: no cover
+            self.skipTest("nemo_text_processing installed")
+
+
+class KrispMetricTests(unittest.TestCase):
+    def setUp(self):
+        self.norm = krisp.KrispNormalizer("stdlib")
+
+    def test_segments_validation_and_regions(self):
+        segs = krisp.validate_segments([kseg(0, 5, "primary", "hi"), kseg(5, 9, "mix", "x"), kseg(9, 12, "secondary"), kseg(12, 12.4, "secondary"), kseg(12.4, 14, "noise")])
+        self.assertEqual(krisp.regions(segs, "secondary"), [(9.25, 11.75)])  # 0.4 s segment skipped
+        self.assertEqual(krisp.regions(segs, "noise"), [(12.65, 13.75)])
+        self.assertAlmostEqual(krisp.segment_minutes(segs, "secondary"), 3.4 / 60)
+        with self.assertRaises(ValueError):
+            krisp.validate_segments([kseg(0, 1, "music")])
+        with self.assertRaises(ValueError):
+            krisp.validate_segments([kseg(2, 1, "primary")])
+
+    def test_words_in_regions_uses_midpoint_and_offset(self):
+        regs = [(10.0, 12.0)]
+        words = [("hello", 9.5, 10.6), ("there,", 11.0, 11.4), ("uh", 11.5, 11.6), ("don't", 11.7, 12.2), ("late", 12.1, 12.5)]
+        self.assertEqual(krisp.words_in_regions(words, regs), 1 + 1 + 0 + 2)  # hello mid 10.05; don't mid 11.95
+        self.assertEqual(krisp.words_in_regions(words, regs, offset=0.3), 1 + 0 + 2 + 1)  # late mid 12.3-0.3; hello mid 9.75 out
+
+    def test_clip_row_counts(self):
+        segs = [kseg(0, 4, "primary", "please call me back"), kseg(4, 8, "secondary"), kseg(8, 10, "noise")]
+        words = [("Please", 0.2, 0.5), ("call", 0.6, 0.9), ("me", 1.0, 1.1), ("turn", 5.0, 5.3), ("on", 5.4, 5.5), ("the", 5.6, 5.7), ("TV.", 5.8, 6.0), ("hmm", 9.0, 9.2), ("yes", 9.3, 9.5)]
+        r = krisp.clip_row("work/1", "work", "spk1", "Please call me back.", "Please call me. Turn on the TV yes", words, segs, self.norm)
+        self.assertEqual((r["H"], r["S"], r["D"], r["I"]), (3, 1, 0, 4))  # back->turn, +on the tv yes
+        self.assertEqual(r["leak"], 4)
+        self.assertAlmostEqual(r["bgmin"], 3.5 / 60, places=5)
+        self.assertEqual(r["noise_words"], 1)  # "hmm" is a filler
+        self.assertAlmostEqual(r["noise_min"], 1.5 / 60, places=5)
+        self.assertEqual((r["i"], r["scen"], r["caller"]), ("work/1", "work", "spk1"))
+
+    def test_pooled_is_corpus_level(self):
+        rows = [krow("a", "s1", H=9, S=1, leak=3, bgmin=0.5), krow("b", "s2", H=90, D=5, I=5, leak=0, bgmin=1.0)]
+        p = krisp.pooled(rows)
+        self.assertAlmostEqual(p["wer"], 100 * 11 / 105)  # not the mean of 10% and 10.5%
+        self.assertAlmostEqual(p["missed"], 100 * 6 / 105)
+        self.assertAlmostEqual(p["del"], 100 * 5 / 105)
+        self.assertAlmostEqual(p["ins"], 100 * 5 / 105)
+        self.assertAlmostEqual(p["leak"], 3 / 1.5)
+        self.assertTrue(math.isnan(p["noise_wpm"]))
+        self.assertTrue(math.isnan(krisp.pooled([])["wer"]))
+
+    def test_percentile_matches_numpy_linear(self):
+        self.assertEqual(krisp.percentile([4, 1, 3, 2], 25), 1.75)
+        self.assertEqual(krisp.percentile([1, float("nan"), 3], 50), 2.0)
+        self.assertTrue(math.isnan(krisp.percentile([], 50)))
+
+    def test_speaker_bootstrap(self):
+        rows = [krow(f"c{k}", f"s{k % 5}", H=90 + k, S=k % 4, D=1, I=k % 3, leak=k % 3, bgmin=0.3) for k in range(20)]
+        ci = krisp.speaker_bootstrap(rows, n_boot=500, seed=1)
+        p = krisp.pooled(rows)
+        self.assertEqual(ci["speakers"], 5)
+        for k in ("wer", "missed", "leak"):
+            lo, hi = ci[k]
+            self.assertLessEqual(lo, p[k])
+            self.assertGreaterEqual(hi, p[k])
+            self.assertLess(lo, hi)
+        again = krisp.speaker_bootstrap(rows, n_boot=500, seed=1)  # deterministic
+        self.assertEqual({k: ci[k] for k in ("wer", "missed", "leak")}, {k: again[k] for k in ("wer", "missed", "leak")})
+        same = [krow(f"c{k}", f"s{k}", H=95, S=5, leak=2, bgmin=1.0) for k in range(6)]  # identical speakers
+        ci = krisp.speaker_bootstrap(same, n_boot=200)
+        self.assertAlmostEqual(ci["wer"][0], 5.0)
+        self.assertAlmostEqual(ci["wer"][1], 5.0)
+        self.assertAlmostEqual(ci["leak"][0], 2.0)
+
+    def test_paired_bootstrap(self):
+        ref = [krow(f"c{k}", f"s{k % 8}", H=90, S=6, D=1, I=3, leak=4 + k % 3, bgmin=0.5) for k in range(24)]
+        better = [dict(r, S=r["S"] - 2, H=r["H"] + 2, leak=0) for r in ref]
+        d = krisp.paired_bootstrap(better, ref, n_boot=300)
+        self.assertAlmostEqual(d["wer"][0], -200 / 97)
+        self.assertLess(d["wer"][2], 0)  # significantly better: whole interval below zero
+        self.assertLess(d["leak"][2], 0)
+        self.assertEqual((d["clips"], d["speakers"]), (24, 8))
+        z = krisp.paired_bootstrap(ref, ref, n_boot=50)
+        self.assertEqual(z["wer"], (0.0, 0.0, 0.0))
+        with self.assertRaises(ValueError):
+            krisp.paired_bootstrap(ref, [krow("other", "s", H=1)])
+
+    def test_summary_and_delta_metric_names(self):
+        rows = [krow("work/1", "a", H=95, S=5, leak=2, bgmin=1.0), krow("phone_calls/1", "b", H=96, S=4, scen="phone_calls", noise_words=1, noise_min=0.5)]
+        m = krisp.summary_metrics(rows, n_boot=100)
+        self.assertAlmostEqual(m["krisp_wer_pct"], 4.5)
+        self.assertAlmostEqual(m["phone_calls_krisp_wer_pct"], 4.0)
+        self.assertAlmostEqual(m["work_secondary_leaked_words_per_min"], 2.0)
+        self.assertAlmostEqual(m["noise_hallucinated_words_per_min"], 2.0)
+        self.assertEqual((m["krisp_files"], m["krisp_speakers"]), (2, 2))
+        for k in ("krisp_wer_pct_ci_lo", "krisp_wer_pct_ci_hi", "missed_caller_pct", "secondary_leaked_words_per_min_ci_hi"):
+            self.assertIn(k, m)
+        self.assertIn("raw_krisp_wer_pct", krisp.summary_metrics(rows, prefix="raw_", n_boot=10))
+        d = krisp.delta_metrics(rows, rows, "krisp_default", n_boot=10)
+        self.assertEqual(d["krisp_wer_pct_delta_vs_krisp_default"], 0.0)
+        self.assertIn("secondary_leaked_words_per_min_delta_vs_krisp_default_ci_hi", d)
+        self.assertEqual(krisp.summary_metrics([]), {})
+
+    def test_cluster_mean_ci(self):
+        point, lo, hi = krisp.cluster_mean_ci([0.1, 0.3, 0.2, 0.2], ["a", "a", "b", "b"], n_boot=200)
+        self.assertAlmostEqual(point, 0.2)
+        self.assertAlmostEqual(lo, 0.2)
+        self.assertAlmostEqual(hi, 0.2)
+        self.assertTrue(math.isnan(krisp.cluster_mean_ci([None], ["a"])[0]))
+
+    def test_published_reference_rows(self):
+        self.assertEqual(krisp.PUBLISHED["raw"], {"wer": 23.21, "missed": 4.28, "leak": 66.48})
+        self.assertEqual((krisp.PUBLISHED["vi_2_5_default"]["wer"], krisp.PUBLISHED["vi_2_5_default"]["leak"]), (5.30, 1.52))
+
+
+class HighBandTests(unittest.TestCase):
+    @staticmethod
+    def noise(rate, seconds, seed=3):
+        import random as _r
+
+        g = _r.Random(seed)
+        return [g.uniform(-0.5, 0.5) for _ in range(int(rate * seconds))]
+
+    def test_white_noise_share_and_band_limited_signal(self):
+        x = self.noise(48000, 0.5)
+        r = mx.band_energy_ratio_db(x, 48000)
+        self.assertAlmostEqual(r, 10 * math.log10(8 / 24), delta=0.6)  # 16–24 kHz of a flat 0–24 kHz spectrum
+        self.assertLess(mx.band_energy_ratio_db(sine(1000, 48000, 0.5, 0.5), 48000), -80.0)
+        self.assertIsNone(mx.band_energy_ratio_db(x, 32000))  # Nyquist 16 kHz: no band to measure
+        self.assertIsNone(mx.band_energy_ratio_db([0.0] * 4800, 48000))
+        self.assertIsNone(mx.band_energy_ratio_db([0.1] * 100, 48000))
+        self.assertAlmostEqual(mx.band_energy_ratio_db(x, 48000, 4000, 8000), 10 * math.log10(4 / 24), delta=0.6)
+
+    def test_stdlib_fft_path_matches_numpy_path(self):
+        x = [a + b for a, b in zip(self.noise(48000, 0.2), sine(18000, 48000, 0.2, 0.2))]
+        saved = mx._np
+        try:
+            mx._np = None
+            pure = mx.band_energy_ratio_db(x, 48000, max_frames=8)
+        finally:
+            mx._np = saved
+        self.assertAlmostEqual(pure, mx.band_energy_ratio_db(x, 48000, max_frames=8), places=6)
+
+    def test_high_band_metrics(self):
+        rate = 48000
+        fullband = [a + b for a, b in zip(sine(300, rate, 0.5, 0.3), self.noise(rate, 0.5))]
+        m = mx.high_band_metrics(fullband, rate, fullband, rate)
+        self.assertAlmostEqual(m["high_band_16k_delta_db"], 0.0, places=6)
+        self.assertGreater(m["high_band_16k_db"], -60.0)
+        lowpassed = [a + b for a, b in zip(sine(300, rate, 0.5, 0.3), sine(3000, rate, 0.5, 0.05))]
+        m = mx.high_band_metrics(fullband, rate, lowpassed, rate)
+        self.assertLess(m["high_band_16k_db"], -60.0)  # what a 16 kHz-band model looks like
+        self.assertLess(m["high_band_16k_delta_db"], -20.0)
+        self.assertEqual(mx.high_band_metrics(fullband[:16000], 32000, fullband, rate), {})  # 32 kHz input: not fullband
+        self.assertEqual(mx.high_band_metrics(sine(300, rate, 0.5), rate, fullband, rate), {})  # no >16 kHz content in
+        narrow = mx.high_band_metrics(fullband, rate, sine(300, 16000, 0.5, 0.3), 16000)
+        self.assertEqual(narrow["high_band_16k_db"], mx.FLOOR_DB)
+        self.assertLess(narrow["high_band_16k_delta_db"], -100.0)
+
+    def test_gates_cover_fullband(self):
+        g = harness.load_toml(HERE / "gates.toml")["oto1"]["clean"]
+        checks = {c["gate"]: c["status"] for c in harness.evaluate_gates({"high_band_16k_db": -110.0, "high_band_16k_delta_db": -70.0}, g)}
+        self.assertEqual((checks["min_high_band_16k_db"], checks["min_high_band_16k_delta_db"]), ("fail", "fail"))
+
+
+class AsrBackendTests(unittest.TestCase):
+    def test_words_from_tokens(self):
+        self.assertEqual(asr.words_from_tokens([" hel", "lo", " world", ","], [0.0, 0.08, 0.4, 0.48]), [("hello", 0.0, 0.16), ("world,", 0.4, 0.56)])
+        self.assertEqual(asr.words_from_tokens(["▁it", "'s", "▁ok"], [1.0, 1.08, 2.0]), [("it's", 1.0, 1.16), ("ok", 2.0, 2.08)])
+        self.assertEqual(asr.words_from_tokens(["no", "space"], [0.0, 0.08]), [("nospace", 0.0, 0.16)])
+        self.assertEqual(asr.words_from_tokens([], []), [])
+        self.assertEqual(asr.words_from_tokens(None, None), [])
+
+    def test_make_transcriber(self):
+        with self.assertRaises(ValueError):
+            asr.make_transcriber("kaldi")
+        try:
+            import onnx_asr  # noqa: F401
+        except ImportError:
+            with self.assertRaisesRegex(RuntimeError, "parakeet"):
+                asr.make_transcriber("parakeet")
+        self.assertEqual(asr.ParakeetTranscriber.DEFAULT_MODEL, "nemo-parakeet-tdt-0.6b-v2")
+
+    def test_transcribe_helper(self):
+        class Timed:
+            def __call__(self, p):
+                return "text"
+
+            def transcribe_words(self, p):
+                return "text", [("text", 0.0, 0.1)]
+
+        self.assertEqual(asr.transcribe(Timed(), "a.wav", True), ("text", [("text", 0.0, 0.1)]))
+        self.assertEqual(asr.transcribe(Timed(), "a.wav", False), ("text", None))
+        self.assertEqual(asr.transcribe(lambda p: "plain", "a.wav", True), ("plain", None))
+
+    def test_pyproject_extras_keep_base_stdlib(self):
+        pp = tomllib.loads((HERE / "pyproject.toml").read_text())["project"]
+        self.assertEqual(pp["dependencies"], [])
+        self.assertTrue(any(d.startswith("onnx-asr") for d in pp["optional-dependencies"]["parakeet"]))
+
+
+def make_krisp_data(root: Path, rate: int = 16000, seconds: float = 3.0) -> Path:
+    """A tiny fake Krisp data dir: 2 work files (2 speakers), 1 phone call, VI Default for work."""
+    meta = {
+        "work": [
+            {"file_name": "001.wav", "id": "001", "speaker_id": "speaker1", "gender": "male", "full_transcript": "Please call me back at 8:45.", "segments": [kseg(0.0, 1.0, "primary", "Please call"), kseg(1.0, 1.5, "mix", "me back at 8:45."), kseg(1.5, 2.6, "secondary"), kseg(2.6, 3.0, "noise")], "recording_device": "jabra", "environment": "small_room"},
+            {"file_name": "002.wav", "id": "002", "speaker_id": "speaker2", "gender": "female", "full_transcript": "The order ships on the 14th.", "segments": [kseg(0.0, 1.2, "primary", "The order ships on the 14th."), kseg(1.2, 2.8, "secondary"), kseg(2.8, 3.0, "noise")], "recording_device": "airpods", "environment": "open_space"},
+        ],
+        "phone_calls": [
+            {"file_name": "107.wav", "id": "107", "speaker_id": "speaker1", "gender": "male", "full_transcript": "Hi Olivia, I booked the tickets.", "segments": [kseg(0.2, 2.9, "primary", "Hi Olivia, I booked the tickets.")], "recording_device": "airpods", "environment": "car", "phone": "iphone_16", "car_model": None},
+        ],
+    }
+    for scen, rows in meta.items():
+        d = krisp_bench.raw_dir(root, scen)
+        d.mkdir(parents=True)
+        (d / "metadata.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
+        for r in rows:
+            write_wav(d / r["file_name"], rate, sine(220, rate, seconds, 0.2), "pcm16")
+    v = krisp_bench.variant_dir(root, "work", "vi_2_5_default")
+    v.mkdir(parents=True)
+    for r in meta["work"]:
+        write_wav(v / r["file_name"], rate, sine(220, rate, seconds, 0.1), "pcm16")
+    return root
+
+
+class FakeTimedAsr:
+    """Raw input leaks the background talker; Krisp's output leaks one word; anything else
+    (the model's output) is clean. Word times follow the fake data's segments."""
+
+    config = {"engine": "fake", "model": "timed", "quantization": "none"}
+    CLEAN = {"001": "please call me back at 8:45", "002": "the order ships on the 14th", "107": "hi olivia i booked the tickets"}
+
+    def __init__(self):
+        self.calls = []
+
+    def transcribe_words(self, path):
+        self.calls.append(str(path))
+        p = Path(path)
+        key = next(k for k in self.CLEAN if k in p.name)
+        words = [(w, 0.1 + 0.1 * i, 0.15 + 0.1 * i) for i, w in enumerate(self.CLEAN[key].split())]
+        if key == "107":
+            return self.CLEAN[key], words
+        if p.name.startswith("raw__") or "/raw/" in str(p):
+            leak = [("turn", 1.9, 2.0), ("on", 2.0, 2.1), ("the", 2.1, 2.2), ("tv", 2.2, 2.3)]
+        elif "vi_2_5_default" in str(p):
+            leak = [("tv", 2.0, 2.1)]
+        else:
+            leak = []
+        return " ".join(w for w, _, _ in words + leak), words + leak
+
+    def __call__(self, path):
+        return self.transcribe_words(path)[0]
+
+
+class KrispBenchTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix="oto-krisp-test-")
+        self.root = make_krisp_data(Path(self.tmp.name) / "krisp")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_data_dir_must_be_outside_repo(self):
+        for bad in (REPO, REPO / "tools/eval/out/krisp", HERE):
+            with self.assertRaises(krisp_bench.BenchError):
+                krisp_bench.data_dir(bad)
+        self.assertEqual(krisp_bench.data_dir(self.root), self.root.resolve())
+        self.assertEqual(krisp_bench.data_dir(None), Path("~/.cache/oto-eval/krisp").expanduser().resolve())
+        with self.assertRaises(krisp_bench.BenchError):
+            krisp_bench.manifest_path(self.root, str(REPO / "krisp.jsonl"))
+        with redirect_stderr(io.StringIO()):
+            self.assertEqual(krisp_bench.main(["manifest", "--data-dir", str(REPO / "data")]), 2)
+
+    def test_build_manifest(self):
+        entries = krisp_bench.build_manifest(self.root)
+        self.assertEqual([e["id"] for e in entries], ["phone_calls/107", "work/001", "work/002"])
+        w = entries[1]
+        self.assertEqual((w["kind"], w["speaker_id"], w["scenario"], w["license"]), ("speech", "speaker1", "work", "CC-BY-NC-4.0"))
+        self.assertEqual(w["transcript"], "Please call me back at 8:45.")
+        self.assertEqual([s["label"] for s in w["segments"]], ["primary", "mix", "secondary", "noise"])
+        self.assertEqual(set(w["baselines"]), {"krisp_default"})
+        self.assertTrue(Path(w["baselines"]["krisp_default"]).is_file())
+        self.assertNotIn("baselines", entries[0])  # no VI output downloaded for phone calls
+        self.assertEqual(len(krisp_bench.build_manifest(self.root, limit=2)), 2)
+        self.assertEqual([e["id"] for e in krisp_bench.build_manifest(self.root, scenarios=["work"])], ["work/001", "work/002"])
+        with self.assertRaises(krisp_bench.BenchError):
+            krisp_bench.build_manifest(Path(self.tmp.name) / "empty")
+
+    def test_manifest_round_trips_through_eval(self):
+        with redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(krisp_bench.main(["manifest", "--data-dir", str(self.root)]), 0)
+        self.assertIn("3 files, 2 speakers", out.getvalue())
+        m = self.root / "manifest.jsonl"
+        self.assertTrue(m.read_text().startswith("# Krisp Voice Isolation Benchmark (CC-BY-NC-4.0)"))
+        entries = harness.read_manifest(m)
+        self.assertEqual(len(entries), 3)
+        self.assertEqual(entries[1]["segments"][2]["label"], "secondary")
+        self.assertTrue(Path(entries[1]["baselines"]["krisp_default"]).is_absolute())
+        bad = self.root / "bad.jsonl"
+        bad.write_text(json.dumps({"noisy": "a.wav", "segments": [kseg(0, 1, "music")]}) + "\n")
+        with self.assertRaises(harness.HarnessError):
+            harness.read_manifest(bad)
+        bad.write_text(json.dumps({"noisy": "a.wav", "baselines": ["x.wav"]}) + "\n")
+        with self.assertRaises(harness.HarnessError):
+            harness.read_manifest(bad)
+
+    def test_plan_download_and_disk_guard(self):
+        def lister(repo, sub):
+            if repo == krisp_bench.RAW_REPO:
+                return [{"path": f"{sub}/metadata.jsonl", "size": 10}, {"path": f"{sub}/001.wav", "size": (self.root / "raw" / sub / "001.wav").stat().st_size if sub == "work" else 5}, {"path": f"{sub}/999.wav", "size": 1000}, {"path": f"{sub}/nested/x.wav", "size": 1}]
+            return [{"path": f"{sub}/001.wav", "size": 7}, {"path": f"{sub}/.DS_Store", "size": 6148}]
+
+        jobs = krisp_bench.plan_download(self.root, ["work"], ["vi_2_5_default"], lister)
+        dests = sorted(Path(j["dest"]).relative_to(self.root).as_posix() for j in jobs)
+        # metadata.jsonl and work/001.wav already present at the same size are skipped (meta size differs: refetched)
+        self.assertEqual(dests, ["processed/work/vi_2_5_default/001.wav", "raw/work/999.wav", "raw/work/metadata.jsonl"])
+        self.assertTrue(all(j["url"].startswith("https://huggingface.co/datasets/Krisp-AI/") and "/resolve/main/" in j["url"] for j in jobs))
+
+        class U:
+            def __init__(self, free):
+                self.free = free
+
+        info = krisp_bench.check_disk(self.root / "new" / "dir", 2 * 10**9, 20.0, usage=lambda p: U(60 * 10**9))
+        self.assertEqual((info["need_gb"], info["free_after_gb"]), (2.0, 58.0))
+        with self.assertRaisesRegex(krisp_bench.BenchError, "not enough disk"):
+            krisp_bench.check_disk(self.root, 2 * 10**9, 20.0, usage=lambda p: U(21 * 10**9))
+
+        args = krisp_bench.parse_args(["download", "--data-dir", str(self.root), "--scenarios", "work", "--dry-run"])
+        fetched, lines = [], []
+        self.assertEqual(krisp_bench.cmd_download(args, lines.append, lister, fetched.append, lambda p: U(60 * 10**9)), 0)
+        self.assertEqual(fetched, [])  # dry run writes nothing
+        self.assertIn("3 files", lines[0])
+        args = krisp_bench.parse_args(["download", "--data-dir", str(self.root), "--scenarios", "work"])
+        self.assertEqual(krisp_bench.cmd_download(args, lines.append, lister, fetched.append, lambda p: U(60 * 10**9)), 0)
+        self.assertEqual(len(fetched), 3)
+        with self.assertRaises(krisp_bench.BenchError):
+            krisp_bench.cmd_download(args, lines.append, lister, fetched.append, lambda p: U(10**9))
+
+    def test_asr_cache_score_and_report(self):
+        fake = FakeTimedAsr()
+        entries = krisp_bench.build_manifest(self.root)
+        tag = krisp_bench.run_asr(entries, ["raw", "vi_2_5_default"], fake, self.root, quiet_log)
+        self.assertEqual(tag, "fake-timed-none")
+        n = len(fake.calls)
+        self.assertEqual(n, 3 + 2)  # VI Default exists for the 2 work files only
+        krisp_bench.run_asr(entries, ["raw"], fake, self.root, quiet_log)
+        self.assertEqual(len(fake.calls), n)  # cached
+        args = krisp_bench.parse_args(["score", "--data-dir", str(self.root), "--cond", "raw", "--cond", "vi_2_5_default", "--normalizer", "stdlib", "--bootstrap", "50"])
+        lines = []
+        self.assertEqual(krisp_bench.cmd_score(args, lines.append, fake.config), 0)
+        rep = json.loads((self.root / "reports" / "krisp.json").read_text())
+        raw, vi = rep["scores"]["raw"], rep["scores"]["vi_2_5_default"]
+        self.assertEqual((raw["files"], raw["speakers"], vi["files"]), (3, 2, 2))
+        self.assertAlmostEqual(raw["leak"], 8 / ((1.1 - 0.5 + 1.6 - 0.5) / 60), places=1)  # 4 leaked words in each work file
+        self.assertAlmostEqual(vi["leak"], 2 / ((1.1 - 0.5 + 1.6 - 0.5) / 60), places=1)
+        self.assertAlmostEqual(vi["wer"], 2 / 14 * 100)  # one inserted "tv" per work file; "8:45" is 3 of the 14 reference words
+        self.assertIn("vs_reference", raw)
+        self.assertEqual(rep["checks"], [])  # not the full 265 files
+        self.assertTrue((self.root / "reports" / "krisp.clips.jsonl").is_file())
+        self.assertIn("| raw | 3 / 2 |", "\n".join(lines))
+        args = krisp_bench.parse_args(["score", "--data-dir", str(self.root), "--cond", "vi_2_5_hd"])
+        with self.assertRaisesRegex(krisp_bench.BenchError, "no transcripts"):
+            krisp_bench.cmd_score(args, quiet_log, fake.config)
+
+    def test_score_published_clips_and_check(self):
+        def rows(H, S, D, I, leak, bgmin):
+            out = [krow(f"work/{k}", f"speaker{k % 47}", 0) for k in range(264)]
+            return [krow("work/x", "speaker0", H, S, D, I, leak, bgmin)] + out
+
+        raw = rows(9572, 300, 128, 1893, 6648, 100.0)  # 23.21% WER, 66.48 w/min
+        vi = rows(9579, 320, 101, 109, 152, 100.0)  # 5.30% WER, 1.52 w/min
+        clips = Path(self.tmp.name) / "clips.jsonl"
+        clips.write_text(json.dumps({"set": "krisp", "cond": "raw", "clips": raw}) + "\n" + json.dumps({"set": "krisp", "cond": "krisp_vi_2_5_default", "clips": vi}) + "\n" + json.dumps({"set": "ami", "cond": "raw", "clips": []}) + "\n")
+        got = krisp_bench.read_clips_jsonl(clips)
+        self.assertEqual(sorted(got), ["raw", "vi_2_5_default"])
+        scores = krisp_bench.score_conditions(got, "vi_2_5_default", n_boot=20)
+        checks = {c["cond"]: c for c in krisp_bench.check_published(scores)}
+        self.assertTrue(checks["raw"]["ok"] and checks["vi_2_5_default"]["ok"], checks)
+        self.assertAlmostEqual(checks["raw"]["leak"], 66.48)
+        lines = []
+        args = krisp_bench.parse_args(["score", "--data-dir", str(self.root), "--clips", str(clips), "--check", "--bootstrap", "20"])
+        self.assertEqual(krisp_bench.cmd_score(args, lines.append), 0)
+        self.assertIn("OK raw: WER 23.21 vs published 23.21", "\n".join(lines))
+        self.assertFalse((self.root / "reports").exists())  # --clips without --write
+        off = rows(9572, 300, 128, 1950, 6648, 100.0)  # 23.78%: outside 0.2 points
+        clips.write_text(json.dumps({"set": "krisp", "cond": "raw", "clips": off}) + "\n")
+        self.assertEqual(krisp_bench.cmd_score(args, quiet_log), 1)
+
+    def test_eval_command(self):
+        args = krisp_bench.parse_args(["eval", "--data-dir", str(self.root), "--models", "dfn3", "--asr-quantization", "int8", "--", "--strict"])
+        calls = []
+        self.assertEqual(krisp_bench.cmd_eval(args, quiet_log, lambda cmd: calls.append(cmd) or 0), 0)
+        (cmd,) = calls
+        self.assertEqual(cmd[1], str(HERE / "eval.py"))
+        joined = " ".join(cmd)
+        for part in ("--suite manifest", f"--manifest {self.root.resolve() / 'manifest.jsonl'}", "--models dfn3", "--asr --asr-backend parakeet", "--gates-profile oto1.isolate", f"--out {self.root.resolve() / 'eval-out'}", "--asr-quantization int8"):
+            self.assertIn(part, joined)
+        self.assertEqual(cmd[-1], "--strict")
+        self.assertEqual(krisp_bench.parse_args(["eval"]).models, "dfn3,dpdfnet,nearfield")
+
+
+class KrispEvalIntegrationTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix="oto-krisp-eval-")
+        self.root = make_krisp_data(Path(self.tmp.name) / "krisp")
+        self.gates = harness.load_toml(HERE / "gates.toml")
+        self.models = harness.load_models(REPO / "MODELS.toml")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_manifest_suite_scores_krisp_rows(self):
+        m = krisp_bench.write_manifest(krisp_bench.build_manifest(self.root), self.root / "manifest.jsonl")
+        entries = harness.read_manifest(m)
+        fake = FakeTimedAsr()
+        rows = harness.run_manifest(entries, [self.models["dfn3"]], ["balanced"], harness.OracleProcessor(), self.gates, Path(self.tmp.name) / "run", "oto1.isolate", fake, None, quiet_log, normalizer=krisp.KrispNormalizer("stdlib"), n_boot=100)
+        (row,) = rows
+        mt = row["metrics"]
+        self.assertEqual(mt["krisp_files"], 3)
+        self.assertEqual(mt["krisp_speakers"], 2)
+        self.assertEqual(mt["krisp_wer_pct"], 0.0)  # model output: clean transcript
+        self.assertEqual(mt["secondary_leaked_words_per_min"], 0.0)
+        self.assertGreater(mt["raw_secondary_leaked_words_per_min"], 100)
+        self.assertEqual(mt["krisp_default_krisp_files"], 2)
+        self.assertEqual(mt["krisp_references"], ["krisp_default", "raw"])
+        self.assertLess(mt["secondary_leaked_words_per_min_delta_vs_krisp_default"], 0)
+        self.assertLess(mt["krisp_wer_pct_delta_vs_raw"], 0)
+        self.assertEqual(mt["phone_calls_krisp_wer_pct"], 0.0)
+        by = {c["gate"]: c for c in row["checks"]}
+        self.assertEqual(by["max_phone_calls_krisp_wer_pct"]["status"], "pass")
+        self.assertEqual(by["max_krisp_wer_pct_delta_vs_krisp_default_ci_lo"]["status"], "pass")
+        self.assertEqual(by["max_secondary_leaked_words_per_min_delta_vs_krisp_default_ci_hi"]["status"], "pass")
+        self.assertEqual(by["min_krisp_files"]["status"], "fail")  # 3 of 265 files
+        self.assertEqual(by["min_krisp_speakers"]["status"], "fail")
+        self.assertEqual(mt["krisp_matched_files_vs_krisp_default"], 2)
+        self.assertEqual(mt["krisp_matched_speakers_vs_krisp_default"], 2)
+        self.assertEqual(by["min_krisp_matched_files_vs_krisp_default"]["status"], "fail")
+        self.assertEqual(by["min_krisp_matched_speakers_vs_krisp_default"]["status"], "fail")
+        self.assertEqual(by["max_heap_allocations_per_frame"]["status"], "missing")
+        # raw, baseline and model each transcribed once per clip (baselines are not re-run per row)
+        self.assertEqual(len(fake.calls), 3 + 2 + 3)
+        report = {"meta": {"date": "d", "processor": "oracle", "platform": "p", "gates": "gates.toml", "asr": fake.config}, "hashes": [], "results": rows}
+        report["summary"] = harness.summarize(rows, [], strict=False)
+        md = harness.markdown(report)
+        self.assertIn("### Krisp Voice Isolation Benchmark scoring", md)
+        self.assertIn("| **dfn3 / balanced** | 3 / 2 |", md)
+        self.assertIn("↳ Δ vs krisp_default", md)
+
+    def test_word_times_are_shifted_by_the_chain_delay(self):
+        e = harness.read_manifest(krisp_bench.write_manifest(krisp_bench.build_manifest(self.root, scenarios=["work"]), self.root / "m.jsonl"))[0]
+
+        class Late:
+            def transcribe_words(self, p):  # one background word just after the secondary region ends, in output time
+                return "please call me back at 8:45 tv", [("please", 0.1, 0.2), ("tv", 2.38, 2.42)]
+
+        inp = read_wav(e["noisy"])
+        c0 = harness.clip_metrics(e, inp, inp, 0, Path(e["noisy"]), Late(), "", None, krisp.KrispNormalizer("stdlib"))
+        c1 = harness.clip_metrics(e, inp, inp, 2400, Path(e["noisy"]), Late(), "", None, krisp.KrispNormalizer("stdlib"))  # 50 ms at 48 kHz
+        self.assertEqual((c0["krisp"]["leak"], c1["krisp"]["leak"]), (0, 1))
+
+    def test_baseline_dnsmos_deltas(self):
+        clips = [{"id": f"c{k}", "kind": "speech", "duration_s": 1, "nan_count": 0, "clip_count": 0, "speaker_id": f"s{k % 2}", "dnsmos_sig": 3.5, "dnsmos_ovr": 3.0, "baseline_dnsmos": {"krisp_nc": {"dnsmos_sig": 3.4, "dnsmos_ovr": 3.1, "dnsmos_bak": 4.0}}} for k in range(4)]
+        a = harness.aggregate_manifest(clips, n_boot=50)
+        self.assertAlmostEqual(a["dnsmos_sig_delta_vs_krisp_nc"], 0.1)
+        self.assertAlmostEqual(a["dnsmos_ovr_delta_vs_krisp_nc_ci_hi"], -0.1)
+        self.assertNotIn("dnsmos_bak_delta_vs_krisp_nc", a)  # the model row has no BAK
+        checks = {c["gate"]: c["status"] for c in harness.evaluate_gates(a, self.gates["oto1"]["clean"])}
+        self.assertEqual((checks["min_dnsmos_sig_delta_vs_krisp_nc_ci_hi"], checks["min_dnsmos_ovr_delta_vs_krisp_nc_ci_hi"]), ("pass", "fail"))
+
+
+class Oto1GateTests(unittest.TestCase):
+    def test_plan_0004_gates(self):
+        g = harness.load_toml(HERE / "gates.toml")
+        self.assertIn("ci", g)  # older sections untouched
+        self.assertIn("opt_in", g["voice_isolation"])
+        o = g["oto1"]
+        self.assertEqual((o["sample_rate_hz"], o["n_fft"], o["hop"]), (48000, 1024, 512))
+        clean, iso = o["clean"], o["isolate"]
+        self.assertEqual(clean["max_chain_latency_ms"], 21.33)
+        self.assertEqual(clean["max_macos_e2e_latency_ms"], 40.0)
+        self.assertEqual(clean["max_bench_cpu_percent"], 5.0)
+        self.assertEqual(clean["max_heap_allocations_per_frame"], 0)
+        self.assertEqual(clean["max_wasm_brotli_bytes"], 1_500_000)
+        self.assertEqual((clean["max_browser_paced_p99_ms"], clean["max_browser_racing_mean_ms"]), (2.0, 0.5))
+        self.assertEqual(clean["min_dnsmos_bak_delta_vs_krisp_nc"], -0.1)
+        self.assertEqual(clean["max_target_wer_delta"], 0.002)
+        self.assertLessEqual(clean["max_chain_latency_ms"] * 512 / 1000 * 48000 / 512, 1024 + 1)  # 21.33 ms ≈ 1024 samples
+        self.assertEqual(iso["max_chain_latency_ms"], 21.33)
+        self.assertEqual(iso["max_phone_calls_krisp_wer_pct"], 4.15)
+        self.assertEqual(iso["max_krisp_wer_pct_delta_vs_krisp_default_ci_lo"], 0.0)
+        self.assertLess(iso["max_secondary_leaked_words_per_min_delta_vs_krisp_default_ci_hi"], 0.0)
+        self.assertEqual((iso["min_krisp_files"], iso["min_krisp_speakers"]), (265, 47))
+        self.assertEqual((iso["min_krisp_matched_files_vs_krisp_default"], iso["min_krisp_matched_speakers_vs_krisp_default"]), (265, 47))
+        # Gate names must match metric names krisp.py / eval.py produce.
+        produced = set(krisp.summary_metrics([krow("phone_calls/1", "a", 9, 1, leak=1, bgmin=1.0, scen="phone_calls")], n_boot=5))
+        produced |= set(krisp.delta_metrics([krow("x", "a", 9, 1, leak=1, bgmin=1.0)], [krow("x", "a", 9, 1, leak=1, bgmin=1.0)], "krisp_default", n_boot=5))
+        for k in ("max_phone_calls_krisp_wer_pct", "max_krisp_wer_pct_delta_vs_krisp_default_ci_lo", "max_secondary_leaked_words_per_min_delta_vs_krisp_default_ci_hi", "min_krisp_files", "min_krisp_speakers", "min_krisp_matched_files_vs_krisp_default", "min_krisp_matched_speakers_vs_krisp_default"):
+            self.assertIn(k[4:], produced, k)
+        self.assertEqual(krisp_bench.baseline_name("vi_2_5_default"), "krisp_default")
+
+    def test_check_published_fails_on_incomplete_condition_and_token_unredirected(self):
+        # 265 raw matching published WER, but only 264 krisp default clips -> must fail!
+        scores = {
+            "raw": {"files": 265, "wer": 23.21, "leak": 66.48},
+            "vi_2_5_default": {"files": 264, "wer": 5.30, "leak": 1.52},
+        }
+        checks = krisp_bench.check_published(scores, required=["raw", "vi_2_5_default"])
+        by = {c["cond"]: c for c in checks}
+        self.assertTrue(by["raw"]["ok"])
+        self.assertFalse(by["vi_2_5_default"]["ok"])
+        self.assertIn("264/265", by["vi_2_5_default"]["reason"])
+
+        # Alias `krisp_default`, `default`, and `krisp_vi_2_5_default` all resolve to `vi_2_5_default`, and collisions fail.
+        alias_scores = {"raw": scores["raw"], "krisp_default": scores["vi_2_5_default"]}
+        alias_checks = {c["cond"]: c for c in krisp_bench.check_published(alias_scores, required=["raw", "krisp_default"])}
+        self.assertFalse(alias_checks["vi_2_5_default"]["ok"])
+        self.assertEqual(krisp_bench.canonical_cond("default"), "vi_2_5_default")
+        self.assertEqual(krisp_bench.canonical_cond("krisp_vi_2_5_default"), "vi_2_5_default")
+        with self.assertRaises(ValueError):
+            krisp_bench.check_published({"krisp_default": scores["vi_2_5_default"], "vi_2_5_default": scores["vi_2_5_default"]})
+
+        # Duplicate or missing/null clip IDs must be rejected before scoring/pairing so coverage cannot be spoofed.
+        dup = [krow("x", "a", 9, 1), krow("x", "a", 9, 1)]
+        with self.assertRaises(ValueError):
+            krisp.summary_metrics(dup, n_boot=5)
+        with self.assertRaises(ValueError):
+            krisp.paired_bootstrap(dup, [krow("x", "a", 9, 1)], n_boot=5)
+        null_id = [krow("x", "a", 9, 1), {**krow("y", "a", 9, 1), "i": None}]
+        with self.assertRaises(ValueError):
+            krisp.summary_metrics(null_id, n_boot=5)
+        with self.assertRaises(ValueError):
+            krisp.paired_bootstrap(null_id, null_id, n_boot=5)
+
+        old = os.environ.get("HF_TOKEN")
+        try:
+            os.environ["HF_TOKEN"] = "secret-token"
+            hf_req = krisp_bench._request("https://huggingface.co/datasets/Krisp-AI/x")
+            self.assertNotIn("Authorization", hf_req.headers)
+            self.assertEqual(hf_req.unredirected_hdrs.get("Authorization"), "Bearer secret-token")
+            other_req = krisp_bench._request("https://example.com/file.wav")
+            self.assertNotIn("Authorization", other_req.headers)
+            self.assertNotIn("Authorization", other_req.unredirected_hdrs)
+        finally:
+            if old is None:
+                os.environ.pop("HF_TOKEN", None)
+            else:
+                os.environ["HF_TOKEN"] = old
+
+    def test_cached_score_with_alias_preserves_paired_deltas(self):
+        with tempfile.TemporaryDirectory(prefix="oto-krisp-alias-") as td:
+            root = make_krisp_data(Path(td) / "krisp")
+            fake = FakeTimedAsr()
+            entries = krisp_bench.build_manifest(root)
+            tag = krisp_bench.run_asr(entries, ["raw", "krisp_default"], fake, root, quiet_log)
+            alias_cf = krisp_bench.cache_file(root, tag, "krisp_default")
+            self.assertTrue(alias_cf.is_file())
+            # A partial canonical cache must not shadow the explicitly requested alias cache.
+            canon_cf = krisp_bench.cache_file(root, tag, "vi_2_5_default")
+            alias_data = json.loads(alias_cf.read_text())
+            first_id = next(iter(alias_data))
+            canon_cf.write_text(json.dumps({first_id: alias_data[first_id]}))
+            args = krisp_bench.parse_args(["score", "--data-dir", str(root), "--cond", "raw", "--cond", "krisp_default", "--reference", "krisp_default", "--normalizer", "stdlib", "--bootstrap", "20", "--name", "alias"])
+            rc = krisp_bench.cmd_score(args, quiet_log, fake.config)
+            self.assertEqual(rc, 0)
+            rep = json.loads((root / "reports" / "alias.json").read_text())
+            self.assertEqual(rep["scores"]["vi_2_5_default"]["files"], len(alias_data))
+            vs = rep["scores"]["raw"].get("vs_reference")
+            self.assertIsNotNone(vs)
+            self.assertEqual(vs["reference"], "vi_2_5_default")
+            self.assertIn("wer", vs)
+            self.assertIn("leak", vs)
 
 
 def _live_oto():

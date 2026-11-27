@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Oto-1 WASM AudioWorklet demo</title>
+<style>
+  body { font: 14px/1.4 system-ui, sans-serif; max-width: 60rem; margin: 2rem auto; padding: 0 1rem; }
+  fieldset { display: flex; flex-wrap: wrap; gap: .75rem 1.5rem; align-items: center; border: 1px solid #8884; }
+  button { padding: .35rem .8rem; }
+  pre { background: #8881; padding: .75rem; height: 26rem; overflow: auto; white-space: pre-wrap; }
+  #stats { font-family: ui-monospace, monospace; min-height: 1.4em; }
+</style>
+</head>
+<body>
+<h1>Oto-1 in an AudioWorklet</h1>
+<p>Pure-Rust Oto-1 kernel compiled to <code>wasm32-unknown-unknown</code> (no wasm-bindgen, zero imports), run one
+512-sample hop per four 128-sample render quanta inside the worklet. Random weights unless you pick a
+<code>.otow</code> file. Chain delay 1024 samples (21.33 ms) plus the browser's own context and device latency.</p>
+
+<fieldset>
+  <label>Model <select id="arch"><option value="1">Candidate A (DFN-style)</option><option value="2">Candidate B (FastEnhancer-style)</option></select></label>
+  <label>Build <select id="build"><option value="auto">auto (SIMD probe)</option><option value="simd">simd128</option><option value="scalar">scalar</option></select></label>
+  <label>Wasm into worklet as <select id="transfer"><option value="module">Module (bytes fallback)</option><option value="bytes">bytes</option></select></label>
+  <label>Weights <input type="file" id="weights" accept=".otow"></label>
+  <label>Paced seconds <input type="number" id="paced" value="10" min="1" max="120" style="width:4rem"></label>
+</fieldset>
+<p>
+  <button id="bench">Worker benchmark (racing + paced)</button>
+  <button id="offline">OfflineAudioContext through the worklet</button>
+  <button id="live">Start live mic</button>
+  <button id="stop">Stop</button>
+  <label><input type="checkbox" id="bypass"> bypass (matched delay)</label>
+</p>
+<div id="stats"></div>
+<pre id="log"></pre>
+<script src="main.js" type="module"></script>
+</body>
+</html>

@@ -11,6 +11,8 @@ pub mod filters;
 mod nearfield;
 #[cfg(feature = "onnx")]
 mod onnx;
+#[cfg(feature = "oto1")]
+pub mod oto1;
 mod rnnoise;
 pub mod signal;
 
@@ -23,6 +25,8 @@ pub use nearfield::Nearfield;
 pub use onnx::DpdfNet;
 #[cfg(feature = "fastenhancer")]
 pub use onnx::FastEnhancer;
+#[cfg(feature = "oto1")]
+pub use oto1::Oto1;
 pub use rnnoise::RnNoise;
 
 use filters::{Delay, HighPass, Limiter};

@@ -258,6 +258,75 @@ def overlap_leakage_db(inp, out, interferer, rate: int, clean=None) -> float | N
     return to_db(p_out / p_in)
 
 
+HIGH_BAND_HZ = 16000.0
+
+
+def band_power_spectrum(x, rate: int, nfft: int = 1024, max_frames: int = 256) -> list[float]:
+    """Mean Hann-windowed power spectrum (nfft/2+1 bins) over at most `max_frames` frames
+    spread evenly across the signal. numpy when installed; the stdlib FFT otherwise."""
+    n = len(x)
+    if n < nfft:
+        return []
+    hop = nfft // 2
+    starts = list(range(0, n - nfft + 1, hop))
+    if len(starts) > max_frames:
+        step = len(starts) / max_frames
+        starts = [starts[int(i * step)] for i in range(max_frames)]
+    win = [0.5 - 0.5 * math.cos(2.0 * math.pi * k / nfft) for k in range(nfft)]
+    bins = nfft // 2 + 1
+    if _np is not None:
+        arr = _np.asarray(x, dtype=_np.float64)
+        arr = _np.where(_np.isfinite(arr), arr, 0.0)
+        frames = _np.stack([arr[s : s + nfft] for s in starts]) * _np.asarray(win)
+        return (_np.abs(_np.fft.rfft(frames, axis=1)) ** 2).mean(axis=0).tolist()
+    acc = [0.0] * bins
+    for s in starts:
+        spec = _fft([complex((x[s + k] if math.isfinite(x[s + k]) else 0.0) * win[k]) for k in range(nfft)])
+        for f in range(bins):
+            acc[f] += spec[f].real ** 2 + spec[f].imag ** 2
+    return [v / len(starts) for v in acc]
+
+
+def band_energy_ratio_db(x, rate: int, f_lo: float = HIGH_BAND_HZ, f_hi: float | None = None, nfft: int = 1024, max_frames: int = 256) -> float | None:
+    """Energy in [f_lo, f_hi) relative to the whole spectrum, in dB (FLOOR_DB when the band is
+    empty, None when the signal is silent, too short, or its Nyquist is at or below `f_lo`).
+    With the defaults this is the >16 kHz content check for Oto-1's 48 kHz fullband gate: a
+    16 kHz-band model resampled to 48 kHz scores near the floor, real fullband speech about
+    −25 to −50 dB."""
+    if rate / 2 <= f_lo:
+        return None
+    spec = band_power_spectrum(x, rate, nfft, max_frames)
+    if not spec:
+        return None
+    total = math.fsum(spec)
+    if total <= 1e-20:
+        return None
+    hz = rate / nfft
+    band = math.fsum(p for f, p in enumerate(spec) if f * hz >= f_lo and (f_hi is None or f * hz < f_hi))
+    return to_db(band / total)
+
+
+def high_band_metrics(inp, in_rate: int, out, out_rate: int, min_input_db: float = -70.0) -> dict:
+    """`high_band_16k_db` (output's >16 kHz share) and `high_band_16k_delta_db` (output minus
+    input share) when the input is fullband: rate ≥ 44.1 kHz and >16 kHz content above
+    `min_input_db`. Band-limited inputs (the 32 kHz Krisp set, phone audio) return {}, so the
+    gate reports them as missing rather than failing a model for its input. When the input is
+    fullband and the output rate is below 44.1 kHz, the output cannot carry >16 kHz content and
+    scores `FLOOR_DB` so the fullband gate fails rather than being skipped."""
+    if in_rate < 44100:
+        return {}
+    a = band_energy_ratio_db(inp, in_rate)
+    if a is None or a < min_input_db:
+        return {}
+    if out_rate < 44100:
+        b = FLOOR_DB
+    else:
+        b = band_energy_ratio_db(out, out_rate)
+        if b is None:
+            return {}
+    return {"input_high_band_16k_db": a, "high_band_16k_db": b, "high_band_16k_delta_db": b - a}
+
+
 def median(values):
     v = sorted(values)
     if not v:

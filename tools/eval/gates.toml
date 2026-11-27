@@ -173,3 +173,68 @@ max_target_wer_delta = 0.01
 max_speech_onset_miss_rate = 0.005
 max_noise_only_hallucinated_words_per_min = 0.25
 max_macos_e2e_latency_ms = 65.0        # no worse than DeepFilterNet3's latency class
+
+# ---------------------------------------------------------------------------------------------
+# Oto-1 (docs/plans/0004-oto-v1-model-and-wasm.md, "What 'beat Krisp' means"). Written in Phase 0
+# and frozen before training starts: never loosen a gate in the change that lets a checkpoint
+# through. Units: `*_pct` are percent, `*_ms` milliseconds, `target_wer_delta` a fraction.
+# Gates whose metric no report produces yet (browser, allocation counters, Krisp NC deltas) show
+# as "missing" and fail only with `--strict`.
+
+[oto1]
+plan = "docs/plans/0004-oto-v1-model-and-wasm.md"
+frozen = false                         # flip once Phase 0 (Krisp rows reproduced, baselines scored) is done
+sample_rate_hz = 48000
+n_fft = 1024
+hop = 512
+# Krisp references (Parakeet TDT 0.6B v2, Krisp's normalisation, all 265 files):
+# raw 23.21% WER / 66.48 leaked w/min; Krisp VI 2.5 Default 5.30% / 1.52, missed 4.21%;
+# phone-call subset raw 3.82%, Krisp Default 4.15%. Reproduced by `krisp_bench.py reproduce`.
+
+[oto1.clean]
+# Oto-1 Clean: 48 kHz noise + reverb removal, the next default model.
+max_chain_latency_ms = 21.33           # 1024/512 sqrt-Hann STFT, 0 lookahead
+max_macos_e2e_latency_ms = 40.0        # inline in the Core Audio callback (DFN3 today ~62 ms)
+max_bench_cpu_percent = 5.0            # one M-series core, inline
+max_heap_allocations_per_frame = 0
+max_wasm_brotli_bytes = 1_500_000      # wasm + f16 weights
+max_browser_paced_p99_ms = 2.0         # per 10.67 ms hop, 2020-class laptop, AudioWorklet
+max_browser_racing_mean_ms = 0.5
+browser_quantum_ceiling_ms = 2.67      # hard limit of one 128-sample render quantum (not a gate)
+# 48 kHz fullband: measured content above 16 kHz on fullband input (metrics.high_band_metrics).
+# A 16 kHz-band model resampled to 48 kHz lands near −100 dB; real fullband speech −25 to −50 dB.
+min_high_band_16k_db = -60.0
+min_high_band_16k_delta_db = -20.0     # provisional: how far the >16 kHz share may drop vs the input
+# Noise quality vs Krisp NC on identical files (paired, speaker bootstrap). "Not lower at 95%
+# confidence" = the interval of (Oto − Krisp NC) reaches 0 or above. Needs the Krisp NC outputs
+# captured in Phase 0 as the `krisp_nc` baseline.
+min_dnsmos_sig_delta_vs_krisp_nc_ci_hi = 0.0
+min_dnsmos_ovr_delta_vs_krisp_nc_ci_hi = 0.0
+min_dnsmos_bak_delta_vs_krisp_nc = -0.1
+max_target_wer_delta = 0.002           # clean-speech WER regression ≤ 0.2 points
+# Interim, until Krisp NC outputs exist: beat DeepFilterNet3 on the manifest suite at ≤ 40 ms
+# macOS e2e and lower CPU (same bar as [voice_isolation.default_promotion]).
+
+[oto1.isolate]
+# Oto-1 Isolate: background-voice removal. Krisp numbers from the Krisp Voice Isolation
+# Benchmark in strict streaming mode; never select checkpoints on that set. The manifest built
+# by `krisp_bench.py manifest` names Krisp's published output `krisp_default` as a baseline.
+max_chain_latency_ms = 21.33           # Phase 2.5 tries an asymmetric window for ≤ 16 ms
+stretch_max_chain_latency_ms = 16.0    # not a gate
+max_macos_e2e_latency_ms = 40.0
+max_bench_cpu_percent = 5.0
+max_heap_allocations_per_frame = 0
+# WER not significantly worse than Krisp VI 2.5 Default: the lower end of the paired 95%
+# interval of (Oto − Krisp) WER must not be above 0.
+max_krisp_wer_pct_delta_vs_krisp_default_ci_lo = 0.0
+# Leak significantly better: the upper end of the (Oto − Krisp) leak interval must be below 0
+# (−0.01 so that two leak-free systems, an interval of exactly [0, 0], do not count as better).
+max_secondary_leaked_words_per_min_delta_vs_krisp_default_ci_hi = -0.01
+# Do no harm on the phone-call subset (Krisp worsens it 3.82% → 4.15%); stretch: ≤ raw.
+max_phone_calls_krisp_wer_pct = 4.15
+stretch_max_phone_calls_krisp_wer_pct_delta_vs_raw = 0.0   # not a gate
+# The whole benchmark, not a subset: 265 files, bootstrap over all 47 speakers (both candidate and matched Krisp Default reference).
+min_krisp_files = 265
+min_krisp_speakers = 47
+min_krisp_matched_files_vs_krisp_default = 265
+min_krisp_matched_speakers_vs_krisp_default = 47

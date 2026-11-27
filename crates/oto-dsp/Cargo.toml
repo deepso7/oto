@@ -6,7 +6,10 @@ license.workspace = true
 publish.workspace = true
 
 [features]
-default = ["dfn3", "onnx", "fastenhancer", "nearfield"]
+default = ["dfn3", "onnx", "fastenhancer", "nearfield", "oto1"]
+# Oto-1: our own model on a dependency-free pure-Rust kernel (`src/oto1/`). Builds for
+# wasm32-unknown-unknown too: `--no-default-features --features oto1`.
+oto1 = []
 # DeepFilterNet3 via upstream libDF + tract, the default model. Without it the build is
 # RNNoise-only and has no tract.
 dfn3 = ["dep:deep_filter", "dep:ndarray", "dep:tract-core", "dep:tract-onnx", "dep:tract-pulse", "dep:tract-hir"]
@@ -32,3 +35,7 @@ tract-pulse = { version = "=0.21.4", optional = true }
 tract-hir = { version = "=0.21.4", optional = true }
 ort = { version = "=2.0.0-rc.15", default-features = false, features = ["std", "download-binaries", "tls-native", "api-22"], optional = true }
 realfft = { version = "3.5", optional = true }
+
+[[example]]
+name = "oto1_bench"
+required-features = ["oto1"]
