@@ -135,8 +135,6 @@ struct Paint {
     on_hero: Color,
     glyph: Color,
     hero_in: Color,
-    /// The opaque surface dropdown lists draw on, over the glass.
-    menu: Color,
 }
 
 impl Paint {
@@ -189,16 +187,17 @@ impl Paint {
         k.radius.sm = 12.0;
         k.radius.md = 14.0;
         k.radius.lg = 16.0;
-        k.radius.xl = 18.0;
         Paint {
             t,
             k,
             dark,
             accent,
             green: rune::oklch(if dark { 0.74 } else { 0.62 }, 0.17, 152.0),
-            amber: sc
-                .alert
-                .map_or(rune::oklch(if dark { 0.8 } else { 0.7 }, 0.15, 75.0), pick),
+            amber: sc.alert.map_or(
+                // Light mode is darker so the small muted line keeps its contrast on a pale tile.
+                rune::oklch(if dark { 0.8 } else { 0.56 }, 0.14, 70.0),
+                pick,
+            ),
             hair: 1.0 / scale,
             backdrop,
             platter,
@@ -208,7 +207,6 @@ impl Paint {
             on_hero: hex(sc.on_hero),
             glyph: hex(sc.glyph),
             hero_in: hex(sc.hero_in),
-            menu,
         }
     }
 }
@@ -370,7 +368,10 @@ fn pills(
                 .checked(on)
                 .focusable(true)
                 .focus_selected(on)
+                .position_in_set(i + 1, n)
                 .focus_ring(2.0, 1.0, p.accent)
+                .radius(h / 2.0)
+                .hover(if on { Color::TRANSPARENT } else { p.t.hover })
                 .w(seg)
                 .h(h)
                 .center()
@@ -1093,6 +1094,8 @@ fn main_page(s: &State, p: &Paint, layer: &mut Vec<El>) -> El {
         "Off \u{00b7} your microphone passes through"
     } else if s.degraded.is_some() {
         "Muted until it can run again"
+    } else if isolating && !s.offers_isolation() {
+        "Muted \u{00b7} switch to Noise Cancellation"
     } else if s.clients_active && isolating {
         "Keeping only your voice"
     } else if s.clients_active {
@@ -1119,12 +1122,7 @@ fn main_page(s: &State, p: &Paint, layer: &mut Vec<El>) -> El {
         && let Some(list) = layer.pop()
     {
         // As wide as the field, so device names don't truncate in a narrow list.
-        layer.push(
-            list.w(CARD_INNER)
-                .fill(p.menu)
-                .radius(MENU_RADIUS)
-                .continuous_corners(),
-        );
+        layer.push(list.w(CARD_INNER).radius(MENU_RADIUS).continuous_corners());
     }
     let mic_row = labelled(p, "mic-row", "Microphone", device);
     let labels: Vec<&str> = STRENGTHS.iter().map(|(_, l)| *l).collect();
@@ -1243,7 +1241,7 @@ fn hero(s: &State, p: &Paint, title: &str, state_line: &str) -> El {
     let lit = on && !muted;
     let ink = if lit { p.on_hero } else { p.t.text };
     let ink2 = if lit {
-        p.on_hero.alpha(0.78)
+        p.on_hero.alpha(0.94)
     } else if muted {
         p.amber
     } else {
@@ -1255,7 +1253,10 @@ fn hero(s: &State, p: &Paint, title: &str, state_line: &str) -> El {
             .linear_gradient(
                 std::f32::consts::PI * 0.88,
                 // Tinted glass, not paint: the material shows through the hero's colour.
-                [(0.0, p.brand.0.alpha(0.82)), (1.0, p.brand.1.alpha(0.86))],
+                [
+                    (0.0, p.brand.0.mix(p.brand.1, 0.35).alpha(0.86)),
+                    (1.0, p.brand.1.alpha(0.88)),
+                ],
             )
             .border_gradient(p.hair, Color::WHITE.alpha(0.42), Color::WHITE.alpha(0.06))
             .shadow(8.0, 22.0, p.brand.1.alpha(if p.dark { 0.45 } else { 0.32 }));
@@ -1283,9 +1284,14 @@ fn hero(s: &State, p: &Paint, title: &str, state_line: &str) -> El {
             )
             .child(power_button(p, title, on, lit, lit && s.clients_active)),
     );
-    if !lit {
+    if !on {
         return t;
     }
+    let (raw_c, clean_c, label_c) = if lit {
+        (p.hero_in, p.on_hero, p.on_hero.alpha(0.72))
+    } else {
+        (p.t.text_secondary.alpha(0.6), p.t.text, p.t.text_secondary)
+    };
     let mut levels = col()
         .key("meter")
         .w_full()
@@ -1296,7 +1302,7 @@ fn hero(s: &State, p: &Paint, title: &str, state_line: &str) -> El {
             "In",
             "Input level",
             &s.meter.raw,
-            p.hero_in,
+            (raw_c, label_c),
         ))
         .child(meter_row(
             p,
@@ -1304,7 +1310,7 @@ fn hero(s: &State, p: &Paint, title: &str, state_line: &str) -> El {
             "Out",
             "Cleaned level",
             &s.meter.clean,
-            p.on_hero,
+            (clean_c, label_c),
         ));
     if !s.clients_active {
         levels = levels.child(
@@ -1325,7 +1331,7 @@ fn meter_row(
     label: &str,
     a11y: &str,
     live: &rune::Live<[f32; 4]>,
-    color: Color,
+    (color, ink): (Color, Color),
 ) -> El {
     row()
         .key(key)
@@ -1336,7 +1342,7 @@ fn meter_row(
             text(label)
                 .key("label")
                 .font(CAPTION_NUM)
-                .color(Color::WHITE.alpha(0.72))
+                .color(ink)
                 .grow(1.0)
                 .a11y_hidden(),
         )
@@ -1427,12 +1433,7 @@ fn models_card(s: &State, p: &Paint, layer: &mut Vec<El>) -> Option<El> {
     if s.open == Some(Open::Model)
         && let Some(list) = layer.pop()
     {
-        layer.push(
-            list.w(CARD_INNER)
-                .fill(p.menu)
-                .radius(MENU_RADIUS)
-                .continuous_corners(),
-        );
+        layer.push(list.w(CARD_INNER).radius(MENU_RADIUS).continuous_corners());
     }
     Some(
         card(p, "models")
