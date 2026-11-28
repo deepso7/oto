@@ -31,7 +31,7 @@ F_BOTT = 16
 class CandidateBConfig:
     """Exactly the ``.otow`` config keys (``arch`` aside)."""
 
-    channels: int = 32
+    channels: int = 24
     gru_hidden: int = 128
 
     def __post_init__(self):

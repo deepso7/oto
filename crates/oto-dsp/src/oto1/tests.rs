@@ -250,3 +250,91 @@ fn loader_rejects_mismatched_files() {
             .contains("n_erb")
     );
 }
+
+#[test]
+fn conv_matches_naive_convolution() {
+    use super::layers::{Conv, ConvSpec, Source};
+    // (ci, co, k, stride, pad, f_in): every conv shape Oto-1 uses, plus edge cases where no
+    // row is interior or every row is.
+    let specs = [
+        (1, 48, 3, 1, 1, 32),
+        (2, 32, 8, 4, 2, 256),
+        (48, 48, 3, 2, 1, 96),
+        (48, 48, 3, 3, 0, 24),
+        (64, 64, 3, 1, 1, 16),
+        (64, 8, 3, 1, 1, 128),
+        (48, 1, 3, 1, 1, 32),
+        (48, 6, 1, 1, 0, 96),
+        (5, 20, 5, 1, 2, 3),
+        (3, 17, 2, 1, 0, 9),
+    ];
+    for (n, &(ci, co, k, stride, pad, f_in)) in specs.iter().enumerate() {
+        let s = ConvSpec {
+            ci,
+            co,
+            k,
+            stride,
+            pad,
+            f_in,
+        };
+        let mut tensors = Vec::new();
+        let conv = Conv::load(
+            &mut Source::Random(Rng::new(n as u64), &mut tensors),
+            "c",
+            s,
+        )
+        .unwrap();
+        let (w, b) = (&tensors[0].2, &tensors[1].2); // [co][ci][k], [co]
+        let x = noise(f_in * ci, 100 + n as u64, 1.0);
+        // Same summation order as the kernel: bias, then input row t, then channel c.
+        let mut want = vec![0.0f32; s.f_out() * co];
+        for f in 0..s.f_out() {
+            for o in 0..co {
+                let mut acc = b[o];
+                for t in 0..k {
+                    let row = (f * stride + t) as isize - pad as isize;
+                    for c in 0..ci {
+                        let xv = if row >= 0 && (row as usize) < f_in {
+                            x[row as usize * ci + c]
+                        } else {
+                            0.0
+                        };
+                        acc += xv * w[(o * ci + c) * k + t];
+                    }
+                }
+                want[f * co + o] = acc;
+            }
+        }
+        for be in Backend::all() {
+            let mut patch = vec![0.0; conv.patch_len()];
+            let mut y = vec![f32::NAN; conv.out_len()];
+            conv.forward(be, &x, &mut patch, &mut y);
+            let db = err_db(&y, &want);
+            assert!(db <= -90.0, "{be:?} conv {n}: {db:.1} dB");
+            if !matches!(format!("{be:?}").as_str(), "Neon" | "Avx2Fma") {
+                assert_eq!(y, want, "{be:?} conv {n} should be bit-identical");
+            }
+        }
+    }
+}
+
+#[test]
+fn candidate_b_v1_omitted_channels_falls_back_to_32() {
+    use super::arch_b::{ArchB, ConfigB};
+    use super::layers::Source;
+
+    let legacy_cfg = ConfigB {
+        channels: 32,
+        gru_hidden: 128,
+    };
+    let mut tensors = Vec::new();
+    let mut src = Source::Random(Rng::new(5), &mut tensors);
+    let _ = ArchB::build(&mut src, legacy_cfg, Backend::Scalar).unwrap();
+    let mut w = OtowWriter::new(2, DTYPE_F32, 0, r#"{"arch":"oto1-b","gru_hidden":128}"#);
+    for (name, shape, data) in tensors {
+        w.add(&name, &shape, data);
+    }
+    let m = Oto1::from_otow(&w.finish()).unwrap();
+    assert_eq!(m.arch(), Arch::B);
+    assert_eq!(m.params(), 460_233);
+}

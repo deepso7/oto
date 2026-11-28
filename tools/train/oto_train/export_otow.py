@@ -12,7 +12,7 @@
     [28..32)  u32 table_offset
     [32..64)  SHA-256 of bytes [64..EOF)
     [64..64+config_len)  flat canonical JSON config (sorted keys, no whitespace), zero-padded,
-                         e.g. {"arch":"oto1-b","channels":32,"gru_hidden":128}
+                         e.g. {"arch":"oto1-b","channels":24,"gru_hidden":128}
     [table_offset..)     num_tensors x 96-byte entries:
                            [0..64) UTF-8 name, zero-padded (<= 63 bytes)
                            [64..68) u32 ndim (1..=4)
@@ -206,7 +206,10 @@ def load_otow_into_model(path_or_bytes, model: OtoModel | None = None) -> OtoMod
     if o.arch_id not in _ARCH_KEYS:
         raise OtowError(f"unknown arch_id {o.arch_id}")
     if model is None:
-        model = build_model(o.arch_id, **{k: o.config[k] for k in _ARCH_KEYS[o.arch_id] if k in o.config})
+        cfg = {k: o.config[k] for k in _ARCH_KEYS[o.arch_id] if k in o.config}
+        if o.arch_id == 2 and "channels" not in cfg:
+            cfg["channels"] = 32  # v1 omitted-key fallback (new models default to 24 and write it)
+        model = build_model(o.arch_id, **cfg)
     elif model.arch_id != o.arch_id:
         raise OtowError(f"file arch_id {o.arch_id} != model arch_id {model.arch_id}")
     return import_tensors(model, o.tensors).eval()

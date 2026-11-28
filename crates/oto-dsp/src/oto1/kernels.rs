@@ -4,7 +4,9 @@
 //! - [`gemv`]: `y = init + W x` on a [`Matrix`] packed in 16-output column panels. Every backend
 //!   sums each output in the same order (bias first, then `i = 0, 1, …`), so the only difference
 //!   between backends is fused multiply-add: NEON and AVX2 use FMA, scalar, SSE2 and wasm
-//!   `simd128` do not (and are bit-identical to each other).
+//!   `simd128` do not (and are bit-identical to each other). [`gemv_rows`] runs one matrix over
+//!   several input rows (a convolution's interior), sharing each weight load between rows; each
+//!   row's result is exactly [`gemv`]'s. Narrow matrices (`n_out <= 8`) skip the zero padding.
 //! - [`activate`]: sigmoid / tanh / SiLU through one Cephes-style `exp` polynomial, evaluated with
 //!   the same operation sequence on every backend (no FMA), so activations are bit-identical
 //!   everywhere.
@@ -14,7 +16,7 @@
 
 /// Outputs per packed panel.
 pub const PACK: usize = 16;
-/// Most panels a kernel accumulates at once (16 NEON / 8 AVX2 accumulator registers).
+/// Most panels a kernel accumulates at once (see [`Backend::tile`]).
 const MAX_NP: usize = 4;
 
 /// Which kernel implementation runs.
@@ -101,17 +103,55 @@ impl Backend {
         }
     }
 
-    fn max_panels(self) -> usize {
+    /// How [`gemv_rows`] tiles a matrix with `n_out` outputs over `rows` inputs: `(l, r, np)`,
+    /// computing `4 l` lanes of each 16-output panel (`l < 4` only when `n_out <= 8`, skipping
+    /// the zero padding), up to `r` input rows sharing each weight load, `np` panels at a time.
+    ///
+    /// Accumulators live in registers: `r · np · (4 l / lanes)` of them, plus `r` broadcasts of
+    /// `x` and one weight vector. x86_64 (and so V8 / SpiderMonkey wasm on x86_64) has 16 vector
+    /// registers, so SSE2 and `simd128` stay at 12 accumulators or fewer; NEON has 32.
+    // Only the SIMD backends fuse rows; scalar-only builds (e.g. plain wasm32) have no other.
+    #[cfg_attr(
+        not(any(
+            target_arch = "aarch64",
+            target_arch = "x86_64",
+            all(target_arch = "wasm32", target_feature = "simd128")
+        )),
+        allow(unused_variables)
+    )]
+    fn tile(self, n_out: usize, rows: usize) -> (usize, usize, usize) {
+        let l = match n_out {
+            0..=4 => 1,
+            5..=8 => 2,
+            _ => 4,
+        };
         match self {
-            Backend::Scalar => 1,
+            Backend::Scalar => (l, 1, 1),
             #[cfg(target_arch = "aarch64")]
-            Backend::Neon => 4,
+            Backend::Neon => match (l, rows > 1) {
+                (4, false) => (4, 1, 4),
+                (4, true) => (4, 2, 2),
+                _ => (l, 4, 1),
+            },
+            // 8 lanes per register, so a narrow panel is at least one full register.
             #[cfg(target_arch = "x86_64")]
-            Backend::Avx2Fma => 4,
+            Backend::Avx2Fma => match (l, rows > 1) {
+                (4, false) => (4, 1, 4),
+                (4, true) => (4, 2, 2),
+                _ => (2, 4, 1),
+            },
             #[cfg(target_arch = "x86_64")]
-            Backend::Sse2 => 2,
+            Backend::Sse2 => match (l, rows > 1) {
+                (4, false) => (4, 1, 3),
+                (4, true) => (4, 2, 1),
+                _ => (l, 4, 1),
+            },
             #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
-            Backend::Simd128 => 2,
+            Backend::Simd128 => match (l, rows > 1) {
+                (4, false) => (4, 1, 3),
+                (4, true) => (4, 2, 1),
+                _ => (l, 4, 1),
+            },
         }
     }
 }
@@ -168,9 +208,8 @@ impl Matrix {
 pub fn gemv(be: Backend, m: &Matrix, x: &[f32], bias: &[f32], y: &mut [f32]) {
     assert!(be.is_supported(), "CPU does not support backend {be:?}");
     assert!(x.len() >= m.n_in && bias.len() >= m.n_out && y.len() >= m.n_out);
-    // SAFETY: lengths and CPU features checked above; `init` and `y` may alias in `run`, which
-    // reads a panel's init values before it writes that panel.
-    unsafe { run(be, m, x.as_ptr(), bias.as_ptr(), y.as_mut_ptr()) }
+    // SAFETY: lengths and CPU features checked above.
+    unsafe { run(be, m, 1, x.as_ptr(), 0, bias.as_ptr(), y.as_mut_ptr(), 0) }
 }
 
 /// `y += W x`.
@@ -178,194 +217,327 @@ pub fn gemv_acc(be: Backend, m: &Matrix, x: &[f32], y: &mut [f32]) {
     assert!(be.is_supported(), "CPU does not support backend {be:?}");
     assert!(x.len() >= m.n_in && y.len() >= m.n_out);
     let p = y.as_mut_ptr();
-    // SAFETY: as in `gemv`.
-    unsafe { run(be, m, x.as_ptr(), p, p) }
+    // SAFETY: as in `gemv`; `init` and `y` alias, which `run` allows.
+    unsafe { run(be, m, 1, x.as_ptr(), 0, p, p, 0) }
 }
 
-unsafe fn run(be: Backend, m: &Matrix, x: *const f32, init: *const f32, y: *mut f32) {
-    let max = be.max_panels();
+/// `rows` GEMVs against one matrix: `y[r·y_step..][..n_out] = bias + W x[r·x_step..][..n_in]`
+/// for `r = 0..rows` (input rows may overlap, as a convolution's do). Each output is exactly
+/// what [`gemv`] computes for that row; sharing the weight loads across rows is what is faster.
+#[allow(clippy::too_many_arguments)]
+pub fn gemv_rows(
+    be: Backend,
+    m: &Matrix,
+    x: &[f32],
+    x_step: usize,
+    rows: usize,
+    bias: &[f32],
+    y: &mut [f32],
+    y_step: usize,
+) {
+    assert!(be.is_supported(), "CPU does not support backend {be:?}");
+    if rows == 0 {
+        return;
+    }
+    assert!(rows == 1 || y_step >= m.n_out, "output rows overlap");
+    assert!(bias.len() >= m.n_out);
+    let x_need = (rows - 1)
+        .checked_mul(x_step)
+        .and_then(|v| v.checked_add(m.n_in))
+        .expect("gemv_rows input span overflow");
+    let y_need = (rows - 1)
+        .checked_mul(y_step)
+        .and_then(|v| v.checked_add(m.n_out))
+        .expect("gemv_rows output span overflow");
+    assert!(x.len() >= x_need);
+    assert!(y.len() >= y_need);
+    // SAFETY: lengths and CPU features checked above; output rows are disjoint.
+    unsafe {
+        run(
+            be,
+            m,
+            rows,
+            x.as_ptr(),
+            x_step,
+            bias.as_ptr(),
+            y.as_mut_ptr(),
+            y_step,
+        )
+    }
+}
+
+/// Most input rows a kernel accumulates at once.
+const MAX_R: usize = 4;
+type Ptrs<T> = [T; MAX_R];
+
+/// Row `r` reads `x + r·xs` and writes `y + r·ys`; every row starts from `init` (shared), which
+/// may alias `y` only when `rows == 1` (a kernel reads all of its `init` before writing `y`).
+#[allow(clippy::too_many_arguments)]
+unsafe fn run(
+    be: Backend,
+    m: &Matrix,
+    rows: usize,
+    x: *const f32,
+    xs: usize,
+    init: *const f32,
+    y: *mut f32,
+    ys: usize,
+) {
+    let (l, rmax, npmax) = be.tile(m.n_out, rows);
     let mut p = 0;
     while p < m.panels {
-        let np = (m.panels - p).min(max);
-        let mut acc = [[0.0f32; PACK]; MAX_NP];
-        for (q, a) in acc.iter_mut().enumerate().take(np) {
-            for (j, v) in a.iter_mut().enumerate() {
-                let o = (p + q) * PACK + j;
-                if o < m.n_out {
-                    *v = unsafe { *init.add(o) };
-                }
-            }
-        }
+        let np = (m.panels - p).min(npmax);
         let w = unsafe { m.data.as_ptr().add(p * m.n_in * PACK) };
-        unsafe { panels(be, np, w, m.n_in, x, &mut acc) };
-        for (q, a) in acc.iter().enumerate().take(np) {
-            for (j, &v) in a.iter().enumerate() {
-                let o = (p + q) * PACK + j;
-                if o < m.n_out {
-                    unsafe { *y.add(o) = v };
+        let o0 = p * PACK;
+        // Lanes the kernel touches: panels p..p+np, the last one only up to 4 l.
+        let end = o0 + (np - 1) * PACK + 4 * l;
+        let mut r = 0;
+        while r < rows {
+            let rr = [4, 2, 1]
+                .into_iter()
+                .find(|&n| n <= rmax && n <= rows - r)
+                .unwrap();
+            let xp: Ptrs<*const f32> = core::array::from_fn(|q| {
+                if q < rr {
+                    unsafe { x.add((r + q) * xs) }
+                } else {
+                    x
+                }
+            });
+            if end <= m.n_out {
+                // Whole tile inside the output: the kernel reads init and writes y directly.
+                let ip: Ptrs<*const f32> = [unsafe { init.add(o0) }; MAX_R];
+                let yp: Ptrs<*mut f32> = core::array::from_fn(|q| {
+                    if q < rr {
+                        unsafe { y.add((r + q) * ys + o0) }
+                    } else {
+                        y
+                    }
+                });
+                unsafe { kernel(be, rr, l, np, w, m.n_in, &xp, &ip, &yp) };
+            } else {
+                // The tile overhangs n_out: go through a zero-padded copy.
+                let mut tmp = [[0.0f32; PACK * MAX_NP]; MAX_R];
+                let valid = m.n_out - o0;
+                for t in tmp.iter_mut().take(rr) {
+                    for (j, v) in t.iter_mut().enumerate().take(valid) {
+                        *v = unsafe { *init.add(o0 + j) };
+                    }
+                }
+                // Derive ip from the same raw mutable pointer as yp (no overlapping &/&mut).
+                let base = tmp.as_mut_ptr() as *mut f32;
+                let stride = PACK * MAX_NP;
+                let yp: Ptrs<*mut f32> = core::array::from_fn(|q| unsafe { base.add(q * stride) });
+                let ip: Ptrs<*const f32> = core::array::from_fn(|q| yp[q] as *const f32);
+                unsafe { kernel(be, rr, l, np, w, m.n_in, &xp, &ip, &yp) };
+                for (q, t) in tmp.iter().enumerate().take(rr) {
+                    for (j, &v) in t.iter().enumerate().take(valid) {
+                        unsafe { *y.add((r + q) * ys + o0 + j) = v };
+                    }
                 }
             }
+            r += rr;
         }
         p += np;
     }
 }
 
-type Acc = [[f32; PACK]; MAX_NP];
-
-unsafe fn panels(be: Backend, np: usize, w: *const f32, n_in: usize, x: *const f32, acc: &mut Acc) {
-    macro_rules! by_np {
-        ($f:ident) => {
-            match np {
-                1 => $f::<1>(w, n_in, x, acc),
-                2 => $f::<2>(w, n_in, x, acc),
-                3 => $f::<3>(w, n_in, x, acc),
-                _ => $f::<4>(w, n_in, x, acc),
+/// Runs the `(rows, l, panels)` kernel instance of `be`, for each tile [`Backend::tile`] picks.
+#[allow(clippy::too_many_arguments)]
+unsafe fn kernel(
+    be: Backend,
+    r: usize,
+    l: usize,
+    np: usize,
+    w: *const f32,
+    n_in: usize,
+    x: &Ptrs<*const f32>,
+    init: &Ptrs<*const f32>,
+    y: &Ptrs<*mut f32>,
+) {
+    macro_rules! arms {
+        ($f:ident: $(($r:literal, $l:literal, $np:literal)),*) => {
+            match (r, l, np) {
+                $(($r, $l, $np) => $f::<$np, $r, $l>(w, n_in, x, init, y),)*
+                _ => unreachable!("no {} kernel for rows {r}, l {l}, panels {np}", stringify!($f)),
             }
         };
     }
     unsafe {
         match be {
-            Backend::Scalar => by_np!(scalar_panels),
+            Backend::Scalar => arms!(scalar_tile: (1, 1, 1), (1, 2, 1), (1, 4, 1)),
             #[cfg(target_arch = "aarch64")]
-            Backend::Neon => by_np!(neon_panels),
+            Backend::Neon => arms!(neon_tile:
+                (1, 4, 1), (1, 4, 2), (1, 4, 3), (1, 4, 4), (2, 4, 1), (2, 4, 2),
+                (1, 2, 1), (2, 2, 1), (4, 2, 1), (1, 1, 1), (2, 1, 1), (4, 1, 1)),
             #[cfg(target_arch = "x86_64")]
-            Backend::Avx2Fma => by_np!(avx2_panels),
+            Backend::Avx2Fma => arms!(avx2_tile:
+                (1, 4, 1), (1, 4, 2), (1, 4, 3), (1, 4, 4), (2, 4, 1), (2, 4, 2),
+                (1, 2, 1), (2, 2, 1), (4, 2, 1)),
             #[cfg(target_arch = "x86_64")]
-            Backend::Sse2 => by_np!(sse2_panels),
+            Backend::Sse2 => arms!(sse2_tile:
+                (1, 4, 1), (1, 4, 2), (1, 4, 3), (2, 4, 1),
+                (1, 2, 1), (2, 2, 1), (4, 2, 1), (1, 1, 1), (2, 1, 1), (4, 1, 1)),
             #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
-            Backend::Simd128 => by_np!(simd128_panels),
+            Backend::Simd128 => arms!(simd128_tile:
+                (1, 4, 1), (1, 4, 2), (1, 4, 3), (2, 4, 1),
+                (1, 2, 1), (2, 2, 1), (4, 2, 1), (1, 1, 1), (2, 1, 1), (4, 1, 1)),
         }
     }
 }
 
-unsafe fn scalar_panels<const NP: usize>(w: *const f32, n_in: usize, x: *const f32, acc: &mut Acc) {
-    for i in 0..n_in {
-        let xi = unsafe { *x.add(i) };
-        for (p, a) in acc.iter_mut().enumerate().take(NP) {
-            let wp = unsafe { w.add((p * n_in + i) * PACK) };
-            for (j, v) in a.iter_mut().enumerate() {
-                *v += xi * unsafe { *wp.add(j) };
+/// The reference tile: for each of `R` rows, lanes `0..4 L` of panels `0..NP` (relative to `w`,
+/// `init` and `y`), `acc = init`, then `acc += x[i] * w[i]` for `i = 0..n_in`, no FMA.
+unsafe fn scalar_tile<const NP: usize, const R: usize, const L: usize>(
+    w: *const f32,
+    n_in: usize,
+    x: &Ptrs<*const f32>,
+    init: &Ptrs<*const f32>,
+    y: &Ptrs<*mut f32>,
+) {
+    let width = 4 * L;
+    let mut a = [[[0.0f32; PACK]; NP]; R];
+    for r in 0..R {
+        for p in 0..NP {
+            for j in 0..width {
+                a[r][p][j] = unsafe { *init[r].add(p * PACK + j) };
             }
         }
     }
+    for i in 0..n_in {
+        for r in 0..R {
+            let xi = unsafe { *x[r].add(i) };
+            for p in 0..NP {
+                let wp = unsafe { w.add((p * n_in + i) * PACK) };
+                for j in 0..width {
+                    a[r][p][j] += xi * unsafe { *wp.add(j) };
+                }
+            }
+        }
+    }
+    for r in 0..R {
+        for p in 0..NP {
+            for j in 0..width {
+                unsafe { *y[r].add(p * PACK + j) = a[r][p][j] };
+            }
+        }
+    }
+}
+
+/// [`scalar_tile`] in one target's vector registers (`$lanes` floats each). Each weight vector is
+/// loaded once per `i` and used by all `R` rows; per lane the operation order is the reference's.
+#[cfg(any(
+    target_arch = "aarch64",
+    target_arch = "x86_64",
+    all(target_arch = "wasm32", target_feature = "simd128")
+))]
+macro_rules! simd_tile {
+    ($name:ident, $feat:literal, $arch:path, $ty:ty, $lanes:literal,
+     zero = $zero:expr, splat = $splat:expr, load = $load:expr, store = $store:expr,
+     madd = $madd:expr) => {
+        #[target_feature(enable = $feat)]
+        unsafe fn $name<const NP: usize, const R: usize, const L: usize>(
+            w: *const f32,
+            n_in: usize,
+            x: &Ptrs<*const f32>,
+            init: &Ptrs<*const f32>,
+            y: &Ptrs<*mut f32>,
+        ) {
+            use $arch::*;
+            const VPP: usize = PACK / $lanes;
+            let nv = (4 * L).div_ceil($lanes);
+            let x = *x;
+            unsafe {
+                let mut a: [[[$ty; VPP]; NP]; R] = [[[$zero; VPP]; NP]; R];
+                for r in 0..R {
+                    for p in 0..NP {
+                        for k in 0..nv {
+                            a[r][p][k] = $load(init[r].add(p * PACK + k * $lanes));
+                        }
+                    }
+                }
+                for i in 0..n_in {
+                    let mut xv: [$ty; R] = [$zero; R];
+                    for r in 0..R {
+                        xv[r] = $splat(*x[r].add(i));
+                    }
+                    for p in 0..NP {
+                        let wp = w.add((p * n_in + i) * PACK);
+                        for k in 0..nv {
+                            let wv = $load(wp.add(k * $lanes));
+                            for r in 0..R {
+                                a[r][p][k] = $madd(a[r][p][k], wv, xv[r]);
+                            }
+                        }
+                    }
+                }
+                for r in 0..R {
+                    for p in 0..NP {
+                        for k in 0..nv {
+                            $store(y[r].add(p * PACK + k * $lanes), a[r][p][k]);
+                        }
+                    }
+                }
+            }
+        }
+    };
 }
 
 #[cfg(target_arch = "aarch64")]
-#[target_feature(enable = "neon")]
-unsafe fn neon_panels<const NP: usize>(w: *const f32, n_in: usize, x: *const f32, acc: &mut Acc) {
-    use core::arch::aarch64::*;
-    unsafe {
-        let mut a = [[vdupq_n_f32(0.0); 4]; NP];
-        for p in 0..NP {
-            for k in 0..4 {
-                a[p][k] = vld1q_f32(acc[p].as_ptr().add(4 * k));
-            }
-        }
-        for i in 0..n_in {
-            let xv = vdupq_n_f32(*x.add(i));
-            for p in 0..NP {
-                let wp = w.add((p * n_in + i) * PACK);
-                for k in 0..4 {
-                    a[p][k] = vfmaq_f32(a[p][k], vld1q_f32(wp.add(4 * k)), xv);
-                }
-            }
-        }
-        for p in 0..NP {
-            for k in 0..4 {
-                vst1q_f32(acc[p].as_mut_ptr().add(4 * k), a[p][k]);
-            }
-        }
-    }
-}
+simd_tile!(
+    neon_tile,
+    "neon",
+    core::arch::aarch64,
+    float32x4_t,
+    4,
+    zero = vdupq_n_f32(0.0),
+    splat = |c: f32| vdupq_n_f32(c),
+    load = |p: *const f32| vld1q_f32(p),
+    store = |p: *mut f32, v| vst1q_f32(p, v),
+    madd = |a, w, x| vfmaq_f32(a, w, x)
+);
 
 #[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2,fma")]
-unsafe fn avx2_panels<const NP: usize>(w: *const f32, n_in: usize, x: *const f32, acc: &mut Acc) {
-    use core::arch::x86_64::*;
-    unsafe {
-        let mut a = [[_mm256_setzero_ps(); 2]; NP];
-        for p in 0..NP {
-            for k in 0..2 {
-                a[p][k] = _mm256_loadu_ps(acc[p].as_ptr().add(8 * k));
-            }
-        }
-        for i in 0..n_in {
-            let xv = _mm256_set1_ps(*x.add(i));
-            for p in 0..NP {
-                let wp = w.add((p * n_in + i) * PACK);
-                for k in 0..2 {
-                    a[p][k] = _mm256_fmadd_ps(_mm256_loadu_ps(wp.add(8 * k)), xv, a[p][k]);
-                }
-            }
-        }
-        for p in 0..NP {
-            for k in 0..2 {
-                _mm256_storeu_ps(acc[p].as_mut_ptr().add(8 * k), a[p][k]);
-            }
-        }
-    }
-}
+simd_tile!(
+    avx2_tile,
+    "avx2,fma",
+    core::arch::x86_64,
+    __m256,
+    8,
+    zero = _mm256_setzero_ps(),
+    splat = |c: f32| _mm256_set1_ps(c),
+    load = |p: *const f32| _mm256_loadu_ps(p),
+    store = |p: *mut f32, v| _mm256_storeu_ps(p, v),
+    madd = |a, w, x| _mm256_fmadd_ps(w, x, a)
+);
 
 #[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "sse2")]
-unsafe fn sse2_panels<const NP: usize>(w: *const f32, n_in: usize, x: *const f32, acc: &mut Acc) {
-    use core::arch::x86_64::*;
-    unsafe {
-        let mut a = [[_mm_setzero_ps(); 4]; NP];
-        for p in 0..NP {
-            for k in 0..4 {
-                a[p][k] = _mm_loadu_ps(acc[p].as_ptr().add(4 * k));
-            }
-        }
-        for i in 0..n_in {
-            let xv = _mm_set1_ps(*x.add(i));
-            for p in 0..NP {
-                let wp = w.add((p * n_in + i) * PACK);
-                for k in 0..4 {
-                    a[p][k] = _mm_add_ps(a[p][k], _mm_mul_ps(_mm_loadu_ps(wp.add(4 * k)), xv));
-                }
-            }
-        }
-        for p in 0..NP {
-            for k in 0..4 {
-                _mm_storeu_ps(acc[p].as_mut_ptr().add(4 * k), a[p][k]);
-            }
-        }
-    }
-}
+simd_tile!(
+    sse2_tile,
+    "sse2",
+    core::arch::x86_64,
+    __m128,
+    4,
+    zero = _mm_setzero_ps(),
+    splat = |c: f32| _mm_set1_ps(c),
+    load = |p: *const f32| _mm_loadu_ps(p),
+    store = |p: *mut f32, v| _mm_storeu_ps(p, v),
+    madd = |a, w, x| _mm_add_ps(a, _mm_mul_ps(w, x))
+);
 
 #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
-unsafe fn simd128_panels<const NP: usize>(
-    w: *const f32,
-    n_in: usize,
-    x: *const f32,
-    acc: &mut Acc,
-) {
-    use core::arch::wasm32::*;
-    unsafe {
-        let mut a = [[f32x4_splat(0.0); 4]; NP];
-        for p in 0..NP {
-            for k in 0..4 {
-                a[p][k] = v128_load(acc[p].as_ptr().add(4 * k) as *const v128);
-            }
-        }
-        for i in 0..n_in {
-            let xv = f32x4_splat(*x.add(i));
-            for p in 0..NP {
-                let wp = w.add((p * n_in + i) * PACK);
-                for k in 0..4 {
-                    let wv = v128_load(wp.add(4 * k) as *const v128);
-                    a[p][k] = f32x4_add(a[p][k], f32x4_mul(wv, xv));
-                }
-            }
-        }
-        for p in 0..NP {
-            for k in 0..4 {
-                v128_store(acc[p].as_mut_ptr().add(4 * k) as *mut v128, a[p][k]);
-            }
-        }
-    }
-}
+simd_tile!(
+    simd128_tile,
+    "simd128",
+    core::arch::wasm32,
+    v128,
+    4,
+    zero = f32x4_splat(0.0),
+    splat = |c: f32| f32x4_splat(c),
+    load = |p: *const f32| v128_load(p as *const v128),
+    store = |p: *mut f32, v| v128_store(p as *mut v128, v),
+    madd = |a, w, x| f32x4_add(a, f32x4_mul(w, x))
+);
 
 /// Elementwise nonlinearity.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -603,7 +775,11 @@ mod tests {
         let mut r = Rng::new(2);
         for &(o, i) in &[
             (1, 1),
+            (1, 128),
+            (4, 7),
             (6, 48),
+            (8, 192),
+            (9, 20),
             (16, 3),
             (17, 5),
             (48, 144),
@@ -634,6 +810,71 @@ mod tests {
                 assert_eq!(y2, y, "{be:?}: gemv_acc != gemv");
             }
         }
+    }
+
+    #[test]
+    fn gemv_rows_matches_gemv_per_row() {
+        let mut r = Rng::new(4);
+        // Narrow (1 / 4 / 6 / 8 outputs), partial and whole panels, odd row counts, overlapping
+        // input rows (step < n_in, like a strided conv) and padded output rows.
+        for &(o, i, rows, x_step, y_step) in &[
+            (1, 96, 32, 32, 1),
+            (4, 9, 5, 3, 4),
+            (6, 48, 96, 48, 6),
+            (8, 192, 7, 64, 8),
+            (16, 3, 3, 1, 17),
+            (40, 30, 6, 20, 40),
+            (48, 144, 47, 96, 48),
+            (64, 192, 9, 64, 64),
+            (100, 70, 4, 70, 100),
+        ] {
+            let w = rand_vec(&mut r, o * i, 1.0 / (i as f32).sqrt());
+            let x = rand_vec(&mut r, (rows - 1) * x_step + i, 1.0);
+            let b = rand_vec(&mut r, o, 0.1);
+            let m = Matrix::from_rows(&w, o, i);
+            for be in Backend::all() {
+                let mut y = vec![f32::NAN; (rows - 1) * y_step + o];
+                gemv_rows(be, &m, &x, x_step, rows, &b, &mut y, y_step);
+                for row in 0..rows {
+                    let xr = &x[row * x_step..row * x_step + i];
+                    let mut want = vec![0.0; o];
+                    gemv(be, &m, xr, &b, &mut want);
+                    let got = &y[row * y_step..row * y_step + o];
+                    assert_eq!(got, &want[..], "{be:?} {o}x{i} row {row}/{rows}");
+                    // Gaps between output rows are left alone.
+                    assert!(
+                        y[row * y_step + o..((row + 1) * y_step).min(y.len())]
+                            .iter()
+                            .all(|v| v.is_nan())
+                    );
+                    if be == Backend::Scalar {
+                        let naive: Vec<f32> = (0..o)
+                            .map(|a| (0..i).fold(b[a], |s, k| s + w[a * i + k] * xr[k]))
+                            .collect();
+                        assert_eq!(got, &naive[..], "scalar {o}x{i} row {row}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "overflow")]
+    fn gemv_rows_rejects_overflowing_span() {
+        let m = Matrix::from_rows(&[1.0], 1, 1);
+        let x = [1.0];
+        let b = [0.0];
+        let mut y = [0.0; 3];
+        gemv_rows(
+            Backend::Scalar,
+            &m,
+            &x,
+            1usize << (usize::BITS - 1),
+            3,
+            &b,
+            &mut y,
+            1,
+        );
     }
 
     #[test]

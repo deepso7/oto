@@ -19,7 +19,7 @@ Extras: `rir` (pyroomacoustics), `upload` (boto3 for R2, huggingface_hub), `plot
 | `oto_train/models/stft.py` | Shared STFT contract: 48 kHz, `1024/512`, periodic sqrt-Hann, causal 512-sample left pad; batch `stft`/`istft`, `StreamingSTFT`; the pinned 32-band ERB edges |
 | `oto_train/models/layers.py` | The op set the Rust kernel mirrors: freq-only `FreqConv` (+foldable BN, SiLU), grouped `GRULayer`, `group_shuffle`, sub-pixel upsample, `comp` |
 | `oto_train/models/candidate_a.py` | `arch_id = 1` (`oto1-a`), DeepFilterNet-style: 32 ERB gains + 3-tap complex DF on bins `0..96`, 2 grouped GRUs 192/4; 574 328 params |
-| `oto_train/models/candidate_b.py` | `arch_id = 2` (`oto1-b`), FastEnhancer-style: freq-only conv U-Net `512->128->64->32->16`, 2 GRUs 128, bounded complex mask; 460 233 params |
+| `oto_train/models/candidate_b.py` | `arch_id = 2` (`oto1-b`), FastEnhancer-style: freq-only conv U-Net `512->128->64->32->16`, 2 GRUs 128, bounded complex mask; 373 817 params |
 | `oto_train/export_otow.py` | BN folding, `.safetensors` + `.otow` v1 writer, verifying `read_otow`, `load_otow_into_model` (also loads Rust-written files), parity fixtures |
 | `oto_train/losses.py` | Bandwidth-masked multi-res compressed STFT, over-attenuation, band-limited L1, scale-aware silent-target, presence BCE |
 | `oto_train/data/bandwidth.py` | Effective bandwidth (`-50 dB` from peak, Hi-Fi TTS / URGENT method) |
@@ -38,7 +38,7 @@ Convolutions only look along frequency, so the only temporal state is the GRU hi
 
 ## `.otow` v1 and the Rust kernel
 
-The contract is [`crates/oto-dsp/src/oto1/SPEC.md`](../../crates/oto-dsp/src/oto1/SPEC.md): file layout, flat config JSON (`{"arch":"oto1-b","channels":32,"gru_hidden":128}`, plus `meta_*` keys the kernel ignores), tensor names and shapes, features and equations. The models here follow it exactly, so `export_tensors()` is the file's tensor list, and `load_otow_into_model()` loads any v1 file, including the kernel's own random models.
+The contract is [`crates/oto-dsp/src/oto1/SPEC.md`](../../crates/oto-dsp/src/oto1/SPEC.md): file layout, flat config JSON (`{"arch":"oto1-b","channels":24,"gru_hidden":128}`, plus `meta_*` keys the kernel ignores), tensor names and shapes, features and equations. The models here follow it exactly, so `export_tensors()` is the file's tensor list, and `load_otow_into_model()` loads any v1 file, including the kernel's own random models.
 
 `tests/test_rust_parity.py` checks both directions at <= -90 dB (needs `cargo`; the wasm part also needs `node` and `web/demo/wasm/`): the kernel's `target/oto1/random-{a,b}.otow` run in PyTorch (streaming and batch) against `ref-{a,b}-out.f32`, and PyTorch exports (f32, f16, folded random BatchNorm, a `--smoke` checkpoint) run through every native backend with `oto1_bench --eval <model.otow> <in.f32> <out-prefix>` and through both wasm builds.
 

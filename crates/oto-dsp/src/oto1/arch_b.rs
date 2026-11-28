@@ -19,10 +19,13 @@ pub struct ConfigB {
     pub gru_hidden: usize,
 }
 
+/// Legacy v1 fallback width when an older `.otow` file omits `"channels"`.
+const LEGACY_V1_CHANNELS: usize = 32;
+
 impl Default for ConfigB {
     fn default() -> Self {
         Self {
-            channels: 32,
+            channels: 24,
             gru_hidden: 128,
         }
     }
@@ -33,7 +36,7 @@ impl ConfigB {
         let d = Self::default();
         let get = |k: &str, d: usize| o.config_u32(k).map_or(d, |v| v as usize);
         let c = Self {
-            channels: get("channels", d.channels),
+            channels: get("channels", LEGACY_V1_CHANNELS),
             gru_hidden: get("gru_hidden", d.gru_hidden),
         };
         if c.channels == 0 || c.gru_hidden == 0 {
