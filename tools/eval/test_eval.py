@@ -1547,6 +1547,14 @@ class KrispEvalIntegrationTests(unittest.TestCase):
             rep = json.loads((self.root / "reports" / f"merge-{cond_arg}.json").read_text())
             self.assertEqual(rep["scores"]["vi_2_5_default"]["files"], 2)
 
+        # Locked read-merge-replace preserves entries saved concurrently by another run.
+        shared_cf = Path(self.tmp.name) / "shared" / "raw.json"
+        harness._write_json_atomic(shared_cf, {"clip_a": {"text": "a", "words": []}})
+        harness._write_json_atomic(shared_cf, {"clip_b": {"text": "b", "words": []}})
+        self.assertEqual(set(json.loads(shared_cf.read_text())), {"clip_a", "clip_b"})
+        krisp_bench._write_json_atomic(shared_cf, {"clip_c": {"text": "c", "words": []}})
+        self.assertEqual(set(json.loads(shared_cf.read_text())), {"clip_a", "clip_b", "clip_c"})
+
 
 class Oto1GateTests(unittest.TestCase):
     def test_plan_0004_gates(self):

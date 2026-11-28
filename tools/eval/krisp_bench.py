@@ -22,6 +22,10 @@ Download and manifest are stdlib only. `asr` / `reproduce` / `eval` need the `pa
 from __future__ import annotations
 
 import argparse
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows
+    fcntl = None
 import hashlib
 import json
 import os
@@ -262,19 +266,37 @@ def _file_sha256(path: str | Path) -> str:
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
-def _write_json_atomic(path: Path, data: dict) -> None:
+def _write_json_atomic(path: Path, updates: dict) -> None:
+    """Lock `<path>.lock`, re-read current on-disk JSON, merge `updates`, and atomically replace."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
-    try:
-        with os.fdopen(fd, "w") as f:
-            json.dump(data, f)
-        os.replace(tmp_name, path)
-    except BaseException:
+    lock_path = path.with_name(f".{path.name}.lock")
+    with open(lock_path, "a+") as lf:
+        if fcntl is not None:
+            fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
         try:
-            os.unlink(tmp_name)
-        except OSError:
-            pass
-        raise
+            merged: dict = {}
+            if path.is_file():
+                try:
+                    cur = json.loads(path.read_text())
+                    if isinstance(cur, dict):
+                        merged.update(cur)
+                except (OSError, json.JSONDecodeError):
+                    pass
+            merged.update(updates)
+            fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+            try:
+                with os.fdopen(fd, "w") as f:
+                    json.dump(merged, f)
+                os.replace(tmp_name, path)
+            except BaseException:
+                try:
+                    os.unlink(tmp_name)
+                except OSError:
+                    pass
+                raise
+        finally:
+            if fcntl is not None:
+                fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
 
 
 def _valid_word_list(words) -> bool:
@@ -299,7 +321,7 @@ def run_asr(entries: list[dict], conds, transcriber, d: Path, log=print) -> str:
         cf = cache_file(d, tag, canon)
         existing_canon = json.loads(cf.read_text()) if cf.is_file() else {}
         cache = _load_cond_cache(d, tag, cond, canon) or {}
-        merged_dirty = bool(cache) and (not cf.is_file() or any(k not in existing_canon for k in cache))
+        updates: dict = {k: v for k, v in cache.items() if k not in existing_canon}
         todo: list[tuple[dict, str, str]] = []
         for e in entries:
             p = cond_path(e, canon)
@@ -317,13 +339,16 @@ def run_asr(entries: list[dict], conds, transcriber, d: Path, log=print) -> str:
             todo.append((e, p, digest))
         for k, (e, p, digest) in enumerate(todo, 1):
             text, words = asr.transcribe(transcriber, p, True)
-            cache[e["id"]] = {"text": text, "words": words or [], "sha256": digest}
+            entry_out = {"text": text, "words": words or [], "sha256": digest}
+            cache[e["id"]] = entry_out
+            updates[e["id"]] = entry_out
             if k % 20 == 0 or k == len(todo):
-                _write_json_atomic(cf, cache)
-                merged_dirty = False
+                _write_json_atomic(cf, updates)
+                updates.clear()
                 log(f"  asr {canon}: {k}/{len(todo)}")
-        if merged_dirty:
-            _write_json_atomic(cf, cache)
+        if updates:
+            _write_json_atomic(cf, updates)
+            updates.clear()
         if not todo:
             log(f"  asr {canon}: cached ({len(cache)} files)")
     return tag

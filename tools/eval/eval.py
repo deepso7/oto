@@ -14,6 +14,10 @@ from __future__ import annotations
 
 import argparse
 import datetime as _dt
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows
+    fcntl = None
 import hashlib
 import json
 import math
@@ -576,19 +580,37 @@ def _krisp_row(e: dict, text: str, words, normalizer, offset: float = 0.0) -> di
     return krisp.clip_row(e["id"], e.get("scenario") or e.get("dataset") or "", e.get("speaker_id") or e["id"], e["transcript"], text, words, e["segments"], normalizer, offset)
 
 
-def _write_json_atomic(path: Path, data: dict) -> None:
+def _write_json_atomic(path: Path, updates: dict) -> None:
+    """Lock `<path>.lock`, re-read current on-disk JSON, merge `updates`, and atomically replace."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
-    try:
-        with os.fdopen(fd, "w") as f:
-            json.dump(data, f)
-        os.replace(tmp_name, path)
-    except BaseException:
+    lock_path = path.with_name(f".{path.name}.lock")
+    with open(lock_path, "a+") as lf:
+        if fcntl is not None:
+            fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
         try:
-            os.unlink(tmp_name)
-        except OSError:
-            pass
-        raise
+            merged: dict = {}
+            if path.is_file():
+                try:
+                    cur = json.loads(path.read_text())
+                    if isinstance(cur, dict):
+                        merged.update(cur)
+                except (OSError, json.JSONDecodeError):
+                    pass
+            merged.update(updates)
+            fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+            try:
+                with os.fdopen(fd, "w") as f:
+                    json.dump(merged, f)
+                os.replace(tmp_name, path)
+            except BaseException:
+                try:
+                    os.unlink(tmp_name)
+                except OSError:
+                    pass
+                raise
+        finally:
+            if fcntl is not None:
+                fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
 
 
 _KRISP_DATASET = "krisp-voice-isolation-benchmark"
@@ -714,7 +736,8 @@ def run_manifest(entries: list[dict], models: list[ModelSpec], strengths: list[s
     if transcriber:
         normalizer = normalizer or krisp.KrispNormalizer()
         raw_cf, raw_cache, raw_dirty = _load_asr_cache(asr_cache_dir, asr_tag, "raw")
-        base_caches: dict[str, tuple[Path | None, dict, bool, bool]] = {}
+        raw_updates: dict = dict(raw_cache) if raw_dirty else {}
+        base_caches: dict[str, tuple[Path | None, dict, bool, dict]] = {}
         for idx, e in enumerate(entries, 1):
             scored = _krisp_scored(e)
             cid = e["id"]
@@ -737,15 +760,16 @@ def run_manifest(entries: list[dict], models: list[ModelSpec], strengths: list[s
                     write_wav(src, inp_audio.rate, inp_audio.mono, "float32")
                 raw_text[cid], words = _asr.transcribe(transcriber, src, scored)
                 if raw_cf is not None:
-                    raw_cache[cid] = {"text": raw_text[cid], "words": list(words) if words is not None else None, "sha256": raw_sha}
-                    raw_dirty = True
+                    entry_out = {"text": raw_text[cid], "words": list(words) if words is not None else None, "sha256": raw_sha}
+                    raw_cache[cid] = entry_out
+                    raw_updates[cid] = entry_out
             if scored:
                 krisp_raw[cid] = _krisp_row(e, raw_text[cid], words, normalizer)
                 for name, path in (e.get("baselines") or {}).items():
                     if name not in base_caches:
                         bcf, bc, is_known_krisp, bdirty = _baseline_cache(asr_cache_dir, asr_tag, name)
-                        base_caches[name] = (bcf, bc, is_known_krisp, bdirty)
-                    bcf, bc, is_known_krisp, bdirty = base_caches[name]
+                        base_caches[name] = (bcf, bc, is_known_krisp, dict(bc) if bdirty else {})
+                    bcf, bc, is_known_krisp, bupdates = base_caches[name]
                     try:
                         b_sha = _file_sha256(Path(path)) if bcf is not None else None
                     except OSError as err:
@@ -767,17 +791,18 @@ def run_manifest(entries: list[dict], models: list[ModelSpec], strengths: list[s
                             log(f"  baseline {name} {cid}: {err}")
                             continue
                         if bcf is not None:
-                            bc[cid] = {"text": text, "words": list(bwords) if bwords is not None else None, "sha256": b_sha}
-                            base_caches[name] = (bcf, bc, is_known_krisp, True)
+                            b_entry = {"text": text, "words": list(bwords) if bwords is not None else None, "sha256": b_sha}
+                            bc[cid] = b_entry
+                            bupdates[cid] = b_entry
                     krisp_base.setdefault(cid, {})[name] = _krisp_row(e, text, bwords, normalizer)
             if idx % 20 == 0 or idx == len(entries):
-                if raw_dirty and raw_cf is not None:
-                    _write_json_atomic(raw_cf, raw_cache)
-                    raw_dirty = False
-                for name, (bcf, bc, is_known_krisp, bdirty) in list(base_caches.items()):
-                    if bdirty and bcf is not None:
-                        _write_json_atomic(bcf, bc)
-                        base_caches[name] = (bcf, bc, is_known_krisp, False)
+                if raw_updates and raw_cf is not None:
+                    _write_json_atomic(raw_cf, raw_updates)
+                    raw_updates.clear()
+                for bcf, _bc, _is_k, bupdates in base_caches.values():
+                    if bupdates and bcf is not None:
+                        _write_json_atomic(bcf, bupdates)
+                        bupdates.clear()
 
     # DNSMOS of each baseline (e.g. Krisp NC captures), once per clip, for paired deltas.
     base_dnsmos: dict[str, dict[str, dict]] = {}
@@ -797,7 +822,7 @@ def run_manifest(entries: list[dict], models: list[ModelSpec], strengths: list[s
         for strength in strengths:
             clips, errors = [], [calib["error"]] if "error" in calib else []
             m_cf, m_cache = _model_cache(asr_cache_dir, asr_tag, model.key, strength) if transcriber else (None, {})
-            m_dirty = False
+            m_updates: dict = {}
             for idx, e in enumerate(entries, 1):
                 out = work / f"{model.key}__{strength}__{_safe(e['id'])}.wav"
                 try:
@@ -807,8 +832,9 @@ def run_manifest(entries: list[dict], models: list[ModelSpec], strengths: list[s
                     c = clip_metrics(e, read_wav(e["noisy"]), read_wav(out), delay48, out, transcriber, raw_text.get(e["id"]), dnsmos, normalizer, cached_asr=mhit)
                     if m_cf is not None and mhit is None and "hyp" in c:
                         w_out = c.pop("_asr_words", None)
-                        m_cache[e["id"]] = {"text": c["hyp"], "words": list(w_out) if w_out is not None else None, "sha256": digest}
-                        m_dirty = True
+                        m_entry = {"text": c["hyp"], "words": list(w_out) if w_out is not None else None, "sha256": digest}
+                        m_cache[e["id"]] = m_entry
+                        m_updates[e["id"]] = m_entry
                     else:
                         c.pop("_asr_words", None)
                     if e["id"] in krisp_raw:
@@ -822,9 +848,9 @@ def run_manifest(entries: list[dict], models: list[ModelSpec], strengths: list[s
                 except (ProcessError, ValueError, OSError) as err:
                     errors.append(f"{e['id']}: {err}")
                 if idx % 20 == 0 or idx == len(entries):
-                    if m_dirty and m_cf is not None:
-                        _write_json_atomic(m_cf, m_cache)
-                        m_dirty = False
+                    if m_updates and m_cf is not None:
+                        _write_json_atomic(m_cf, m_updates)
+                        m_updates.clear()
                     if len(entries) >= 20:
                         log(f"    {model.key}/{strength}: {idx}/{len(entries)}")
             agg = aggregate_manifest(clips, n_boot)
