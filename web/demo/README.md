@@ -7,6 +7,7 @@ OTO_WASM_TOOLCHAIN=stable crates/oto-wasm/build-wasm.sh   # → web/demo/wasm/ot
 python3 -m http.server -d web/demo 8000                   # then open http://localhost:8000
 node web/demo/bench-node.mjs 5                            # V8 timing + parity without a browser
 node web/demo/bench-node.mjs 5 --weights b24-f16.otow --label B24 --build simd   # time any .otow
+node --test web/demo/worklet.test.mjs                     # worklet hop-ring & overload unit tests
 ```
 
 `OTO_WASM_TOOLCHAIN` is only needed if the pinned toolchain lacks the `wasm32-unknown-unknown` target.
@@ -26,6 +27,7 @@ Files:
   - Supports only 48 kHz. At any other context rate it stays in matched-delay bypass and reports why (the demo doesn't resample).
 - **`bench-worker.js`, `bench-core.js`**: timing in a Worker. "Racing" runs hops back to back. "Paced" runs one hop per 10.67 ms of wall time.
 - **`bench-node.mjs`**: the same timing in Node, plus a parity check against the native reference vectors. `--weights <path.otow>` times a trained or custom-width model instead of the random A/B models (no parity check), `--label <name>` names the row, and `--build simd|scalar|both` picks the builds (default both).
+- **`worklet.test.mjs`**: zero-dependency Node tests (`node --test`) exercising boundary-crossing render quanta, 1024-sample delay, mid-hop `unoverload` recovery + 2-hop refill, non-48 kHz bypass, module→bytes fallback, and zero-alloc percentiles.
 
 Caveats:
 
