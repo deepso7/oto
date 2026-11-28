@@ -334,9 +334,11 @@ def main(argv=None) -> dict:
 
     data_root = rir_root = None
     if not args.smoke and args.data:
-        data_root = stage(args.data, str(Path(args.stage_dir) / "data")) if "://" in args.data else args.data
+        need_stage = "://" in args.data or Path(args.data).suffix == ".tar"
+        data_root = stage(args.data, str(Path(args.stage_dir) / "data")) if need_stage else args.data
     if not args.smoke and args.rir_data:
-        rir_root = stage(args.rir_data, str(Path(args.stage_dir) / "rirs")) if "://" in args.rir_data else args.rir_data
+        need_stage = "://" in args.rir_data or Path(args.rir_data).suffix == ".tar"
+        rir_root = stage(args.rir_data, str(Path(args.stage_dir) / "rirs")) if need_stage else args.rir_data
 
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay, betas=(0.9, 0.99))
 

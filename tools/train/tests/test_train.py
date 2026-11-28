@@ -92,6 +92,50 @@ def test_stage_hf_tar_extracts_and_caches(tmp_path, monkeypatch):
     assert len(calls) == 1 and calls[0][2] == "rirs.tar"
 
 
+def test_main_stages_local_rir_tar(tmp_path):
+    import json
+    import tarfile
+    from dataclasses import asdict
+    import numpy as np
+    import soundfile as sf
+    from oto_train.data import pack_shards as P
+    from oto_train.data.rir_gen import room_split
+    from oto_train.data.stream import SR
+
+    # Minimal valid train + dev speech shards and a local rirs.tar containing train + dev rooms.
+    wav = tmp_path / "s.wav"
+    sf.write(wav, (0.1 * np.random.default_rng(0).standard_normal(SR * 2)).astype(np.float32), SR)
+    it = P.Item(key="vctk_s", source="vctk", path=str(wav), kind="speech", speaker="s", session="s", licence="CC-BY-4.0")
+    key, flac, meta = P.encode_sample(asdict(it))
+    shards_root = tmp_path / "shards"
+    for split in ("train", "dev"):
+        w = P.ShardWriter(str(shards_root / split / f"speech-{split}-%06d.tar"), max_count=10)
+        w.write(key, {"flac": flac, "json": meta})
+        w.close()
+
+    rir_tar = tmp_path / "rirs.tar"
+    train_id = next(i for i in range(100) if room_split(i) == "train")
+    dev_id = next(i for i in range(100) if room_split(i) == "dev")
+    with tarfile.open(rir_tar, "w") as tf:
+        for rid in (train_id, dev_id):
+            p = tmp_path / f"{rid:06d}.npz"
+            near = np.zeros(1024, np.float32)
+            near[16] = 1.0
+            far = np.zeros((1, 1024), np.float32)
+            far[0, 32] = 1.0
+            np.savez(p, near=near, far=far, meta=json.dumps({"direct_idx": [16, 32], "rt60": 0.4}))
+            tf.add(p, arcname=f"rirs/{rid:06d}.npz")
+
+    res = main([
+        "--arch", "b", "--data", str(shards_root), "--rir-data", str(rir_tar),
+        "--stage-dir", str(tmp_path / "stage"), "--ckpt-dir", str(tmp_path / "ckpt"),
+        "--steps", "1", "--batch-size", "1", "--seconds", "1", "--val-every", "1",
+        "--val-batches", "1", "--workers", "0", "--warmup", "1", "--log-every", "1",
+    ])
+    assert res["step"] == 1
+    assert (tmp_path / "stage" / "rirs" / "rirs" / f"{train_id:06d}.npz").exists()
+
+
 def test_run_batch_drops_incomplete_trailing_istft_hop():
     class IdentityStftModel(torch.nn.Module):
         def forward(self, x):
