@@ -14,6 +14,7 @@ import json
 import math
 import random
 import tarfile
+import zipfile
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -139,9 +140,48 @@ def _fit(h: np.ndarray, n: int) -> np.ndarray:
     return h[:n] if len(h) >= n else np.pad(h, (0, n - len(h)))
 
 
+def _read_rir_rt60(path: str) -> tuple[bool, float]:
+    """Read ``meta["rt60"]`` from an RIR ``.npz`` without decompressing the waveforms.
+
+    Returns ``(has_rt60, value)``; synthetic fixtures without an ``rt60`` key return ``(False, 0.0)``.
+    Present-but-null/non-numeric values return ``(True, nan)`` so they are rejected by the filter.
+    """
+    try:
+        with zipfile.ZipFile(path) as zf:
+            missing = {"meta.npy", "near.npy", "far.npy"} - set(zf.namelist())
+            if missing:
+                raise KeyError(f"missing {', '.join(sorted(missing))}")
+            with zf.open("meta.npy") as fh:
+                raw = np.lib.format.read_array(io.BytesIO(fh.read()), allow_pickle=False)
+        meta = json.loads(str(raw))
+    except Exception as e:  # noqa: BLE001
+        raise ValueError(f"invalid RIR archive {path}: {e}") from e
+    if not isinstance(meta, dict):
+        raise ValueError(f"invalid RIR archive {path}: meta must be a JSON object")
+    if "rt60" not in meta:
+        return False, 0.0
+    val = meta["rt60"]
+    if val is None or isinstance(val, bool):
+        return True, float("nan")
+    try:
+        return True, float(val)
+    except (TypeError, ValueError):
+        return True, float("nan")
+
+
 class ShardStream(IterableDataset):
-    def __init__(self, root: str, split: str, seconds: float, rir_dir: str | None = None, seed: int = 0):
+    def __init__(
+        self,
+        root: str,
+        split: str,
+        seconds: float,
+        rir_dir: str | None = None,
+        seed: int = 0,
+        max_rt60: float | None = 1.5,
+    ):
         super().__init__()
+        if max_rt60 is not None and (not math.isfinite(max_rt60) or max_rt60 <= 0):
+            raise ValueError(f"max_rt60 must be positive and finite (or None), got {max_rt60!r}")
         rootp = Path(root) / split
         self.speech = sorted(str(p) for p in rootp.glob("speech-*.tar"))
         self.noise = sorted(str(p) for p in rootp.glob("noise-*.tar")) + sorted(str(p) for p in rootp.glob("music-*.tar"))
@@ -157,6 +197,17 @@ class ShardStream(IterableDataset):
             rirs = [r for r in all_rirs if room_split(int(Path(r).stem)) == split]
             if not rirs:
                 raise FileNotFoundError(f"no RIR .npz files for split {split!r} under {rir_dir}")
+            if max_rt60 is not None:
+                kept = []
+                for r in rirs:
+                    has_rt60, rt60 = _read_rir_rt60(r)
+                    if not has_rt60 or (math.isfinite(rt60) and 0.0 < rt60 <= max_rt60):
+                        kept.append(r)
+                rirs = kept
+                if not rirs:
+                    raise FileNotFoundError(
+                        f"no RIR .npz files for split {split!r} with 0 < rt60 <= {max_rt60} s under {rir_dir}"
+                    )
         else:
             rirs = []
         self.rirs = RirBank(rirs)
