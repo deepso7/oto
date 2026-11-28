@@ -146,6 +146,21 @@ def words_from_tokens(tokens, timestamps, frame_s: float = 0.08) -> list[Word]:
     return [(w, round(a, 4), round(b, 4)) for w, a, b in words if w]
 
 
+def default_parakeet_providers(available) -> list[str]:
+    """Skip macOS CoreMLExecutionProvider (splits FastConformer into ~291 partitions and leaks
+    Metal/CoreML contexts across variable-length clips until OOM) and AzureExecutionProvider."""
+    skip = {"CoreMLExecutionProvider", "AzureExecutionProvider"}
+    return [p for p in available if p not in skip] or ["CPUExecutionProvider"]
+
+
+def parakeet_result_text(result) -> tuple[str, list[Word]]:
+    """Decode an onnx-asr timestamped result; reconstruct text from grouped tokens because
+    onnx-asr's `result.text` drops spaces before currency symbols (£/$/€)."""
+    words = words_from_tokens(result.tokens, result.timestamps)
+    text = " ".join(w for w, _, _ in words) if words else (result.text or "").strip()
+    return text, words
+
+
 class ParakeetTranscriber:
     """NVIDIA Parakeet TDT 0.6B v2 (CC-BY-4.0 weights) through `onnx-asr` (MIT; numpy +
     onnxruntime, no torch or NeMo), with token timestamps for leak scoring. Greedy TDT
@@ -165,8 +180,11 @@ class ParakeetTranscriber:
         model = model or self.DEFAULT_MODEL
         self._np = np
         kw = {"quantization": quantization} if quantization else {}
-        if providers:  # pragma: no cover - hardware dependent
-            kw["providers"] = providers
+        if providers is None:  # pragma: no cover - hardware dependent
+            import onnxruntime as ort
+
+            providers = default_parakeet_providers(ort.get_available_providers())
+        kw["providers"] = providers  # pragma: no cover - hardware dependent
         self._model = onnx_asr.load_model(model, **kw).with_timestamps()  # pragma: no cover - needs weights
         self.config = {"engine": "onnx-asr", "model": model, "quantization": quantization or "fp32", "decoding": "greedy-tdt", "timestamps": True, "vad": False}  # pragma: no cover
 
@@ -183,8 +201,7 @@ class ParakeetTranscriber:
 
     def transcribe_words(self, wav_path: str) -> tuple[str, list[Word]]:  # pragma: no cover - needs model weights
         x, rate = self._load(wav_path)
-        r = self._model.recognize(x, sample_rate=rate)
-        return r.text.strip(), words_from_tokens(r.tokens, r.timestamps)
+        return parakeet_result_text(self._model.recognize(x, sample_rate=rate))
 
     def __call__(self, wav_path: str) -> str:  # pragma: no cover - needs model weights
         return self.transcribe_words(wav_path)[0]

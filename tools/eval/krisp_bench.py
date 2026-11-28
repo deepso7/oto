@@ -22,11 +22,17 @@ Download and manifest are stdlib only. `asr` / `reproduce` / `eval` need the `pa
 from __future__ import annotations
 
 import argparse
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows
+    fcntl = None
+import hashlib
 import json
 import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import urllib.parse
 import urllib.request
 from pathlib import Path
@@ -256,29 +262,105 @@ def cache_file(d: Path, tag: str, cond: str) -> Path:
     return d / "asr" / tag / f"{cond}.json"
 
 
+def _file_sha256(path: str | Path) -> str:
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def _write_json_atomic(path: Path, updates: dict) -> None:
+    """Lock `<path>.lock`, re-read current on-disk JSON, merge `updates`, and atomically replace."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = path.with_name(f".{path.name}.lock")
+    with open(lock_path, "a+") as lf:
+        if fcntl is not None:
+            fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
+        try:
+            merged: dict = {}
+            if path.is_file():
+                try:
+                    cur = json.loads(path.read_text())
+                    if isinstance(cur, dict):
+                        merged.update(cur)
+                except (OSError, json.JSONDecodeError):
+                    pass
+            merged.update(updates)
+            fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+            try:
+                with os.fdopen(fd, "w") as f:
+                    json.dump(merged, f)
+                os.replace(tmp_name, path)
+            except BaseException:
+                try:
+                    os.unlink(tmp_name)
+                except OSError:
+                    pass
+                raise
+        finally:
+            if fcntl is not None:
+                fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
+
+
+def _valid_word_list(words) -> bool:
+    if not isinstance(words, list):
+        return False
+    for item in words:
+        if not isinstance(item, (list, tuple)) or len(item) != 3:
+            return False
+        w, a, b = item
+        if not isinstance(w, str) or isinstance(a, bool) or isinstance(b, bool) or not isinstance(a, (int, float)) or not isinstance(b, (int, float)):
+            return False
+    return True
+
+
 def run_asr(entries: list[dict], conds, transcriber, d: Path, log=print) -> str:
-    """Transcribe every condition with timed words into `<data-dir>/asr/<tag>/<cond>.json`."""
+    """Transcribe every condition with timed words into `<data-dir>/asr/<tag>/<canonical-cond>.json`."""
     import asr
 
     tag = asr_tag(transcriber.config)
     for cond in conds:
-        cf = cache_file(d, tag, cond)
-        cache = json.loads(cf.read_text()) if cf.is_file() else {}
-        todo = [e for e in entries if e["id"] not in cache and cond_path(e, cond)]
-        for k, e in enumerate(todo, 1):
-            text, words = asr.transcribe(transcriber, cond_path(e, cond), True)
-            cache[e["id"]] = {"text": text, "words": words or []}
+        canon = canonical_cond(cond)
+        cf = cache_file(d, tag, canon)
+        existing_canon = json.loads(cf.read_text()) if cf.is_file() else {}
+        cache = _load_cond_cache(d, tag, cond, canon) or {}
+        updates: dict = {k: v for k, v in cache.items() if k not in existing_canon}
+        todo: list[tuple[dict, str, str]] = []
+        for e in entries:
+            p = cond_path(e, canon)
+            if not p:
+                continue
+            digest = _file_sha256(p)
+            existing = cache.get(e["id"])
+            if (
+                isinstance(existing, dict)
+                and isinstance(existing.get("text"), str)
+                and _valid_word_list(existing.get("words"))
+                and (existing.get("sha256") is None or existing.get("sha256") == digest)
+            ):
+                continue
+            todo.append((e, p, digest))
+        for k, (e, p, digest) in enumerate(todo, 1):
+            text, words = asr.transcribe(transcriber, p, True)
+            entry_out = {"text": text, "words": words or [], "sha256": digest}
+            cache[e["id"]] = entry_out
+            updates[e["id"]] = entry_out
             if k % 20 == 0 or k == len(todo):
-                cf.parent.mkdir(parents=True, exist_ok=True)
-                cf.write_text(json.dumps(cache))
-                log(f"  asr {cond}: {k}/{len(todo)}")
+                _write_json_atomic(cf, updates)
+                updates.clear()
+                log(f"  asr {canon}: {k}/{len(todo)}")
+        if updates:
+            _write_json_atomic(cf, updates)
+            updates.clear()
         if not todo:
-            log(f"  asr {cond}: cached ({len(cache)} files)")
+            log(f"  asr {canon}: cached ({len(cache)} files)")
     return tag
 
 
-def rows_for(entries: list[dict], cache: dict, normalizer) -> list[dict]:
-    return [krisp.clip_row(e["id"], e["scenario"], e["speaker_id"], e["transcript"], cache[e["id"]]["text"], cache[e["id"]]["words"], e["segments"], normalizer) for e in entries if e["id"] in cache]
+def _cached_text(entry: dict, reconstruct_words: bool = False) -> str:
+    words = entry.get("words") if reconstruct_words else None
+    return " ".join(w[0] for w in words) if words else entry.get("text", "")
+
+
+def rows_for(entries: list[dict], cache: dict, normalizer, reconstruct_words: bool = False) -> list[dict]:
+    return [krisp.clip_row(e["id"], e["scenario"], e["speaker_id"], e["transcript"], _cached_text(cache[e["id"]], reconstruct_words), cache[e["id"]]["words"], e["segments"], normalizer) for e in entries if e["id"] in cache]
 
 
 _COND_ALIASES = {
@@ -404,6 +486,24 @@ def cmd_asr(args, log=print, transcriber=None) -> int:
     return 0
 
 
+def _load_cond_cache(d: Path, tag: str, cond: str, canon: str) -> dict | None:
+    """Merge any legacy/alias cache and canonical cache for `cond`, with canonical entries winning."""
+    names: list[str] = []
+    if canon in VARIANTS:
+        names.append(baseline_name(canon))
+    if cond != canon and cond not in names:
+        names.append(cond)
+    names.append(canon)
+    merged: dict = {}
+    found = False
+    for n in names:
+        p = cache_file(d, tag, n)
+        if p.is_file():
+            merged.update(json.loads(p.read_text()))
+            found = True
+    return merged if found else None
+
+
 def cmd_score(args, log=print, transcriber_config: dict | None = None) -> int:
     meta: dict = {}
     if args.clips:
@@ -424,14 +524,11 @@ def cmd_score(args, log=print, transcriber_config: dict | None = None) -> int:
             canon = canonical_cond(cond)
             if canon in rows_by_cond:
                 raise BenchError(f"duplicate condition {canon!r} (from {cond!r})")
-            cf = cache_file(d, tag, cond)
-            if not cf.is_file() and canon != cond:
-                alt = cache_file(d, tag, canon)
-                if alt.is_file():
-                    cf = alt
-            if not cf.is_file():
+            cache = _load_cond_cache(d, tag, cond, canon)
+            if cache is None:
+                cf = cache_file(d, tag, canon)
                 raise BenchError(f"no transcripts for {cond} at {cf}; run `krisp_bench.py asr --cond {canon}`")
-            rows_by_cond[canon] = rows_for(entries, json.loads(cf.read_text()), normalizer)
+            rows_by_cond[canon] = rows_for(entries, cache, normalizer, reconstruct_words=(config.get("engine") == "onnx-asr"))
         meta.update(asr=config, normalizer=normalizer.backend)
     if not rows_by_cond:
         raise BenchError("nothing to score")
@@ -462,7 +559,7 @@ def cmd_reproduce(args, log=print) -> int:
 
 
 def eval_command(args, manifest: Path, d: Path) -> list[str]:
-    cmd = [sys.executable, str(HERE / "eval.py"), "--suite", "manifest", "--manifest", str(manifest), "--models", args.models, "--strengths", args.strengths, "--asr", "--asr-backend", args.asr_backend, "--gates-profile", args.gates_profile, "--out", str(Path(args.eval_out).expanduser() if args.eval_out else d / "eval-out"), "--bootstrap", str(args.bootstrap), "--krisp-normalizer", args.normalizer]
+    cmd = [sys.executable, str(HERE / "eval.py"), "--suite", "manifest", "--manifest", str(manifest), "--models", args.models, "--strengths", args.strengths, "--asr", "--asr-backend", args.asr_backend, "--asr-cache-dir", str(d / "asr"), "--gates-profile", args.gates_profile, "--out", str(Path(args.eval_out).expanduser() if args.eval_out else d / "eval-out"), "--bootstrap", str(args.bootstrap), "--krisp-normalizer", args.normalizer]
     if args.asr_model:
         cmd += ["--asr-model", args.asr_model]
     if args.asr_quantization:
