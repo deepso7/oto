@@ -30,6 +30,7 @@ import math
 import os
 import shutil
 import signal
+import tarfile
 import time
 from dataclasses import asdict
 from pathlib import Path
@@ -71,6 +72,15 @@ def _split_remote(url: str) -> tuple[str, str, str]:
     return scheme, bucket, prefix
 
 
+def _extract_tar(tar_path: Path, dst: Path) -> str:
+    """Safely extract a ``.tar`` archive into ``dst`` and return the extracted data directory."""
+    with tarfile.open(tar_path) as tf:
+        tf.extractall(dst, filter="data")
+    tar_path.unlink(missing_ok=True)
+    stem_dir = dst / tar_path.stem
+    return str(stem_dir) if stem_dir.is_dir() else str(dst)
+
+
 def stage(src: str, dst: str) -> str:
     """Copy ``src`` (R2 / HF / local, e.g. Google Drive mount) to local NVMe ``dst`` once."""
     from .data import pack_shards as P
@@ -81,8 +91,12 @@ def stage(src: str, dst: str) -> str:
     hf_repo = hf_path = ""
     if src.startswith("hf://"):
         _, hf_repo, hf_path = _split_remote(src)
-        if hf_path:
+        hf_path = hf_path.strip("/")
+        if hf_path and not hf_path.endswith(".tar"):
             resolved = str(root / hf_path)
+    if src.rstrip("/").endswith(".tar"):
+        stem_dir = root / Path(src.rstrip("/")).stem
+        resolved = str(stem_dir) if stem_dir.is_dir() else str(root)
     marker = root / ".staged"
     staging = root / ".staging"
     if marker.exists() and marker.read_text() == src:
@@ -95,9 +109,19 @@ def stage(src: str, dst: str) -> str:
         _, bucket, prefix = _split_remote(src)
         P.download_r2(bucket, prefix, str(root))
     elif src.startswith("hf://"):
-        P.download_hf(hf_repo, str(root), f"{hf_path}*" if hf_path else None)
+        pattern = None if not hf_path else (hf_path if hf_path.endswith(".tar") else f"{hf_path}/**")
+        P.download_hf(hf_repo, str(root), pattern)
+        if hf_path.endswith(".tar"):
+            resolved = _extract_tar(root / hf_path, root)
     else:
-        shutil.copytree(src, str(root), dirs_exist_ok=True)
+        srcp = Path(src)
+        if srcp.is_file() and srcp.suffix == ".tar":
+            with tarfile.open(srcp) as tf:
+                tf.extractall(root, filter="data")
+            stem_dir = root / srcp.stem
+            resolved = str(stem_dir) if stem_dir.is_dir() else str(root)
+        else:
+            shutil.copytree(src, str(root), dirs_exist_ok=True)
     os.replace(staging, marker)
     print(f"staged {src} -> {resolved} in {time.time() - t0:.0f}s", flush=True)
     return resolved
@@ -135,7 +159,9 @@ def sync_down(remote: str | None, name: str, dst: Path) -> None:
             from huggingface_hub import hf_hub_download
 
             _, repo, sub = _split_remote(remote)
-            shutil.copy2(hf_hub_download(repo, sub + name, repo_type="dataset"), dst)
+            sub_clean = sub.strip("/")
+            remote_file = f"{sub_clean}/{name}" if sub_clean else name
+            shutil.copy2(hf_hub_download(repo, remote_file, repo_type="dataset"), dst)
         elif (Path(remote) / name).exists():
             shutil.copy2(Path(remote) / name, dst)
     except Exception as e:  # noqa: BLE001
@@ -308,9 +334,11 @@ def main(argv=None) -> dict:
 
     data_root = rir_root = None
     if not args.smoke and args.data:
-        data_root = stage(args.data, str(Path(args.stage_dir) / "data")) if "://" in args.data else args.data
+        need_stage = "://" in args.data or Path(args.data).suffix == ".tar"
+        data_root = stage(args.data, str(Path(args.stage_dir) / "data")) if need_stage else args.data
     if not args.smoke and args.rir_data:
-        rir_root = stage(args.rir_data, str(Path(args.stage_dir) / "rirs")) if "://" in args.rir_data else args.rir_data
+        need_stage = "://" in args.rir_data or Path(args.rir_data).suffix == ".tar"
+        rir_root = stage(args.rir_data, str(Path(args.stage_dir) / "rirs")) if need_stage else args.rir_data
 
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay, betas=(0.9, 0.99))
 

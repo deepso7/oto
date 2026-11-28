@@ -834,11 +834,12 @@ def upload_hf(src: str, repo_id: str, path_in_repo: str = "") -> None:
 
     api = HfApi()
     api.create_repo(repo_id, repo_type="dataset", private=True, exist_ok=True)
+    clean_prefix = path_in_repo.strip("/")
     if Path(src).is_file():
-        api.upload_file(path_or_fileobj=src, path_in_repo=path_in_repo + Path(src).name, repo_id=repo_id,
-                        repo_type="dataset")  # fmt: skip
-    elif path_in_repo:
-        api.upload_folder(repo_id=repo_id, folder_path=src, path_in_repo=path_in_repo, repo_type="dataset")
+        dst = f"{clean_prefix}/{Path(src).name}" if clean_prefix else Path(src).name
+        api.upload_file(path_or_fileobj=src, path_in_repo=dst, repo_id=repo_id, repo_type="dataset")
+    elif clean_prefix or not hasattr(api, "upload_large_folder"):
+        api.upload_folder(repo_id=repo_id, folder_path=src, path_in_repo=clean_prefix, repo_type="dataset")
     else:
         api.upload_large_folder(repo_id=repo_id, folder_path=src, repo_type="dataset")
 
