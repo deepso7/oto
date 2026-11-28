@@ -263,7 +263,43 @@ def main(argv=None) -> dict:
     ckpt_dir.mkdir(parents=True, exist_ok=True)
 
     overrides = {k: json.loads(v) for k, v in (kv.split("=", 1) for kv in args.set)}
-    model = build_model(args.arch, **overrides).to(device)
+
+    latest = ckpt_dir / "latest.pt"
+    sync_down(args.sync, "latest.pt", latest)
+    sync_down(args.sync, "best.pt", ckpt_dir / "best.pt")
+
+    def _ckpt_cfg(ck: dict, label: str) -> dict:
+        ck_arch = ck.get("arch")
+        if ck_arch is not None and ck_arch != args.arch:
+            raise ValueError(f"--arch {args.arch!r} conflicts with {label} (arch={ck_arch!r})")
+        ck_cfg = dict(ck.get("model_cfg") or {})
+        if args.arch == "b" and "channels" not in ck_cfg:
+            sd = ck.get("ema") or ck.get("model") or {}
+            if "enc0.conv.weight" in sd:
+                ck_cfg["channels"] = int(sd["enc0.conv.weight"].shape[0])
+        for k, v in overrides.items():
+            if k in ck_cfg and ck_cfg[k] != v:
+                raise ValueError(f"--set {k}={v!r} conflicts with {label} ({k}={ck_cfg[k]!r})")
+        return {**ck_cfg, **overrides}
+
+    resumed_ck = None
+    init_ck = None
+    model_cfg = dict(overrides)
+    if latest.exists():
+        resumed_ck = torch.load(latest, map_location=device, weights_only=True)
+        if args.init_from:
+            ck_init = _norm_path((resumed_ck.get("args") or {}).get("init_from"))
+            if ck_init != _norm_path(args.init_from):
+                raise ValueError(
+                    f"--init-from {args.init_from!r} conflicts with existing {latest} "
+                    f"(initialized from {ck_init!r}); pass a fresh --ckpt-dir for fine-tuning"
+                )
+        model_cfg = _ckpt_cfg(resumed_ck, f"checkpoint {latest}")
+    elif args.init_from:
+        init_ck = torch.load(args.init_from, map_location=device, weights_only=True)
+        model_cfg = _ckpt_cfg(init_ck, f"--init-from {args.init_from}")
+
+    model = build_model(args.arch, **model_cfg).to(device)
     print(model.summary(), flush=True)
 
     data_root = rir_root = None
@@ -283,27 +319,15 @@ def main(argv=None) -> dict:
     ema = EMA(model, args.ema)
     step, best_val = 0, float("inf")
 
-    latest = ckpt_dir / "latest.pt"
-    sync_down(args.sync, "latest.pt", latest)
-    sync_down(args.sync, "best.pt", ckpt_dir / "best.pt")
-    if latest.exists():
-        ck = torch.load(latest, map_location=device, weights_only=True)
-        if args.init_from:
-            ck_init = _norm_path((ck.get("args") or {}).get("init_from"))
-            if ck_init != _norm_path(args.init_from):
-                raise ValueError(
-                    f"--init-from {args.init_from!r} conflicts with existing {latest} "
-                    f"(initialized from {ck_init!r}); pass a fresh --ckpt-dir for fine-tuning"
-                )
-        model.load_state_dict(ck["model"])
-        opt.load_state_dict(ck["opt"])
-        ema.shadow = {k: v.to(device) for k, v in ck["ema"].items()}
-        step, best_val = ck["step"], ck.get("best_val", float("inf"))
-        torch.set_rng_state(ck["rng_cpu"].to(device="cpu", dtype=torch.uint8))
+    if resumed_ck is not None:
+        model.load_state_dict(resumed_ck["model"])
+        opt.load_state_dict(resumed_ck["opt"])
+        ema.shadow = {k: v.to(device) for k, v in resumed_ck["ema"].items()}
+        step, best_val = resumed_ck["step"], resumed_ck.get("best_val", float("inf"))
+        torch.set_rng_state(resumed_ck["rng_cpu"].to(device="cpu", dtype=torch.uint8))
         print(f"resumed from {latest} at step {step} (best val {best_val:.4f})", flush=True)
-    elif args.init_from:
-        ck = torch.load(args.init_from, map_location=device, weights_only=True)
-        model.load_state_dict(ck["ema"] if ck.get("ema") else ck["model"])
+    elif init_ck is not None:
+        model.load_state_dict(init_ck["ema"] if init_ck.get("ema") else init_ck["model"])
         ema = EMA(model, args.ema)
         print(f"initialised from {args.init_from}", flush=True)
 

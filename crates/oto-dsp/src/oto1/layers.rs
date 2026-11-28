@@ -2,7 +2,7 @@
 //! frequency-major, `[F][C]` (index `f * C + c`); see `SPEC.md` for the PyTorch equivalents.
 
 use super::format::{Otow, Rng};
-use super::kernels::{Act, Backend, Matrix, activate, gemv};
+use super::kernels::{Act, Backend, Matrix, activate, gemv, gemv_rows};
 
 /// Below this a recurrent state value is flushed to zero (no subnormals in silence).
 pub const FLUSH: f32 = 1e-15;
@@ -152,28 +152,42 @@ impl Conv {
     }
 
     pub fn forward(&self, be: Backend, x: &[f32], patch: &mut [f32], y: &mut [f32]) {
-        let (ci, co, k) = (self.ci, self.lin.n_out(), self.k);
+        let (ci, co, k, stride) = (self.ci, self.lin.n_out(), self.k, self.stride);
         assert!(x.len() >= self.f_in * ci && y.len() >= self.out_len());
-        for f in 0..self.f_out {
-            let first = (f * self.stride) as isize - self.pad as isize;
-            let out = &mut y[f * co..(f + 1) * co];
-            if first >= 0 && first as usize + k <= self.f_in {
-                // Interior: the K input rows are contiguous in [F][C], no copy.
-                let s = first as usize * ci;
-                self.lin.forward(be, &x[s..s + k * ci], out);
-            } else {
-                for t in 0..k {
-                    let row = first + t as isize;
-                    let dst = &mut patch[t * ci..(t + 1) * ci];
-                    if row >= 0 && (row as usize) < self.f_in {
-                        let r = row as usize;
-                        dst.copy_from_slice(&x[r * ci..(r + 1) * ci]);
-                    } else {
-                        dst.fill(0.0);
-                    }
+        // Output row f reads input rows first(f)..first(f) + K; the interior rows (all K inside
+        // the input) are one contiguous range, read in place from [F][C] with no copy.
+        let first = |f: usize| (f * stride) as isize - self.pad as isize;
+        let inside = |f: usize| first(f) >= 0 && first(f) as usize + k <= self.f_in;
+        let lo = (0..self.f_out).find(|&f| inside(f)).unwrap_or(self.f_out);
+        let hi = (lo..self.f_out).find(|&f| !inside(f)).unwrap_or(self.f_out);
+        if lo < hi {
+            let s = first(lo) as usize * ci;
+            let n_rows = hi - lo;
+            gemv_rows(
+                be,
+                &self.lin.m,
+                &x[s..],
+                if n_rows > 1 { stride * ci } else { 0 },
+                n_rows,
+                &self.lin.b,
+                &mut y[lo * co..],
+                co,
+            );
+        }
+        // Edge rows: gather the K input rows into `patch`, zero-padding past either end.
+        for f in (0..lo).chain(hi..self.f_out) {
+            for t in 0..k {
+                let row = first(f) + t as isize;
+                let dst = &mut patch[t * ci..(t + 1) * ci];
+                if row >= 0 && (row as usize) < self.f_in {
+                    let r = row as usize;
+                    dst.copy_from_slice(&x[r * ci..(r + 1) * ci]);
+                } else {
+                    dst.fill(0.0);
                 }
-                self.lin.forward(be, &patch[..k * ci], out);
             }
+            self.lin
+                .forward(be, &patch[..k * ci], &mut y[f * co..(f + 1) * co]);
         }
     }
 

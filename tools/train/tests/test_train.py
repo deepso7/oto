@@ -84,3 +84,28 @@ def test_run_batch_drops_incomplete_trailing_istft_hop():
                             p_bandlimit=0.0, p_eq=0.0, p_self_noise=0.0, p_clip=0.0), seed=0)
     loss, parts = run_batch(IdentityStftModel(), mixer, OtoLoss(LossWeights()), batch, torch.device("cpu"), False)
     assert float(parts["l1"]) < 1e-5 and float(parts["spec"]) < 1e-5 and float(loss) < 1e-3
+
+
+def test_resume_and_init_from_use_checkpoint_model_cfg(tmp_path):
+    run32 = tmp_path / "b32"
+    main(["--smoke", "--arch", "b", "--set", "channels=32", "--steps", "2", "--ckpt-dir", str(run32)])
+    # Auto-resume without --set must inherit channels=32 from latest.pt instead of default 24.
+    r2 = main(["--smoke", "--arch", "b", "--steps", "3", "--ckpt-dir", str(run32)])
+    assert r2["step"] == 3
+    assert read_otow(run32 / "best.otow").config["channels"] == 32
+    # Conflicting explicit override must fail clearly.
+    with pytest.raises(ValueError, match="conflicts with checkpoint"):
+        main(["--smoke", "--arch", "b", "--set", "channels=24", "--steps", "4", "--ckpt-dir", str(run32)])
+    # Fine-tuning via --init-from without --set also inherits channels=32.
+    ft = tmp_path / "ft32"
+    r3 = main(["--smoke", "--arch", "b", "--steps", "2", "--ckpt-dir", str(ft), "--init-from", str(run32 / "best.pt")])
+    assert r3["step"] == 2
+    assert read_otow(ft / "best.otow").config["channels"] == 32
+    # Weights-only legacy Candidate B checkpoint (no model_cfg) also infers channels=32.
+    raw_ck = torch.load(run32 / "best.pt", map_location="cpu", weights_only=True)
+    legacy = tmp_path / "legacy_b32.pt"
+    torch.save({"model": raw_ck["model"]}, legacy)
+    ft_leg = tmp_path / "ft_leg"
+    r4 = main(["--smoke", "--arch", "b", "--steps", "2", "--ckpt-dir", str(ft_leg), "--init-from", str(legacy)])
+    assert r4["step"] == 2
+    assert read_otow(ft_leg / "best.otow").config["channels"] == 32

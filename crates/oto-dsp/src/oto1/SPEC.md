@@ -174,7 +174,7 @@ p_head.weight [1,192]         p_head.bias [1]
 
 ## 5. Candidate B (`arch_id = 2`): FastEnhancer-style U-Net
 
-Config defaults: `{"arch":"oto1-b","channels":32,"gru_hidden":128}`. `channels` (C) and `gru_hidden` (H) are free.
+Config defaults for new models: `{"arch":"oto1-b","channels":24,"gru_hidden":128}` (`channels` (C) and `gru_hidden` (H) are free; v1 files that omit `channels` fall back to `32` for backwards compatibility).
 
 The network sees bins `0..512`. The Nyquist bin is dropped on input and zeroed on output.
 
@@ -202,20 +202,20 @@ p_target = p_head(h1)   scalar logit
 - For `k < 512`: `M = m[k][0] + j·m[k][1]`, then `Y[k] = X[k] · M · tanh(|M|) / max(|M|, 1e-8)`. So `|mask| < 1`, with the phase of `M`.
 - `Y[512] = 0`.
 
-Tensors (C=32, H=128): 460 233 parameters, 2 392 192 MAC per hop (224 MMAC/s).
+Tensors (C=24, H=128): 373 817 parameters, 1 508 480 MAC per hop (141 MMAC/s).
 
 ```
-enc0.weight [32,2,8]   enc0.bias [32]
-enc1.weight [32,32,3]  enc1.bias [32]
-enc2.weight [32,32,3]  enc2.bias [32]
-enc3.weight [32,32,3]  enc3.bias [32]
-gru0.weight_ih [384,512]  gru0.weight_hh [384,128]  gru0.bias_ih [384]  gru0.bias_hh [384]
+enc0.weight [24,2,8]   enc0.bias [24]
+enc1.weight [24,24,3]  enc1.bias [24]
+enc2.weight [24,24,3]  enc2.bias [24]
+enc3.weight [24,24,3]  enc3.bias [24]
+gru0.weight_ih [384,384]  gru0.weight_hh [384,128]  gru0.bias_ih [384]  gru0.bias_hh [384]
 gru1.weight_ih [384,128]  gru1.weight_hh [384,128]  gru1.bias_ih [384]  gru1.bias_hh [384]
-bott.fc.weight [512,128]  bott.fc.bias [512]
-dec3.weight [64,64,3]  dec3.bias [64]
-dec2.weight [64,64,3]  dec2.bias [64]
-dec1.weight [64,64,3]  dec1.bias [64]
-dec0.weight [8,64,3]   dec0.bias [8]
+bott.fc.weight [384,128]  bott.fc.bias [384]
+dec3.weight [48,48,3]  dec3.bias [48]
+dec2.weight [48,48,3]  dec2.bias [48]
+dec1.weight [48,48,3]  dec1.bias [48]
+dec0.weight [8,48,3]   dec0.bias [8]
 p_head.weight [1,128]  p_head.bias [1]
 ```
 

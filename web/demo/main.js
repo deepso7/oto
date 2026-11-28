@@ -105,7 +105,9 @@ function makeNode(ctx, wasm, w, extra = {}) {
   const prefer = $("transfer").value;
   if (prefer === "module") {
     try {
-      return new AudioWorkletNode(ctx, "oto-processor", { processorOptions: { ...base, module: wasm.module } });
+      // bytes ride along (structured-cloned, not transferred, so the cached buffer stays usable): the
+      // worklet falls back to them if the Module arrives but won't instantiate in its scope.
+      return new AudioWorkletNode(ctx, "oto-processor", { processorOptions: { ...base, module: wasm.module, bytes: wasm.bytes } });
     } catch (e) {
       log(`   Module not cloneable into the worklet (${e.name}); falling back to bytes`);
     }
@@ -114,33 +116,58 @@ function makeNode(ctx, wasm, w, extra = {}) {
 }
 
 let live = null;
-let liveStarting = false;
+let pending = null;
 let liveGen = 0;
+
+function cleanupSession(s) {
+  if (!s) return;
+  if (s.cancel) {
+    const cancel = s.cancel;
+    s.cancel = null;
+    cancel();
+  }
+  if (s.node) {
+    s.node.port.onmessage = null;
+    s.node = null;
+  }
+  if (s.stream) {
+    s.stream.getTracks().forEach((t) => t.stop());
+    s.stream = null;
+  }
+  if (s.ctx) {
+    const c = s.ctx;
+    s.ctx = null;
+    c.close().catch(() => {});
+  }
+}
+
 async function startLive() {
-  if (live || liveStarting) return;
-  liveStarting = true;
+  if (live || pending) return;
   const gen = ++liveGen;
-  let stream = null;
-  let ctx = null;
+  const session = { gen, stream: null, ctx: null, node: null, cancel: null };
+  pending = session;
   try {
     const name = buildName();
     const wasm = await loadWasm(name);
     if (gen !== liveGen) return;
     // getUserMedia before the context: Safari may change the hardware rate when capture starts.
-    stream = await navigator.mediaDevices.getUserMedia({
+    session.stream = await navigator.mediaDevices.getUserMedia({
       audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false, channelCount: 1 },
     });
     if (gen !== liveGen) return;
-    ctx = new AudioContext({ sampleRate: 48000, latencyHint: "interactive" });
-    if (ctx.sampleRate !== 48000) log(`!! context runs at ${ctx.sampleRate} Hz, not 48000: output will be wrong (resampling not implemented in the demo)`);
-    await ctx.audioWorklet.addModule("worklet.js");
+    session.ctx = new AudioContext({ sampleRate: 48000, latencyHint: "interactive" });
+    const rateBypass = session.ctx.sampleRate !== 48000;
+    if (rateBypass) log(`!! context runs at ${session.ctx.sampleRate} Hz, not 48000: Oto-1 stays bypassed (matched-delay dry signal only; resampling is not implemented in the demo)`);
+    await session.ctx.audioWorklet.addModule("worklet.js");
     if (gen !== liveGen) return;
     const w = await weights();
     if (gen !== liveGen) return;
-    const node = makeNode(ctx, wasm, w, { forcedBypass: $("bypass").checked });
+    const node = makeNode(session.ctx, wasm, w, { forcedBypass: rateBypass || $("bypass").checked });
+    session.node = node;
     let initReady = false;
     let initError = false;
     node.port.onmessage = (e) => {
+      if (gen !== liveGen) return;
       const d = e.data;
       if (d.type === "ready") {
         initReady = true;
@@ -148,36 +175,64 @@ async function startLive() {
       }
       if (d.type === "error") {
         initError = true;
-        log("live: worklet error, bypassing: " + d.message);
+        log(d.code === "sampleRate" ? "live: Oto-1 bypassed: " + d.message : "live: worklet error, bypassing: " + d.message);
       }
-      if (d.type === "overload") log(`live: OVERLOAD (${d.slow}/${d.hops} hops > 2 ms in the last second) -> bypass`);
+      if (d.type === "overload") log(`live: OVERLOAD (${d.slow}/${d.hops} hops > ${d.slowMs} ms${d.coarseTimer ? " on the 1 ms Date.now() clock" : ""} in the last second) -> bypass`);
       if (d.type === "stats") {
-        const gate = initError || d.overloaded || (d.hops > 0 && d.p99Ms > 2.0) ? "FAIL" : (!initReady || d.hops === 0 ? "N/A" : "PASS");
+        const gate = rateBypass ? "N/A (rate)" : initError || d.overloaded || (d.hops > 0 && d.p99Ms > 2.0) ? "FAIL" : (!initReady || d.hops === 0 ? "N/A" : "PASS");
         $("stats").textContent = `AudioWorklet paced: hops ${d.hops}, slow ${d.slow}, mean ${f(d.meanMs)} ms, p50 ${f(d.p50Ms)}, p95 ${f(d.p95Ms)}, p99 ${f(d.p99Ms)}, max(1 s) ${f(d.maxMs)} ms [${d.timer}] | gate(p99<=2.0 ms): ${gate} | p_target ${d.pTarget.toFixed(2)}, ${d.bypass ? "BYPASS" : "model on"}`;
       }
     };
-    const src = ctx.createMediaStreamSource(stream);
-    src.connect(node).connect(ctx.destination);
-    log(`live: baseLatency ${f(ctx.baseLatency * 1000)} ms, outputLatency ${f((ctx.outputLatency || 0) * 1000)} ms`);
-    live = { ctx, stream, node };
-    stream = null;
-    ctx = null;
+    const src = session.ctx.createMediaStreamSource(session.stream);
+    src.connect(node).connect(session.ctx.destination);
+    // The context may have been created suspended (no user activation left after the awaits above).
+    // Race resume() against both stopLive() and a timeout: a broken audio daemon can leave it pending forever.
+    let timer = null;
+    try {
+      const resumeP = session.ctx.resume();
+      resumeP.catch(() => {});
+      await Promise.race([
+        resumeP,
+        new Promise((res) => { session.cancel = res; }),
+        new Promise((_, rej) => { timer = setTimeout(() => rej(new Error("AudioContext.resume() timed out (no audio output device?)")), 5000); }),
+      ]);
+    } finally {
+      clearTimeout(timer);
+      session.cancel = null;
+    }
+    if (gen !== liveGen) return;
+    // Re-sync bypass in case the checkbox was toggled while resume() was pending.
+    node.port.postMessage({ type: "bypass", value: rateBypass || $("bypass").checked });
+    log(`live: baseLatency ${f(session.ctx.baseLatency * 1000)} ms, outputLatency ${f((session.ctx.outputLatency || 0) * 1000)} ms, state ${session.ctx.state}`);
+    live = { ctx: session.ctx, stream: session.stream, node, rateBypass };
+    session.stream = null;
+    session.ctx = null;
+    session.node = null;
+  } catch (e) {
+    if (gen === liveGen) log("error: " + (e && e.message ? e.message : e));
   } finally {
-    liveStarting = false;
-    if (stream) stream.getTracks().forEach((t) => t.stop());
-    if (ctx) await ctx.close().catch(() => {});
+    if (pending === session) pending = null;
+    cleanupSession(session);
   }
 }
 
 async function stopLive() {
-  liveGen++;
+  const stopGen = ++liveGen;
+  const pend = pending;
+  pending = null;
+  cleanupSession(pend);
   const cur = live;
   live = null;
-  if (cur) {
-    cur.stream.getTracks().forEach((t) => t.stop());
-    await cur.ctx.close();
-  }
   $("stats").textContent = "";
+  if (cur) {
+    cur.node.port.onmessage = null;
+    cur.stream.getTracks().forEach((t) => t.stop());
+    try {
+      await cur.ctx.close();
+    } catch (e) {
+      if (stopGen === liveGen) log("error: " + (e && e.message ? e.message : e));
+    }
+  }
 }
 
 const guard = (fn) => () => fn().catch((e) => log("error: " + (e && e.message ? e.message : e)));
@@ -185,5 +240,5 @@ $("bench").onclick = guard(benchWorker);
 $("offline").onclick = guard(benchOffline);
 $("live").onclick = guard(startLive);
 $("stop").onclick = guard(stopLive);
-$("bypass").onchange = (e) => live && live.node.port.postMessage({ type: "bypass", value: e.target.checked });
+$("bypass").onchange = (e) => live && live.node.port.postMessage({ type: "bypass", value: live.rateBypass || e.target.checked });
 log(`WebAssembly SIMD: ${simdSupported() ? "yes" : "no"}; auto build = ${simdSupported() ? "simd" : "scalar"}; UA ${navigator.userAgent}`);

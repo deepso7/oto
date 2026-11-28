@@ -67,7 +67,7 @@ def test_fold_batchnorm(arch):
 
 def test_param_and_mac_counts():
     """SPEC.md sections 4 and 5: exact exported tensors, parameter and MAC counts."""
-    want = {"a": (574_328, 1_622_208), "b": (460_233, 2_392_192)}
+    want = {"a": (574_328, 1_622_208), "b": (373_817, 1_508_480)}
     for arch in ARCHS:
         m = build_model(arch)
         n_exp = m.exported_param_count()
@@ -84,15 +84,15 @@ def test_tensor_names_and_shapes():
     assert a["df_dec.fc1.weight"] == (576, 384) and a["df_dec.convp.weight"] == (6, 48, 1)
     assert a["p_head.weight"] == (1, 192) and len(a) == 38
     b = {k: tuple(v.shape) for k, v in build_model("b").fold_batchnorm().export_tensors().items()}
-    assert b["enc0.weight"] == (32, 2, 8) and b["gru0.weight_ih"] == (384, 512) and b["gru1.bias_ih"] == (384,)
-    assert b["bott.fc.weight"] == (512, 128) and b["dec3.weight"] == (64, 64, 3) and b["dec0.weight"] == (8, 64, 3)
+    assert b["enc0.weight"] == (24, 2, 8) and b["gru0.weight_ih"] == (384, 384) and b["gru1.bias_ih"] == (384,)
+    assert b["bott.fc.weight"] == (384, 128) and b["dec3.weight"] == (48, 48, 3) and b["dec0.weight"] == (8, 48, 3)
     assert b["p_head.weight"] == (1, 128) and len(b) == 28
 
 
 def test_config_json():
     assert build_model("a").config_dict() == {"arch": "oto1-a", "channels": 48, "df_order": 3, "gru_groups": 4,
                                               "gru_hidden": 192, "n_df_bins": 96, "n_erb": 32}  # fmt: skip
-    assert build_model("b").config_dict() == {"arch": "oto1-b", "channels": 32, "gru_hidden": 128}
+    assert build_model("b").config_dict() == {"arch": "oto1-b", "channels": 24, "gru_hidden": 128}
     with pytest.raises(ValueError):
         build_model("a", n_df_bins=64)
     with pytest.raises(ValueError):
@@ -124,3 +124,13 @@ def test_training_mode_backward(arch):
     out = m(x)
     (out["wav"].square().mean() + out["p_logit"].mean()).backward()
     assert all(p.grad is not None and torch.isfinite(p.grad).all() for p in m.parameters() if p.requires_grad)
+
+
+def test_candidate_b_v1_omitted_channels_fallback(tmp_path):
+    from oto_train.export_otow import DTYPE_F32, load_otow_into_model, write_otow
+
+    m32 = build_model("b", channels=32).eval().fold_batchnorm()
+    raw = write_otow(tmp_path / "b32.otow", m32.export_tensors(), {"arch": "oto1-b", "gru_hidden": 128}, 2, DTYPE_F32)
+    loaded = load_otow_into_model(raw)
+    assert loaded.cfg.channels == 32
+    assert loaded.exported_param_count() == 460_233
