@@ -191,6 +191,150 @@ def test_shard_stream_rir_split_isolation_and_pool_bounds(tmp_path):
     with pytest.raises(FileNotFoundError, match="split 'dev'"):
         ShardStream(str(tmp_path / "shards"), "dev", seconds=1.0, rir_dir=str(rir_dir))
 
+    # RT60 filtering keeps rooms in (0, max_rt60] (and fixtures omitting rt60) and drops long/NaN/null/<=0 rooms.
+    dev_ids = [i for i in range(400) if room_split(i) == "dev"][:7]
+    for rid, rt60 in zip(dev_ids[:6], [0.45, 2.8, float("nan"), None, 0.0, -0.2]):
+        meta_doc = {"direct_idx": [0, 0]} if rid == dev_ids[5] else {"direct_idx": [0, 0], "rt60": rt60}
+        if rid == dev_ids[5]:
+            # Fixture without rt60 key (exempt) vs explicit rt60=null / <=0 (rejected)
+            pass
+        np.savez(rir_dir / f"{rid}.npz", near=np.zeros(1024, np.float32), far=np.zeros((1, 1024), np.float32),
+                 meta=json.dumps(meta_doc))
+    # Add an explicit negative-rt60 room too.
+    np.savez(rir_dir / f"{dev_ids[6]}.npz", near=np.zeros(1024, np.float32), far=np.zeros((1, 1024), np.float32),
+             meta=json.dumps({"direct_idx": [0, 0], "rt60": -0.2}))
+    ds = ShardStream(str(tmp_path / "shards"), "dev", seconds=1.0, rir_dir=str(rir_dir), max_rt60=1.5)
+    assert {int(P.Path(p).stem) for p in ds.rirs.files} == {dev_ids[0], dev_ids[5]}
+    ds_all = ShardStream(str(tmp_path / "shards"), "dev", seconds=1.0, rir_dir=str(rir_dir), max_rt60=None)
+    assert len(ds_all.rirs.files) == 7
+    with pytest.raises(FileNotFoundError, match="0 < rt60 <= 0.1"):
+        (rir_dir / f"{dev_ids[5]}.npz").unlink()
+        ShardStream(str(tmp_path / "shards"), "dev", seconds=1.0, rir_dir=str(rir_dir), max_rt60=0.1)
+    with pytest.raises(ValueError, match="max_rt60"):
+        ShardStream(str(tmp_path / "shards"), "dev", seconds=1.0, rir_dir=str(rir_dir), max_rt60=0.0)
+
+    # Malformed RIR archives (missing meta.npy or missing far.npy) fail fast and name the offending file.
+    bad_rir = rir_dir / f"{dev_ids[5]}.npz"
+    np.savez(bad_rir, near=np.zeros(16, np.float32))
+    with pytest.raises(ValueError, match=bad_rir.name):
+        ShardStream(str(tmp_path / "shards"), "dev", seconds=1.0, rir_dir=str(rir_dir), max_rt60=1.5)
+    np.savez(bad_rir, near=np.zeros(16, np.float32), meta=json.dumps({"direct_idx": [0, 0], "rt60": 0.4}))
+    with pytest.raises(ValueError, match=f"{bad_rir.name}.*far\\.npy"):
+        ShardStream(str(tmp_path / "shards"), "dev", seconds=1.0, rir_dir=str(rir_dir), max_rt60=1.5)
+
+
+def test_parse_max_rt60_rejects_non_finite():
+    import argparse
+    from oto_train.data.rir_gen import parse_max_rt60
+
+    assert parse_max_rt60("1.5") == 1.5
+    assert parse_max_rt60("0") is None
+    assert parse_max_rt60("-1") is None
+    for bad in ("nan", "inf", "-inf", "abc"):
+        with pytest.raises(argparse.ArgumentTypeError):
+            parse_max_rt60(bad)
+
+
+def test_pack_split_drop_counts_and_repack_cleanup(tmp_path):
+    import soundfile as sf
+
+    good = tmp_path / "good.wav"
+    short = tmp_path / "short.wav"
+    bad = tmp_path / "nan.wav"
+    sf.write(good, (0.1 * np.random.default_rng(0).standard_normal(48_000)).astype(np.float32), 48_000)
+    sf.write(short, np.zeros(1000, np.float32), 48_000)
+    sf.write(bad, np.full(48_000, np.nan, np.float32), 48_000, subtype="FLOAT")
+
+    items = [
+        P.Item(key="k_good", source="vctk", path=str(good), kind="speech", speaker="s1", session="s1", licence="CC-BY-4.0"),
+        P.Item(key="k_short", source="vctk", path=str(short), kind="speech", speaker="s2", session="s2", licence="CC-BY-4.0"),
+        P.Item(key="k_nan", source="vctk", path=str(bad), kind="speech", speaker="s3", session="s3", licence="CC-BY-4.0"),
+        P.Item(key="k_miss", source="vctk", path=str(tmp_path / "missing.wav"), kind="speech", speaker="s4", session="s4", licence="CC-BY-4.0"),
+    ]
+    # Pre-seed a stale higher-index shard: a failed repack must keep it, a successful repack must remove it.
+    stale_dir = tmp_path / "out" / "train"
+    stale_dir.mkdir(parents=True)
+    stale = stale_dir / "speech-train-000005.tar"
+    stale.write_bytes(b"stale")
+    with pytest.raises(ValueError, match="workers"):
+        P.pack_split(items, tmp_path / "out", "train", "speech", workers=0, max_count=10)
+    assert stale.exists()
+
+    drops: dict[str, int] = {}
+    n = P.pack_split(items, tmp_path / "out", "train", "speech", workers=1, max_count=10, drop_counts=drops)
+    assert n == 1
+    assert drops == {"drop_short": 1, "drop_nonfinite": 1, "drop_error": 1}
+    assert not stale.exists()
+
+    # CLI repack into the same dir with omitted splits cleans stale dev/test shards, preserves hyphenated kinds,
+    # and rolls back cleanly if a second group fails mid-pack.
+    src_dir = tmp_path / "src_ace"
+    src_dir.mkdir()
+    for i in range(6):
+        sf.write(src_dir / f"c{i}.wav", (0.1 * np.random.default_rng(i).standard_normal(48_000)).astype(np.float32), 48_000)
+    cli_out = tmp_path / "cli_out"
+    P.main(["pack", "--dir", f"ace:noise-extra:{src_dir}", "--out", str(cli_out), "--split", "train=0.5,dev=0.5", "--workers", "1"])
+    assert list((cli_out / "train").glob("noise-extra-train-*.tar"))
+    assert list((cli_out / "dev").glob("noise-extra-dev-*.tar"))
+    P.main(["pack", "--dir", f"ace:noise-extra:{src_dir}", "--out", str(cli_out), "--split", "train=1", "--workers", "1"])
+    assert list((cli_out / "train").glob("noise-extra-train-*.tar"))
+    assert not list((cli_out / "dev").glob("*.tar"))
+    assert not (cli_out / "splits" / "dev.json").exists()
+    st = json.loads((cli_out / "stats.json").read_text())
+    assert list(st["pack"].keys()) == ["train/noise-extra"] and st["pack"]["train/noise-extra"]["packed"] == 6
+
+    # Mid-pack failure leaves the previous published dataset intact and removes staging dirs.
+    orig_pack = P.pack_split
+    calls = {"n": 0}
+
+    def boom(*a, **kw):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise RuntimeError("injected pack failure")
+        return orig_pack(*a, **kw)
+
+    orig_stats = (cli_out / "stats.json").read_text()
+    try:
+        P.pack_split = boom
+        with pytest.raises(RuntimeError, match="injected pack failure"):
+            P.main(["pack", "--dir", f"ace:noise:{src_dir}", "--dir", f"librispeech:speech:{src_dir}",
+                    "--out", str(cli_out), "--split", "train=1", "--workers", "1"])
+    finally:
+        P.pack_split = orig_pack
+    assert (cli_out / "stats.json").read_text() == orig_stats
+    assert not list((cli_out / "train").glob("noise-train-*.tar"))
+    assert not list(cli_out.glob(".tmp-*"))
+
+    # Failure while removing a stale file rolls back every published replacement.
+    pub_dir = tmp_path / "pub_rb"
+    pub_dir.mkdir()
+    src_f = pub_dir / "new.tar"
+    dst_f = pub_dir / "old.tar"
+    stale_ok = pub_dir / "stale_ok.tar"
+    stale_fail = pub_dir / "stale_fail.tar"
+    bak_dir = pub_dir / "bak"
+    bak_dir.mkdir()
+    src_f.write_bytes(b"new")
+    dst_f.write_bytes(b"old")
+    stale_ok.write_bytes(b"s1")
+    stale_fail.write_bytes(b"s2")
+    real_replace = P.os.replace
+
+    def fail_stale(src, dst):
+        if P.Path(src) == stale_fail:
+            raise PermissionError("read-only dir")
+        return real_replace(src, dst)
+
+    try:
+        P.os.replace = fail_stale
+        with pytest.raises(PermissionError, match="read-only"):
+            P._publish_files([(src_f, dst_f)], [stale_ok, stale_fail], bak_dir)
+    finally:
+        P.os.replace = real_replace
+    assert dst_f.read_bytes() == b"old"
+    assert stale_ok.read_bytes() == b"s1"
+    assert stale_fail.read_bytes() == b"s2"
+
 
 def test_split_speaker_and_session_disjoint():
     items = [P.Item(key=f"k{s}_{u}", source="vctk", path=f"/{s}/{u}", kind="speech", speaker=f"spk{s}",

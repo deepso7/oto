@@ -38,6 +38,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from .data.mixer import Mixer, MixConfig
+from .data.rir_gen import parse_max_rt60
 from .data.stream import ShardStream, SyntheticStream
 from .losses import LossWeights, OtoLoss
 from .models import build_model
@@ -179,6 +180,9 @@ def parse_args(argv=None):
     ap.add_argument("--data", help="shard root: local dir, r2://bucket/prefix/ or hf://user/repo/path")
     ap.add_argument("--stage-dir", default="/content/data", help="local NVMe staging dir for --data")
     ap.add_argument("--rir-data", help="RIR bank (.npz from rir_gen): local dir, r2:// or hf://")
+    ap.add_argument(
+        "--max-rt60", type=parse_max_rt60, default=1.5, help="ignore RIRs with RT60 above this in seconds (finite <=0 disables)"
+    )
     ap.add_argument("--ckpt-dir", default="/content/ckpt")
     ap.add_argument("--sync", help="mirror checkpoints to r2://, hf:// or a local/Drive path")
     ap.add_argument("--ckpt-minutes", type=float, default=20.0)
@@ -229,7 +233,7 @@ def make_loader(args, split: str, data_root: str | None, rir_root: str | None, s
     if args.smoke or not data_root:
         ds = SyntheticStream(args.seconds, seed)
     else:
-        ds = ShardStream(data_root, split, args.seconds, rir_root, seed)
+        ds = ShardStream(data_root, split, args.seconds, rir_root, seed, max_rt60=args.max_rt60)
     nw = args.workers if split == "train" else min(args.workers, 2)
     return DataLoader(ds, batch_size=args.batch_size, num_workers=nw, pin_memory=torch.cuda.is_available(),
                       persistent_workers=nw > 0, prefetch_factor=4 if nw > 0 else None)  # fmt: skip

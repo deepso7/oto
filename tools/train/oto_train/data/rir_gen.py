@@ -69,8 +69,17 @@ def _directivity(pra, kind: str, azimuth: float, colatitude: float):
     return cls(orient)
 
 
-def simulate_room(room: int, seed: int = 0, n_far: int = 2, max_len_s: float = 1.5, ray_tracing: bool = True):
-    """Simulate one room; returns ``(near, far, meta)`` or ``None`` if placement failed."""
+def simulate_room(
+    room: int,
+    seed: int = 0,
+    n_far: int = 2,
+    max_len_s: float = 1.5,
+    ray_tracing: bool = True,
+    max_rt60: float | None = 1.5,
+):
+    """Simulate one room; returns ``(near, far, meta)`` or ``None`` if placement/RT60 failed."""
+    if max_rt60 is not None and (not math.isfinite(max_rt60) or max_rt60 <= 0):
+        raise ValueError(f"max_rt60 must be positive and finite (or None), got {max_rt60!r}")
     import pyroomacoustics as pra
 
     rng = np.random.default_rng([seed, room])
@@ -126,28 +135,40 @@ def simulate_room(room: int, seed: int = 0, n_far: int = 2, max_len_s: float = 1
         rt60 = float(np.median(room_obj.measure_rt60()))
     except Exception:  # noqa: BLE001
         rt60 = float("nan")
+    if max_rt60 is not None and (not math.isfinite(rt60) or rt60 <= 0.0 or rt60 > max_rt60):
+        return None
     # Geometric direct-path index (argmax is unreliable when directivity attenuates the direct ray).
     offset = pra.constants.get("frac_delay_length") // 2
     directs = [int(round(np.linalg.norm(p - mic) / C_SOUND * SR)) + offset for p in [user, *fars]]
     meta = {
         "room": room, "split": room_split(room), "dims": dims.round(3).tolist(), "materials": mats,
         "mic": mic.round(3).tolist(), "mic_directivity": str(mic_kind), "near_dist": round(float(near_d), 3),
-        "far_dist": [round(float(d), 3) for d in far_d], "rt60": round(rt60, 3), "direct_idx": directs, "sr": SR,
+        "far_dist": [round(float(d), 3) for d in far_d], "rt60": rt60, "direct_idx": directs, "sr": SR,
     }  # fmt: skip
     return near, far, meta
 
 
 def _work(args):
-    room, out, seed, n_far, ray_tracing = args
+    room, out, seed, n_far, ray_tracing, max_rt60 = args
     path = Path(out) / f"{room:06d}.npz"
     if path.exists():
         return room, "exists"
-    res = simulate_room(room, seed, n_far, ray_tracing=ray_tracing)
+    res = simulate_room(room, seed, n_far, ray_tracing=ray_tracing, max_rt60=max_rt60)
     if res is None:
-        return room, "placement_failed"
+        return room, "rejected"
     near, far, meta = res
     np.savez_compressed(path, near=near, far=far, meta=json.dumps(meta))
     return room, meta["rt60"]
+
+
+def parse_max_rt60(raw: str) -> float | None:
+    try:
+        val = float(raw)
+    except ValueError as e:
+        raise argparse.ArgumentTypeError(f"invalid float value: {raw!r}") from e
+    if not math.isfinite(val):
+        raise argparse.ArgumentTypeError(f"--max-rt60 must be finite, got {raw!r}")
+    return val if val > 0.0 else None
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -158,10 +179,13 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--n-far", type=int, default=2)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--workers", type=int, default=os.cpu_count() or 4)
+    ap.add_argument(
+        "--max-rt60", type=parse_max_rt60, default=1.5, help="reject rooms with RT60 above this (finite <=0 disables)"
+    )
     ap.add_argument("--no-ray-tracing", action="store_true", help="pure ISM (fast, for tests)")
     args = ap.parse_args(argv)
     Path(args.out).mkdir(parents=True, exist_ok=True)
-    jobs = [(r, args.out, args.seed, args.n_far, not args.no_ray_tracing)
+    jobs = [(r, args.out, args.seed, args.n_far, not args.no_ray_tracing, args.max_rt60)
             for r in range(args.start, args.start + args.rooms)]  # fmt: skip
     with ProcessPoolExecutor(max_workers=args.workers) as ex:
         for room, status in ex.map(_work, jobs, chunksize=4):

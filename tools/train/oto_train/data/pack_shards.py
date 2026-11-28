@@ -42,8 +42,10 @@ import math
 import os
 import random
 import re
+import shutil
 import sys
 import tarfile
+import tempfile
 import time
 from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor
@@ -557,7 +559,7 @@ def to_48k(x: np.ndarray, sr: int) -> np.ndarray:
     return resample_poly(x, TARGET_SR // g, sr // g).astype(np.float32)
 
 
-def encode_sample(item_dict: dict) -> tuple[str, bytes, bytes] | None:
+def _encode_sample_status(item_dict: dict) -> tuple[str, tuple[str, bytes, bytes] | None]:
     """Worker: decode, measure f_max at the source rate, resample to 48 kHz, FLAC-encode."""
     import soundfile as sf
 
@@ -565,9 +567,11 @@ def encode_sample(item_dict: dict) -> tuple[str, bytes, bytes] | None:
         x, sr = load_audio(item_dict["path"])
     except Exception as e:  # noqa: BLE001 - corrupt/missing files are skipped and logged
         print(f"skip {item_dict['path']}: {e}", file=sys.stderr)
-        return None
-    if len(x) < sr * 0.5 or not np.isfinite(x).all():
-        return None
+        return "drop_error", None
+    if len(x) < sr * 0.5:
+        return "drop_short", None
+    if not np.isfinite(x).all():
+        return "drop_nonfinite", None
     f_max = estimate_bandwidth(x, sr)
     y = to_48k(x, sr)
     peak = float(np.abs(y).max())
@@ -578,7 +582,12 @@ def encode_sample(item_dict: dict) -> tuple[str, bytes, bytes] | None:
     meta = {k: v for k, v in item_dict.items() if k != "path"}
     meta.update(f_max=round(f_max, 1), meta_f_max=item_dict.get("f_max", 0.0), orig_sr=sr,
                 duration=round(len(y) / TARGET_SR, 3), sr=TARGET_SR)  # fmt: skip
-    return item_dict["key"], buf.getvalue(), json.dumps(meta, sort_keys=True).encode()
+    return "ok", (item_dict["key"], buf.getvalue(), json.dumps(meta, sort_keys=True).encode())
+
+
+def encode_sample(item_dict: dict) -> tuple[str, bytes, bytes] | None:
+    """Decode, measure f_max at the source rate, resample to 48 kHz, and FLAC-encode one item."""
+    return _encode_sample_status(item_dict)[1]
 
 
 class ShardWriter:
@@ -616,20 +625,73 @@ class ShardWriter:
             self.tar = None
 
 
-def pack_split(items: list[Item], out_dir: Path, split: str, kind: str, workers: int, max_count: int) -> int:
+def _publish_files(moves: list[tuple[Path, Path]], stale: list[Path], backup_dir: Path) -> None:
+    """Atomically replace ``dst`` with ``src`` and remove ``stale`` files, rolling back all on error."""
+    backups: list[tuple[Path, Path | None]] = []
+    try:
+        for i, (src, dst) in enumerate(moves):
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            bak = None
+            if dst.exists():
+                bak = backup_dir / f"bak-{i}"
+                os.replace(dst, bak)
+            backups.append((dst, bak))
+            os.replace(src, dst)
+        for j, p in enumerate(stale):
+            if p.exists():
+                bak = backup_dir / f"stale-{j}"
+                os.replace(p, bak)
+                backups.append((p, bak))
+    except BaseException:
+        for dst, bak in reversed(backups):
+            if bak is not None and bak.exists():
+                os.replace(bak, dst)
+            else:
+                dst.unlink(missing_ok=True)
+        raise
+
+
+def pack_split(
+    items: list[Item],
+    out_dir: Path,
+    split: str,
+    kind: str,
+    workers: int,
+    max_count: int,
+    drop_counts: dict[str, int] | None = None,
+) -> int:
+    if workers < 1:
+        raise ValueError(f"workers must be >= 1, got {workers}")
+    if max_count < 1:
+        raise ValueError(f"max_count must be >= 1, got {max_count}")
     check_unique_keys(items)
-    writer = ShardWriter(str(out_dir / split / f"{kind}-{split}-%06d.tar"), max_count=max_count)
+    split_dir = out_dir / split
+    split_dir.mkdir(parents=True, exist_ok=True)
+    tmp_dir = Path(tempfile.mkdtemp(prefix=f".tmp-pack-{os.getpid()}-", dir=split_dir))
+    bak_dir = tmp_dir / "bak"
+    bak_dir.mkdir()
+    writer = ShardWriter(str(tmp_dir / f"{kind}-{split}-%06d.tar"), max_count=max_count)
     items = list(items)
     random.Random(f"{split}:{kind}").shuffle(items)  # mix speakers inside shards
     n = 0
-    with ProcessPoolExecutor(max_workers=workers) as ex:
-        for res in ex.map(encode_sample, [asdict(i) for i in items], chunksize=16):
-            if res is None:
-                continue
-            key, flac, meta = res
-            writer.write(key, {"flac": flac, "json": meta})
-            n += 1
-    writer.close()
+    try:
+        with ProcessPoolExecutor(max_workers=workers) as ex:
+            for status, res in ex.map(_encode_sample_status, [asdict(i) for i in items], chunksize=16):
+                if res is None:
+                    if drop_counts is not None:
+                        drop_counts[status] = drop_counts.get(status, 0) + 1
+                    continue
+                key, flac, meta = res
+                writer.write(key, {"flac": flac, "json": meta})
+                n += 1
+        writer.close()
+        moves = [(Path(p), split_dir / Path(p).name) for p in writer.paths]
+        written = {dst for _, dst in moves}
+        stale = [p for p in split_dir.glob(f"{kind}-{split}-*.tar") if p not in written]
+        _publish_files(moves, stale, bak_dir)
+    finally:
+        writer.close()
+        shutil.rmtree(tmp_dir, ignore_errors=True)
     return n
 
 
@@ -894,29 +956,80 @@ def main(argv: list[str] | None = None) -> None:
         return
 
     ratios = {k: float(v) for k, v in (kv.split("=") for kv in args.split.split(","))}
+    if not args.dry_run:
+        if args.workers < 1:
+            raise SystemExit(f"--workers must be >= 1, got {args.workers}")
+        if args.shard_size < 1:
+            raise SystemExit(f"--shard-size must be >= 1, got {args.shard_size}")
     splits = split_items(items, ratios, args.salt)
+    prev_splits = {p.stem for p in (out / "splits").glob("*.json")} if (out / "splits").exists() else set()
     out.mkdir(parents=True, exist_ok=True)
     (out / "splits").mkdir(exist_ok=True)
-    for name, its in splits.items():
-        doc = {"speakers": sorted({i.speaker for i in its}), "sessions": sorted({i.session for i in its}),
-               "keys": sorted(i.key for i in its)}  # fmt: skip
-        (out / "splits" / f"{name}.json").write_text(json.dumps(doc, indent=0))
-    with open(out / "manifest.jsonl", "w") as fh:
-        for name, its in splits.items():
-            for it in its:
-                fh.write(json.dumps({**asdict(it), "split": name}) + "\n")
-    write_attribution(items, out / "ATTRIBUTION.md")
-    (out / "stats.json").write_text(json.dumps(stats, indent=2))
     if args.dry_run:
+        for name, its in splits.items():
+            doc = {"speakers": sorted({i.speaker for i in its}), "sessions": sorted({i.session for i in its}),
+                   "keys": sorted(i.key for i in its)}  # fmt: skip
+            (out / "splits" / f"{name}.json").write_text(json.dumps(doc, indent=0))
+        with open(out / "manifest.jsonl", "w") as fh:
+            for name, its in splits.items():
+                for it in its:
+                    fh.write(json.dumps({**asdict(it), "split": name}) + "\n")
+        write_attribution(items, out / "ATTRIBUTION.md")
+        (out / "stats.json").write_text(json.dumps(stats, indent=2))
         return
     t0 = time.time()
-    for name, its in splits.items():
-        by_kind: dict[str, list[Item]] = defaultdict(list)
-        for it in its:
-            by_kind[it.kind].append(it)
-        for kind, kits in sorted(by_kind.items()):
-            n = pack_split(kits, out, name, kind, args.workers, args.shard_size)
-            print(f"{name}/{kind}: {n} samples ({time.time() - t0:.0f}s)")
+    staging = Path(tempfile.mkdtemp(prefix=f".tmp-stage-{os.getpid()}-", dir=out))
+    bak_dir = staging / ".bak"
+    bak_dir.mkdir()
+    try:
+        pack_stats: dict[str, dict[str, int]] = {}
+        moves: list[tuple[Path, Path]] = []
+        written_tars: set[Path] = set()
+        for name, its in splits.items():
+            by_kind: dict[str, list[Item]] = defaultdict(list)
+            for it in its:
+                by_kind[it.kind].append(it)
+            for kind, kits in sorted(by_kind.items()):
+                drops: dict[str, int] = {}
+                n = pack_split(kits, staging, name, kind, args.workers, args.shard_size, drop_counts=drops)
+                pack_stats[f"{name}/{kind}"] = {"packed": n, **drops}
+                drop_msg = f", dropped {drops}" if drops else ""
+                print(f"{name}/{kind}: {n} samples{drop_msg} ({time.time() - t0:.0f}s)")
+            st_split = staging / name
+            if st_split.exists():
+                for tar in sorted(st_split.glob("*.tar")):
+                    dst = out / name / tar.name
+                    moves.append((tar, dst))
+                    written_tars.add(dst)
+        (staging / "splits").mkdir(exist_ok=True)
+        for name, its in splits.items():
+            doc = {"speakers": sorted({i.speaker for i in its}), "sessions": sorted({i.session for i in its}),
+                   "keys": sorted(i.key for i in its)}  # fmt: skip
+            sp = staging / "splits" / f"{name}.json"
+            sp.write_text(json.dumps(doc, indent=0))
+            moves.append((sp, out / "splits" / f"{name}.json"))
+        with open(staging / "manifest.jsonl", "w") as fh:
+            for name, its in splits.items():
+                for it in its:
+                    fh.write(json.dumps({**asdict(it), "split": name}) + "\n")
+        moves.append((staging / "manifest.jsonl", out / "manifest.jsonl"))
+        write_attribution(items, staging / "ATTRIBUTION.md")
+        moves.append((staging / "ATTRIBUTION.md", out / "ATTRIBUTION.md"))
+        stats["pack"] = pack_stats
+        (staging / "stats.json").write_text(json.dumps(stats, indent=2))
+        moves.append((staging / "stats.json", out / "stats.json"))
+        stale: list[Path] = []
+        for old_split in prev_splits | set(splits):
+            split_dir = out / old_split
+            if split_dir.exists():
+                for tar in split_dir.glob("*.tar"):
+                    if tar not in written_tars:
+                        stale.append(tar)
+        for old_split in prev_splits - set(splits):
+            stale.append(out / "splits" / f"{old_split}.json")
+        _publish_files(moves, stale, bak_dir)
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
 
 
 if __name__ == "__main__":
