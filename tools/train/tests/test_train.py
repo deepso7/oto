@@ -66,6 +66,32 @@ def test_stage_hf_nested_path_cached_matches_first_call(tmp_path, monkeypatch):
     assert (tmp_path / "stage" / "shards" / "v2" / "new.tar").exists()
 
 
+def test_stage_hf_tar_extracts_and_caches(tmp_path, monkeypatch):
+    import tarfile
+    from oto_train.data import pack_shards as P
+
+    calls = []
+
+    def fake_dl(repo, dst, pattern=None):
+        calls.append((repo, dst, pattern))
+        tar_p = tmp_path / "stage_rirs" / "rirs.tar"
+        tar_p.parent.mkdir(parents=True, exist_ok=True)
+        npz = tmp_path / "000000.npz"
+        npz.write_bytes(b"npz")
+        with tarfile.open(tar_p, "w") as tf:
+            tf.add(npz, arcname="rirs/000000.npz")
+
+    monkeypatch.setattr(P, "download_hf", fake_dl)
+    url = "hf://user/repo/rirs.tar"
+    dst = str(tmp_path / "stage_rirs")
+    first = stage(url, dst)
+    second = stage(url, dst)
+    assert first == second == str(tmp_path / "stage_rirs" / "rirs")
+    assert (tmp_path / "stage_rirs" / "rirs" / "000000.npz").exists()
+    assert not (tmp_path / "stage_rirs" / "rirs.tar").exists()
+    assert len(calls) == 1 and calls[0][2] == "rirs.tar"
+
+
 def test_run_batch_drops_incomplete_trailing_istft_hop():
     class IdentityStftModel(torch.nn.Module):
         def forward(self, x):
