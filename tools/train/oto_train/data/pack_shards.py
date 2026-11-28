@@ -626,7 +626,7 @@ class ShardWriter:
 
 
 def _publish_files(moves: list[tuple[Path, Path]], stale: list[Path], backup_dir: Path) -> None:
-    """Atomically replace ``dst`` with ``src`` for each pair, restoring backups if any replace fails."""
+    """Atomically replace ``dst`` with ``src`` and remove ``stale`` files, rolling back all on error."""
     backups: list[tuple[Path, Path | None]] = []
     try:
         for i, (src, dst) in enumerate(moves):
@@ -637,6 +637,11 @@ def _publish_files(moves: list[tuple[Path, Path]], stale: list[Path], backup_dir
                 os.replace(dst, bak)
             backups.append((dst, bak))
             os.replace(src, dst)
+        for j, p in enumerate(stale):
+            if p.exists():
+                bak = backup_dir / f"stale-{j}"
+                os.replace(p, bak)
+                backups.append((p, bak))
     except BaseException:
         for dst, bak in reversed(backups):
             if bak is not None and bak.exists():
@@ -644,8 +649,6 @@ def _publish_files(moves: list[tuple[Path, Path]], stale: list[Path], backup_dir
             else:
                 dst.unlink(missing_ok=True)
         raise
-    for p in stale:
-        p.unlink(missing_ok=True)
 
 
 def pack_split(

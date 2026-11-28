@@ -305,6 +305,36 @@ def test_pack_split_drop_counts_and_repack_cleanup(tmp_path):
     assert not list((cli_out / "train").glob("noise-train-*.tar"))
     assert not list(cli_out.glob(".tmp-*"))
 
+    # Failure while removing a stale file rolls back every published replacement.
+    pub_dir = tmp_path / "pub_rb"
+    pub_dir.mkdir()
+    src_f = pub_dir / "new.tar"
+    dst_f = pub_dir / "old.tar"
+    stale_ok = pub_dir / "stale_ok.tar"
+    stale_fail = pub_dir / "stale_fail.tar"
+    bak_dir = pub_dir / "bak"
+    bak_dir.mkdir()
+    src_f.write_bytes(b"new")
+    dst_f.write_bytes(b"old")
+    stale_ok.write_bytes(b"s1")
+    stale_fail.write_bytes(b"s2")
+    real_replace = P.os.replace
+
+    def fail_stale(src, dst):
+        if P.Path(src) == stale_fail:
+            raise PermissionError("read-only dir")
+        return real_replace(src, dst)
+
+    try:
+        P.os.replace = fail_stale
+        with pytest.raises(PermissionError, match="read-only"):
+            P._publish_files([(src_f, dst_f)], [stale_ok, stale_fail], bak_dir)
+    finally:
+        P.os.replace = real_replace
+    assert dst_f.read_bytes() == b"old"
+    assert stale_ok.read_bytes() == b"s1"
+    assert stale_fail.read_bytes() == b"s2"
+
 
 def test_split_speaker_and_session_disjoint():
     items = [P.Item(key=f"k{s}_{u}", source="vctk", path=f"/{s}/{u}", kind="speech", speaker=f"spk{s}",
