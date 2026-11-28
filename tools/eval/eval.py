@@ -23,6 +23,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -575,7 +576,123 @@ def _krisp_row(e: dict, text: str, words, normalizer, offset: float = 0.0) -> di
     return krisp.clip_row(e["id"], e.get("scenario") or e.get("dataset") or "", e.get("speaker_id") or e["id"], e["transcript"], text, words, e["segments"], normalizer, offset)
 
 
-def run_manifest(entries: list[dict], models: list[ModelSpec], strengths: list[str], proc: Processor, gates: dict, out_dir: Path, profile: str | None = None, transcriber=None, dnsmos=None, log=print, latency_gates_by_key: dict[tuple[str, str], set[str]] | None = None, normalizer=None, n_boot: int = 2000) -> list[dict]:
+def _write_json_atomic(path: Path, data: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(data, f)
+        os.replace(tmp_name, path)
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+
+
+_KRISP_DATASET = "krisp-voice-isolation-benchmark"
+_KRISP_BASELINES = {
+    "krisp_default": "vi_2_5_default",
+    "krisp_balanced": "vi_2_5_balanced",
+    "krisp_lite": "vi_2_5_lite",
+    "krisp_hd": "vi_2_5_hd",
+}
+
+
+def _valid_words(words) -> list[tuple[str, float, float]] | None:
+    if not isinstance(words, list):
+        return None
+    out: list[tuple[str, float, float]] = []
+    for item in words:
+        if not isinstance(item, (list, tuple)) or len(item) != 3:
+            return None
+        w, a, b = item
+        if not isinstance(w, str) or isinstance(a, bool) or isinstance(b, bool) or not isinstance(a, (int, float)) or not isinstance(b, (int, float)):
+            return None
+        out.append((w, float(a), float(b)))
+    return out
+
+
+def _cached_asr_entry(
+    entry: dict | None,
+    need_words: bool,
+    sha256: str | None = None,
+    allow_legacy_no_sha256: bool = False,
+    reconstruct_words: bool = False,
+) -> tuple[str, list | None] | None:
+    if not isinstance(entry, dict) or not isinstance(entry.get("text"), str):
+        return None
+    if sha256 is not None:
+        stored_sha = entry.get("sha256")
+        if stored_sha is not None:
+            if stored_sha != sha256:
+                return None
+        elif not allow_legacy_no_sha256:
+            return None
+    raw_words = entry.get("words")
+    if raw_words is None:
+        if need_words:
+            return None
+        word_list = None
+    else:
+        word_list = _valid_words(raw_words)
+        if word_list is None:
+            return None
+    text = " ".join(w[0] for w in word_list) if (reconstruct_words and word_list) else entry["text"]
+    return text, word_list
+
+
+def _file_sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _asr_tag(config: dict) -> str:
+    return "-".join(str(config.get(k, "")) for k in ("engine", "model", "quantization")).strip("-").replace("/", "_")
+
+
+def _load_asr_cache(cache_root: Path | None, tag: str, *names: str) -> tuple[Path | None, dict, bool]:
+    """Load and merge cache files, with earlier names taking precedence; always checkpoint to `names[0]`.
+    Returns `(dest_path, merged_cache, merged_dirty)` where `merged_dirty` is True if merging pulled
+    entries not yet persisted in `dest_path`."""
+    if cache_root is None or not tag:
+        return None, {}, False
+    base = cache_root / tag
+    dest = base / f"{names[0]}.json"
+    dest_data = json.loads(dest.read_text()) if dest.is_file() else {}
+    merged: dict = {}
+    for n in reversed(names):
+        p = base / f"{n}.json"
+        if p.is_file():
+            merged.update(json.loads(p.read_text()))
+    dirty = bool(merged) and (not dest.is_file() or any(k not in dest_data for k in merged))
+    return dest, merged, dirty
+
+
+def _baseline_cache(cache_root: Path | None, tag: str, name: str) -> tuple[Path | None, dict, bool, bool]:
+    """Return `(dest_path, merged_cache, is_known_krisp, dirty)`. Known Krisp baselines use canonical
+    `vi_2_5_<variant>.json` (merging legacy `krisp_<variant>.json` on read); arbitrary names
+    go in a dedicated `baselines/` directory with a safe hashed filename."""
+    if cache_root is None or not tag:
+        return None, {}, False, False
+    canon = _KRISP_BASELINES.get(name)
+    if canon is not None:
+        p, data, dirty = _load_asr_cache(cache_root, tag, canon, name)
+        return p, data, True, dirty
+    digest = hashlib.sha256(name.encode("utf-8")).hexdigest()[:8]
+    safe = f"{_safe(name)[:64] or 'baseline'}-{digest}"
+    p = cache_root / tag / "baselines" / f"{safe}.json"
+    return p, (json.loads(p.read_text()) if p.is_file() else {}), False, False
+
+
+def _model_cache(cache_root: Path | None, tag: str, model_key: str, strength: str) -> tuple[Path | None, dict]:
+    if cache_root is None or not tag:
+        return None, {}
+    p = cache_root / tag / "models" / f"{_safe(model_key)}__{_safe(strength)}.json"
+    return p, (json.loads(p.read_text()) if p.is_file() else {})
+
+
+def run_manifest(entries: list[dict], models: list[ModelSpec], strengths: list[str], proc: Processor, gates: dict, out_dir: Path, profile: str | None = None, transcriber=None, dnsmos=None, log=print, latency_gates_by_key: dict[tuple[str, str], set[str]] | None = None, normalizer=None, n_boot: int = 2000, asr_cache_dir: Path | None = None) -> list[dict]:
     work = out_dir / "processed"
     work.mkdir(parents=True, exist_ok=True)
     fixtures_dir = out_dir / "fixtures"
@@ -591,25 +708,76 @@ def run_manifest(entries: list[dict], models: list[ModelSpec], strengths: list[s
     raw_text: dict[str, str] = {}
     krisp_raw: dict[str, dict] = {}
     krisp_base: dict[str, dict[str, dict]] = {}
+    asr_cfg = getattr(transcriber, "config", {}) if transcriber else {}
+    asr_tag = _asr_tag(asr_cfg) if transcriber else ""
+    reconstruct_words = asr_cfg.get("engine") == "onnx-asr"
     if transcriber:
         normalizer = normalizer or krisp.KrispNormalizer()
-        for e in entries:
+        raw_cf, raw_cache, raw_dirty = _load_asr_cache(asr_cache_dir, asr_tag, "raw")
+        base_caches: dict[str, tuple[Path | None, dict, bool, bool]] = {}
+        for idx, e in enumerate(entries, 1):
             scored = _krisp_scored(e)
-            inp_audio = read_wav(e["noisy"])
-            src = e["noisy"]
-            if len(inp_audio.channels) != 1:
-                src = work / f"raw__{_safe(e['id'])}.wav"
-                write_wav(src, inp_audio.rate, inp_audio.mono, "float32")
-            raw_text[e["id"]], words = _asr.transcribe(transcriber, src, scored)
+            cid = e["id"]
+            is_krisp_ds = e.get("dataset") == _KRISP_DATASET
+            raw_sha = _file_sha256(Path(e["noisy"])) if raw_cf is not None else None
+            hit = _cached_asr_entry(
+                raw_cache.get(cid),
+                need_words=scored,
+                sha256=raw_sha,
+                allow_legacy_no_sha256=is_krisp_ds,
+                reconstruct_words=reconstruct_words,
+            ) if raw_cf is not None else None
+            if hit is not None:
+                raw_text[cid], words = hit
+            else:
+                inp_audio = read_wav(e["noisy"])
+                src = e["noisy"]
+                if len(inp_audio.channels) != 1:
+                    src = work / f"raw__{_safe(cid)}.wav"
+                    write_wav(src, inp_audio.rate, inp_audio.mono, "float32")
+                raw_text[cid], words = _asr.transcribe(transcriber, src, scored)
+                if raw_cf is not None:
+                    raw_cache[cid] = {"text": raw_text[cid], "words": list(words) if words is not None else None, "sha256": raw_sha}
+                    raw_dirty = True
             if scored:
-                krisp_raw[e["id"]] = _krisp_row(e, raw_text[e["id"]], words, normalizer)
+                krisp_raw[cid] = _krisp_row(e, raw_text[cid], words, normalizer)
                 for name, path in (e.get("baselines") or {}).items():
+                    if name not in base_caches:
+                        bcf, bc, is_known_krisp, bdirty = _baseline_cache(asr_cache_dir, asr_tag, name)
+                        base_caches[name] = (bcf, bc, is_known_krisp, bdirty)
+                    bcf, bc, is_known_krisp, bdirty = base_caches[name]
                     try:
-                        text, bwords = _asr.transcribe(transcriber, path, True)
-                    except (ValueError, OSError) as err:
-                        log(f"  baseline {name} {e['id']}: {err}")
+                        b_sha = _file_sha256(Path(path)) if bcf is not None else None
+                    except OSError as err:
+                        log(f"  baseline {name} {cid}: {err}")
                         continue
-                    krisp_base.setdefault(e["id"], {})[name] = _krisp_row(e, text, bwords, normalizer)
+                    bhit = _cached_asr_entry(
+                        bc.get(cid),
+                        need_words=True,
+                        sha256=b_sha,
+                        allow_legacy_no_sha256=(is_krisp_ds and is_known_krisp),
+                        reconstruct_words=reconstruct_words,
+                    ) if bcf is not None else None
+                    if bhit is not None:
+                        text, bwords = bhit
+                    else:
+                        try:
+                            text, bwords = _asr.transcribe(transcriber, path, True)
+                        except (ValueError, OSError) as err:
+                            log(f"  baseline {name} {cid}: {err}")
+                            continue
+                        if bcf is not None:
+                            bc[cid] = {"text": text, "words": list(bwords) if bwords is not None else None, "sha256": b_sha}
+                            base_caches[name] = (bcf, bc, is_known_krisp, True)
+                    krisp_base.setdefault(cid, {})[name] = _krisp_row(e, text, bwords, normalizer)
+            if idx % 20 == 0 or idx == len(entries):
+                if raw_dirty and raw_cf is not None:
+                    _write_json_atomic(raw_cf, raw_cache)
+                    raw_dirty = False
+                for name, (bcf, bc, is_known_krisp, bdirty) in list(base_caches.items()):
+                    if bdirty and bcf is not None:
+                        _write_json_atomic(bcf, bc)
+                        base_caches[name] = (bcf, bc, is_known_krisp, False)
 
     # DNSMOS of each baseline (e.g. Krisp NC captures), once per clip, for paired deltas.
     base_dnsmos: dict[str, dict[str, dict]] = {}
@@ -628,11 +796,21 @@ def run_manifest(entries: list[dict], models: list[ModelSpec], strengths: list[s
         delay48 = calib.get("delay_samples_used") or 0
         for strength in strengths:
             clips, errors = [], [calib["error"]] if "error" in calib else []
-            for e in entries:
+            m_cf, m_cache = _model_cache(asr_cache_dir, asr_tag, model.key, strength) if transcriber else (None, {})
+            m_dirty = False
+            for idx, e in enumerate(entries, 1):
                 out = work / f"{model.key}__{strength}__{_safe(e['id'])}.wav"
                 try:
                     proc.process(model, strength, Path(e["noisy"]), out, hint=e)
-                    c = clip_metrics(e, read_wav(e["noisy"]), read_wav(out), delay48, out, transcriber, raw_text.get(e["id"]), dnsmos, normalizer)
+                    digest = _file_sha256(out) if m_cf is not None else None
+                    mhit = _cached_asr_entry(m_cache.get(e["id"]), need_words=_krisp_scored(e), sha256=digest, reconstruct_words=reconstruct_words) if m_cf is not None else None
+                    c = clip_metrics(e, read_wav(e["noisy"]), read_wav(out), delay48, out, transcriber, raw_text.get(e["id"]), dnsmos, normalizer, cached_asr=mhit)
+                    if m_cf is not None and mhit is None and "hyp" in c:
+                        w_out = c.pop("_asr_words", None)
+                        m_cache[e["id"]] = {"text": c["hyp"], "words": list(w_out) if w_out is not None else None, "sha256": digest}
+                        m_dirty = True
+                    else:
+                        c.pop("_asr_words", None)
                     if e["id"] in krisp_raw:
                         c["krisp_raw"] = krisp_raw[e["id"]]
                     if e["id"] in krisp_base:
@@ -643,6 +821,12 @@ def run_manifest(entries: list[dict], models: list[ModelSpec], strengths: list[s
                     clips.append(c)
                 except (ProcessError, ValueError, OSError) as err:
                     errors.append(f"{e['id']}: {err}")
+                if idx % 20 == 0 or idx == len(entries):
+                    if m_dirty and m_cf is not None:
+                        _write_json_atomic(m_cf, m_cache)
+                        m_dirty = False
+                    if len(entries) >= 20:
+                        log(f"    {model.key}/{strength}: {idx}/{len(entries)}")
             agg = aggregate_manifest(clips, n_boot)
             agg["delay_error_samples"] = calib.get("delay_error_samples")
             # Always enforce baseline output & calibration safety checks alongside any quality profile.
@@ -662,7 +846,7 @@ def run_manifest(entries: list[dict], models: list[ModelSpec], strengths: list[s
     return results
 
 
-def clip_metrics(e: dict, inp: Audio, out: Audio, delay48: int, out_path: Path, transcriber=None, raw_text=None, dnsmos=None, normalizer=None) -> dict:
+def clip_metrics(e: dict, inp: Audio, out: Audio, delay48: int, out_path: Path, transcriber=None, raw_text=None, dnsmos=None, normalizer=None, cached_asr: tuple[str, list | None] | None = None) -> dict:
     y = [s if math.isfinite(s) else 0.0 for s in out.mono]
     delay = round(delay48 * out.rate / ENGINE_RATE)
     duration = inp.frames / inp.rate
@@ -697,7 +881,11 @@ def clip_metrics(e: dict, inp: Audio, out: Audio, delay48: int, out_path: Path, 
     if transcriber is not None:
         import asr
 
-        hyp, words = asr.transcribe(transcriber, out_path, _krisp_scored(e))
+        if cached_asr is not None:
+            hyp, words = cached_asr
+        else:
+            hyp, words = asr.transcribe(transcriber, out_path, _krisp_scored(e))
+            c["_asr_words"] = words
         c["hyp"], c["raw_hyp"] = hyp, raw_text
         if _krisp_scored(e):
             # Word times are in the output's timeline: undo the chain delay before matching segments.
@@ -1279,6 +1467,7 @@ def parse_args(argv=None):
     p.add_argument("--asr-backend", choices=["faster-whisper", "parakeet"], default="faster-whisper", help="parakeet = NVIDIA Parakeet TDT 0.6B v2 via onnx-asr, the Krisp benchmark's recogniser")
     p.add_argument("--asr-model", help="backend model (default: small.en for faster-whisper, nemo-parakeet-tdt-0.6b-v2 for parakeet)")
     p.add_argument("--asr-quantization", help="parakeet only: e.g. int8 (default fp32)")
+    p.add_argument("--asr-cache-dir", type=Path, help="reuse/save per-clip ASR transcripts under <dir>/<asr-tag>/<cond>.json")
     p.add_argument("--krisp-normalizer", choices=["auto", "nemo", "stdlib"], default="auto", help="text normalisation for Krisp-style entries (auto: NeMo TN if installed)")
     p.add_argument("--bootstrap", type=int, default=2000, help="speaker-bootstrap resamples for Krisp-style CIs")
     p.add_argument("--dnsmos-model", help="local DNSMOS sig_bak_ovr.onnx (extra: perceptual)")
@@ -1360,7 +1549,7 @@ def run(args, log=print) -> int:
                     dnsmos = Dnsmos(args.dnsmos_model)
                 except ImportError as e:
                     raise HarnessError("DNSMOS needs the `perceptual` extra (onnxruntime, numpy)") from e
-            results += run_manifest(entries, models, strengths, proc, gates, args.out, args.gates_profile, transcriber, dnsmos, log, latency_gates_by_key=latency_gates_by_key, normalizer=normalizer, n_boot=args.bootstrap)
+            results += run_manifest(entries, models, strengths, proc, gates, args.out, args.gates_profile, transcriber, dnsmos, log, latency_gates_by_key=latency_gates_by_key, normalizer=normalizer, n_boot=args.bootstrap, asr_cache_dir=args.asr_cache_dir)
 
     if args.bench:
         binary = find_oto(args.oto)

@@ -906,6 +906,18 @@ class KrispNormalizationTests(unittest.TestCase):
         self.assertEqual(v("3.5 stars"), "three point five stars")
         self.assertEqual(v("the 1990s"), "the nineteen nineties")
         self.assertEqual(v("R&D"), "R and D")
+        self.assertEqual(v("call 07700900412"), "call zero seven seven zero zero nine zero zero four one two")
+        self.assertEqual(v("our team is on 01138805170."), "our team is on zero one one three eight eight zero five one seven zero.")
+        self.assertEqual(v("£005 and 005%"), "five pounds and five percent")
+        self.assertEqual(self.norm("£ 0005 and 0005%"), ["five", "pounds", "and", "five", "percent"])
+        self.assertEqual(v("1.005 liters"), "one point zero zero five liters")
+        self.assertEqual(v("12GB and 30MB at 100 km/h over 50 km on Flex30"), "twelve gigabytes and thirty megabytes at one hundred kilometers per hour over fifty kilometers on Flex thirty")
+        self.assertEqual(self.norm("3000 km"), ["three", "thousand", "kilometers"])
+        self.assertEqual(self.norm("3000km"), ["three", "thousand", "kilometers"])
+        self.assertEqual(self.norm("3000 kilometers"), ["three", "thousand", "kilometers"])
+        self.assertEqual(self.norm("3000 megabytes"), ["three", "thousand", "megabytes"])
+        self.assertEqual(self.norm("1024MB"), self.norm("1,024 megabytes"))
+        self.assertEqual(krisp.krisp_regex_rules("paying£41, to$18.40, and July 1st.£50"), "paying £41, to $18.40, and July 1st. £50")
 
     def test_jiwer_transform(self):
         self.assertEqual(krisp.jiwer_words("I won't, can't; let's go. They're here, it's John's, I'd, we'll, I've, I'm"), "i will not can not let us go they are here it is john is i would we will i have i am".split())
@@ -1122,6 +1134,20 @@ class AsrBackendTests(unittest.TestCase):
         self.assertEqual(asr.transcribe(Timed(), "a.wav", False), ("text", None))
         self.assertEqual(asr.transcribe(lambda p: "plain", "a.wav", True), ("plain", None))
 
+    def test_parakeet_providers_and_token_text(self):
+        self.assertEqual(asr.default_parakeet_providers(["CoreMLExecutionProvider", "AzureExecutionProvider", "CPUExecutionProvider"]), ["CPUExecutionProvider"])
+        self.assertEqual(asr.default_parakeet_providers(["CUDAExecutionProvider", "CPUExecutionProvider"]), ["CUDAExecutionProvider", "CPUExecutionProvider"])
+        self.assertEqual(asr.default_parakeet_providers(["CoreMLExecutionProvider"]), ["CPUExecutionProvider"])
+
+        class FakeResult:
+            text = "paying£41"
+            tokens = [" paying", " £", "41"]
+            timestamps = [0.0, 0.2, 0.28]
+
+        text, words = asr.parakeet_result_text(FakeResult())
+        self.assertEqual(text, "paying £41")
+        self.assertEqual(words, [("paying", 0.0, 0.08), ("£41", 0.2, 0.36)])
+
     def test_pyproject_extras_keep_base_stdlib(self):
         pp = tomllib.loads((HERE / "pyproject.toml").read_text())["project"]
         self.assertEqual(pp["dependencies"], [])
@@ -1322,7 +1348,7 @@ class KrispBenchTests(unittest.TestCase):
         (cmd,) = calls
         self.assertEqual(cmd[1], str(HERE / "eval.py"))
         joined = " ".join(cmd)
-        for part in ("--suite manifest", f"--manifest {self.root.resolve() / 'manifest.jsonl'}", "--models dfn3", "--asr --asr-backend parakeet", "--gates-profile oto1.isolate", f"--out {self.root.resolve() / 'eval-out'}", "--asr-quantization int8"):
+        for part in ("--suite manifest", f"--manifest {self.root.resolve() / 'manifest.jsonl'}", "--models dfn3", "--asr --asr-backend parakeet", f"--asr-cache-dir {self.root.resolve() / 'asr'}", "--gates-profile oto1.isolate", f"--out {self.root.resolve() / 'eval-out'}", "--asr-quantization int8"):
             self.assertIn(part, joined)
         self.assertEqual(cmd[-1], "--strict")
         self.assertEqual(krisp_bench.parse_args(["eval"]).models, "dfn3,dpdfnet,nearfield")
@@ -1395,6 +1421,131 @@ class KrispEvalIntegrationTests(unittest.TestCase):
         self.assertNotIn("dnsmos_bak_delta_vs_krisp_nc", a)  # the model row has no BAK
         checks = {c["gate"]: c["status"] for c in harness.evaluate_gates(a, self.gates["oto1"]["clean"])}
         self.assertEqual((checks["min_dnsmos_sig_delta_vs_krisp_nc_ci_hi"], checks["min_dnsmos_ovr_delta_vs_krisp_nc_ci_hi"]), ("pass", "fail"))
+
+    def test_asr_cache_reuses_krisp_baselines_and_invalidates_changed_model_audio(self):
+        m = krisp_bench.write_manifest(krisp_bench.build_manifest(self.root), self.root / "manifest.jsonl")
+        entries = harness.read_manifest(m)
+        # Pre-populate krisp_bench's cache for raw and vi_2_5_default (mapped from krisp_default).
+        seed_asr = FakeTimedAsr()
+        krisp_bench.run_asr(entries, ["raw", "vi_2_5_default"], seed_asr, self.root, quiet_log)
+        cache_dir = self.root / "asr"
+
+        fake = FakeTimedAsr()
+        harness.run_manifest(entries, [self.models["dfn3"]], ["balanced"], harness.OracleProcessor(), self.gates, Path(self.tmp.name) / "run1", "oto1.isolate", fake, None, quiet_log, normalizer=krisp.KrispNormalizer("stdlib"), n_boot=50, asr_cache_dir=cache_dir)
+        # Raw (3) and krisp_default (2) came from cache -> only the 3 model outputs were transcribed.
+        self.assertEqual(len(fake.calls), 3)
+
+        # Second run with identical output audio reuses the model cache too (0 ASR calls).
+        fake2 = FakeTimedAsr()
+        harness.run_manifest(entries, [self.models["dfn3"]], ["balanced"], harness.OracleProcessor(), self.gates, Path(self.tmp.name) / "run2", "oto1.isolate", fake2, None, quiet_log, normalizer=krisp.KrispNormalizer("stdlib"), n_boot=50, asr_cache_dir=cache_dir)
+        self.assertEqual(len(fake2.calls), 0)
+
+        # Changing the processed audio (e.g. different processor/checkpoint) invalidates the sha256 cache.
+        class ScaledProcessor(harness.Processor):
+            def process(self, model, strength, inp, out, bypass=False, hint=None):
+                a = read_wav(inp)
+                write_wav(out, a.rate, [s * 0.5 for s in a.mono], "float32")
+
+        fake3 = FakeTimedAsr()
+        harness.run_manifest(entries, [self.models["dfn3"]], ["balanced"], ScaledProcessor(), self.gates, Path(self.tmp.name) / "run3", "oto1.isolate", fake3, None, quiet_log, normalizer=krisp.KrispNormalizer("stdlib"), n_boot=50, asr_cache_dir=cache_dir)
+        self.assertEqual(len(fake3.calls), 3)
+
+        # Cold run writes canonical vi_2_5_default.json (so krisp_bench score finds it) and reconstructs
+        # cached text from stored timed words (fixing glued currency in older caches).
+        cold_cache = Path(self.tmp.name) / "cold-asr"
+        fake_cold = FakeTimedAsr()
+        harness.run_manifest(entries, [self.models["dfn3"]], ["balanced"], harness.OracleProcessor(), self.gates, Path(self.tmp.name) / "run4", "oto1.isolate", fake_cold, None, quiet_log, normalizer=krisp.KrispNormalizer("stdlib"), n_boot=50, asr_cache_dir=cold_cache)
+        tag = krisp_bench.asr_tag(fake_cold.config)
+        vi_cf = cold_cache / tag / "vi_2_5_default.json"
+        self.assertTrue(vi_cf.is_file())
+        self.assertFalse((cold_cache / tag / "krisp_default.json").exists())
+
+        # Corrupt stored text with glued currency while keeping timed words:
+        # Parakeet (onnx-asr) reconstructs spaced text from timed words; other engines preserve stored text.
+        cached = json.loads(vi_cf.read_text())
+        cached["work/001"]["text"] = "Please call me back at£8:45."
+        cached["work/001"]["words"] = [["Please", 0.1, 0.2], ["call", 0.2, 0.3], ["me", 0.3, 0.4], ["back", 0.4, 0.5], ["at", 0.5, 0.6], ["8:45.", 0.6, 0.7]]
+        vi_cf.write_text(json.dumps(cached))
+        scored_rows = krisp_bench.rows_for(entries, cached, krisp.KrispNormalizer("stdlib"), reconstruct_words=True)
+        w001 = next(r for r in scored_rows if r["i"] == "work/001")
+        self.assertEqual((w001["S"], w001["D"], w001["I"]), (0, 0, 0))
+        preserved_rows = krisp_bench.rows_for(entries, cached, krisp.KrispNormalizer("stdlib"), reconstruct_words=False)
+        w001_p = next(r for r in preserved_rows if r["i"] == "work/001")
+        self.assertEqual(w001_p["I"], 1)  # "pounds" inserted from stored text "at£8:45"
+
+        # Partial canonical cache merges entries from alias file and checkpoints the merged canonical file even on all-hit runs.
+        alias_cf = cold_cache / tag / "krisp_default.json"
+        partial = json.loads(vi_cf.read_text())
+        alias_cf.write_text(json.dumps({"work/002": partial["work/002"]}))
+        vi_cf.write_text(json.dumps({"work/001": partial["work/001"]}))
+        fake_merge = FakeTimedAsr()
+        harness.run_manifest(entries, [self.models["dfn3"]], ["balanced"], harness.OracleProcessor(), self.gates, Path(self.tmp.name) / "run4b", "oto1.isolate", fake_merge, None, quiet_log, normalizer=krisp.KrispNormalizer("stdlib"), n_boot=50, asr_cache_dir=cold_cache)
+        self.assertEqual(len(fake_merge.calls), 0)
+        self.assertEqual(set(json.loads(vi_cf.read_text())), {"work/001", "work/002"})
+
+        # Untimed (words=None) or malformed (words=1) cache entries are refreshed when timing is required.
+        raw_cf = cold_cache / tag / "raw.json"
+        raw_cached = json.loads(raw_cf.read_text())
+        raw_cached["work/001"]["words"] = None
+        raw_cached["work/002"]["words"] = 1
+        raw_cf.write_text(json.dumps(raw_cached))
+        fake_refresh = FakeTimedAsr()
+        harness.run_manifest(entries, [self.models["dfn3"]], ["balanced"], harness.OracleProcessor(), self.gates, Path(self.tmp.name) / "run5", "oto1.isolate", fake_refresh, None, quiet_log, normalizer=krisp.KrispNormalizer("stdlib"), n_boot=50, asr_cache_dir=cold_cache)
+        self.assertEqual(len(fake_refresh.calls), 2)
+
+        # Untrusted baseline names cannot escape --asr-cache-dir or collide with raw.json,
+        # and modified non-Krisp raw input invalidates cached raw transcripts via sha256.
+        safe_cache = Path(self.tmp.name) / "safe-asr"
+        custom_noisy = Path(self.tmp.name) / "custom_001.wav"
+        write_wav(custom_noisy, 16000, sine(220, 16000, 1.0, 0.2), "pcm16")
+        custom_base = Path(self.tmp.name) / "base_001.wav"
+        write_wav(custom_base, 16000, sine(220, 16000, 1.0, 0.1), "pcm16")
+        raw_b_path, _, _, _ = harness._baseline_cache(safe_cache, tag, "raw")
+        self.assertEqual(raw_b_path.parent, safe_cache / tag / "baselines")
+        self.assertNotEqual(raw_b_path, safe_cache / tag / "raw.json")
+        custom_entries = [{
+            "id": "work/001", "noisy": str(custom_noisy), "kind": "speech", "dataset": "custom",
+            "speaker_id": "speaker1", "scenario": "work", "transcript": "Please call me back at 8:45.",
+            "segments": [kseg(0.0, 1.0, "primary", "Please call me back at 8:45.")],
+            "baselines": {"../escape": str(custom_base), "/abs/base": str(custom_base)},
+        }]
+        fake_safe = FakeTimedAsr()
+        harness.run_manifest(custom_entries, [self.models["dfn3"]], ["balanced"], harness.OracleProcessor(), self.gates, Path(self.tmp.name) / "run6", "oto1.isolate", fake_safe, None, quiet_log, normalizer=krisp.KrispNormalizer("stdlib"), n_boot=20, asr_cache_dir=safe_cache)
+        self.assertFalse((safe_cache / "escape.json").exists())
+        self.assertTrue((safe_cache / tag / "raw.json").is_file())
+        self.assertEqual(len(list((safe_cache / tag / "baselines").glob("*.json"))), 2)
+        # Mutate raw input audio -> must invalidate raw cache and re-transcribe raw (+ changed model output).
+        write_wav(custom_noisy, 16000, sine(330, 16000, 1.0, 0.25), "pcm16")
+        fake_mut = FakeTimedAsr()
+        harness.run_manifest(custom_entries, [self.models["dfn3"]], ["balanced"], harness.OracleProcessor(), self.gates, Path(self.tmp.name) / "run7", "oto1.isolate", fake_mut, None, quiet_log, normalizer=krisp.KrispNormalizer("stdlib"), n_boot=20, asr_cache_dir=safe_cache)
+        self.assertEqual(len(fake_mut.calls), 2)  # raw + model re-transcribed; 2 unchanged baselines stayed cached
+
+        # krisp_bench.run_asr regenerates entries with words=None (untimed) and re-transcribes when audio changes.
+        raw_kb_cf = krisp_bench.cache_file(self.root, tag, "raw")
+        raw_kb = json.loads(raw_kb_cf.read_text())
+        raw_kb["work/001"]["words"] = None
+        raw_kb_cf.write_text(json.dumps(raw_kb))
+        before_null = len(seed_asr.calls)
+        krisp_bench.run_asr(entries, ["raw"], seed_asr, self.root, quiet_log)
+        self.assertEqual(len(seed_asr.calls), before_null + 1)
+        self.assertIsInstance(json.loads(raw_kb_cf.read_text())["work/001"]["words"], list)
+
+        before_calls = len(seed_asr.calls)
+        w001_wav = krisp_bench.raw_dir(self.root, "work") / "001.wav"
+        write_wav(w001_wav, 16000, sine(330, 16000, 3.0, 0.25), "pcm16")
+        krisp_bench.run_asr(entries, ["raw"], seed_asr, self.root, quiet_log)
+        self.assertEqual(len(seed_asr.calls), before_calls + 1)
+
+        # cmd_score merges partial alias + full canonical cache identically for either spelling.
+        alias_cf_kb = krisp_bench.cache_file(self.root, tag, "krisp_default")
+        canon_cf_kb = krisp_bench.cache_file(self.root, tag, "vi_2_5_default")
+        canon_data = json.loads(canon_cf_kb.read_text())
+        alias_cf_kb.write_text(json.dumps({"work/001": canon_data["work/001"]}))
+        for cond_arg in ("krisp_default", "vi_2_5_default"):
+            sc_args = krisp_bench.parse_args(["score", "--data-dir", str(self.root), "--cond", "raw", "--cond", cond_arg, "--normalizer", "stdlib", "--bootstrap", "20", "--name", f"merge-{cond_arg}"])
+            self.assertEqual(krisp_bench.cmd_score(sc_args, quiet_log, seed_asr.config), 0)
+            rep = json.loads((self.root / "reports" / f"merge-{cond_arg}.json").read_text())
+            self.assertEqual(rep["scores"]["vi_2_5_default"]["files"], 2)
 
 
 class Oto1GateTests(unittest.TestCase):
@@ -1481,11 +1632,12 @@ class Oto1GateTests(unittest.TestCase):
             fake = FakeTimedAsr()
             entries = krisp_bench.build_manifest(root)
             tag = krisp_bench.run_asr(entries, ["raw", "krisp_default"], fake, root, quiet_log)
-            alias_cf = krisp_bench.cache_file(root, tag, "krisp_default")
-            self.assertTrue(alias_cf.is_file())
-            # A partial canonical cache must not shadow the explicitly requested alias cache.
             canon_cf = krisp_bench.cache_file(root, tag, "vi_2_5_default")
-            alias_data = json.loads(alias_cf.read_text())
+            self.assertTrue(canon_cf.is_file())
+            # Simulate a legacy alias cache alongside a partial canonical cache: both entries are merged.
+            alias_cf = krisp_bench.cache_file(root, tag, "krisp_default")
+            alias_data = json.loads(canon_cf.read_text())
+            alias_cf.write_text(json.dumps(alias_data))
             first_id = next(iter(alias_data))
             canon_cf.write_text(json.dumps({first_id: alias_data[first_id]}))
             args = krisp_bench.parse_args(["score", "--data-dir", str(root), "--cond", "raw", "--cond", "krisp_default", "--reference", "krisp_default", "--normalizer", "stdlib", "--bootstrap", "20", "--name", "alias"])

@@ -58,8 +58,8 @@ REPRODUCE_TOLERANCE_WER = 0.2  # percentage points (plan 0004, Phase 0 "done whe
 
 _GENERAL_ID_RE = re.compile(r"\b([A-Z]{1,4})(?:-?(\d+)|[ ](\d{3,}))(?:[ ]?(\d)([A-Z]{2}))?([A-Z]{0,2})\b")
 _DIGIT_FIRST_RE = re.compile(r"\b(\d{4,})-?([A-Za-z])\b")
-_UNITS = r"(?:dollars?|pounds?|euros?|percent|miles?|days?|months?|hours?|minutes?|nights?|years?|weeks?|points?|gigabytes?|megabits?)"
-_STANDALONE_4_RE = re.compile(rf"(?<![$£€\d,])(?<!\d)\b(\d{{4}})\b(?!\d)(?!\s+{_UNITS})")
+_UNITS = r"(?:dollars?|pounds?|euros?|percent|miles?|days?|months?|hours?|minutes?|nights?|years?|weeks?|points?|gigabytes?|megabytes?|megabits?|kilometers?|kilometres?|km(?:/h)?|gb|mb)\b"
+_STANDALONE_4_RE = re.compile(rf"(?<![$£€\d,])(?<![$£€]\s)(?<!\d)\b(\d{{4}})\b(?!\d)(?!\s*%)(?!\s+{_UNITS})", re.I)
 _DIGIT_GROUPS_RE = re.compile(r"\b\d{1,16}(?:\s+\d{1,16}){1,}\b")
 
 
@@ -99,7 +99,11 @@ def split_adjacent_digit_groups(text: str) -> str:
     return _DIGIT_GROUPS_RE.sub(lambda m: " ".join(m.group(0).replace(" ", "")), text)
 
 
+_GLUED_CURRENCY_RE = re.compile(r"(?<=\S)([$£€])(?=\d)")
+
+
 def krisp_regex_rules(text: str) -> str:
+    text = _GLUED_CURRENCY_RE.sub(r" \1", text)
     return split_adjacent_digit_groups(split_standalone_4digits(split_digit_first(split_general_id(text))))
 
 
@@ -215,6 +219,11 @@ def stdlib_verbalize(text: str) -> str:
         return " ".join(last)
 
     t = text.replace("&", " and ")
+    t = re.sub(r"(?<=\d)\s*km/h\b", " kilometers per hour", t, flags=re.I)
+    t = re.sub(r"(?<=\d)\s*km\b", " kilometers", t, flags=re.I)
+    t = re.sub(r"(?<=\d)\s*gb\b", " gigabytes", t, flags=re.I)
+    t = re.sub(r"(?<=\d)\s*mb\b", " megabytes", t, flags=re.I)
+    t = re.sub(r"\b([A-Za-z]{2,})(\d+)\b", r"\1 \2", t)
     t = _RE_MONEY.sub(money, t)
     t = _RE_PERCENT.sub(percent, t)
     t = _RE_TIME.sub(clock, t)
@@ -222,6 +231,8 @@ def stdlib_verbalize(text: str) -> str:
     t = _RE_ORDINAL.sub(lambda m: ordinal_words(int(m.group(1))), t)
     t = _RE_DECADE.sub(decade, t)
     t = _RE_DECIMAL.sub(lambda m: number_words(_int(m.group(1))) + " point " + _digits_words(m.group(2)), t)
+    t = re.sub(r"(?<![\d.,])\b(0\d{2,})\b(?!\d|\.\d)", lambda m: _digits_words(m.group(1)), t)
+    t = re.sub(rf"(?<![\d.])\b({_NUM})(?=\s+{_UNITS})", lambda m: number_words(_int(m.group(1))), t, flags=re.I)
     t = _RE_YEAR.sub(lambda m: year_words(int(m.group(1))), t)
     t = _RE_CARDINAL.sub(lambda m: number_words(_int(m.group(1))), t)
     return t
